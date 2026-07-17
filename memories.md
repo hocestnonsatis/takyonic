@@ -3,6 +3,7 @@
 Güncelleme: 2026-07-17
 
 ## Proje Durumu
+- Private GitHub repository: `https://github.com/hocestnonsatis/takyonic` (`main`)
 - Step 1 (Foundation & Types): completed 2026-07-17 — types, Config, errors, tracing-init
 - Step 2 (WAL & Memtable): completed 2026-07-17 — WalWriter/WalReader (xxh3 + sync_data), Memtable (RwLock+BTreeMap)
 - Step 3 (SST & mmap Pinning): completed 2026-07-17 — block/index/Bloom layout, mmap reader, strict deferred deletion
