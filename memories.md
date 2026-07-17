@@ -20,7 +20,11 @@ Güncelleme: 2026-07-17
 - Step 14 (Dynamic Membership): completed 2026-07-17 — single-server AddNode/RemoveNode, immediate-effect quorum, InstallSnapshot joiner catch-up; topology mutation crucible PASS
 - Step 15 (MVCC + Snapshot Isolation): completed 2026-07-17 — InternalKey versions, Transaction OCC, watermark GC; bank invariant PASS
 - Step 16 (Secondary Indexes + CBO): completed 2026-07-17 — Data_/Idx_ projection, TableStats NDV, cost-based planner; cbo_planner PASS
-- Initial six-step roadmap is complete; Steps 7–16 cover orchestration through indexed query planning
+- Step 17 (Smart Client SDK): completed 2026-07-17 — TakyonicClient topology/routing + execute_txn OCC backoff; leader-kill bank crucible PASS
+- Step 18 (SQL Parser + Logical Planner): completed 2026-07-17 — sqlparser GenericDialect → CBO/MVCC; execute_sql crucible PASS
+- Step 19 (PostgreSQL Wire Protocol): completed 2026-07-17 — pgwire on :5433; psql INSERT/SELECT PASS
+- Step 20 (V1.0 Repository Polish): completed 2026-07-17 — README, architecture guide, dual license, contributing guide, GitHub CI; all checks PASS
+- Package metadata is v1.0.0 with MSRV 1.85; initial six-step roadmap and Steps 7–20 are complete
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -138,9 +142,35 @@ Güncelleme: 2026-07-17
 - CBO: `engine.query(table).filter(...).filter(...)` → pick min `eq_cost = row_count/NDV` index → IndexScan → PK fetch → residual filters
 - Harness (`examples/cbo_planner.rs`): 10k users (9k active, 50 city=X, 200 cities) → EXPLAIN chooses `city` (est=50) over `status` (est=5000); returns 50 rows PASS
 
+## Smart Client SDK (Step 17)
+- Proto `ClientService`: Ping / Get / Put / BeginTxn / TxnGet / TxnPut / TxnCommit / TxnAbort multiplexed with Raft on the same port
+- Followers return gRPC `FailedPrecondition` `not_leader` + metadata `x-takyonic-leader-address`
+- `TakyonicClient`: seed ping → cache leader channel → transparent NotLeader invalidate/rediscover/retry
+- `execute_txn(|txn| async { ... })`: auto-commit; on Conflict exponential backoff+jitter (10/25/50ms…); on NotLeader/network re-discover and re-run closure
+- Leader sessions hold MVCC workspace; commit proposes `RaftCommand::TxnBatch` via `RaftConsensus` (serialized OCC + propose)
+- `apply_committed` updates OCC `last_commit` on every replica (failover-safe SI)
+- Harness (`examples/smart_client.rs`): 3-node bank storm → kill leader → post-failover transfers → sum invariant held, 0 app-visible errors PASS
+
+## SQL Parser & Logical Planner (Step 18)
+- Dep: `sqlparser` 0.62 (`default-features = false`, `std` only — avoids `stacker`/C toolchain on this host)
+- `src/sql.rs`: `LogicalPlanner` / `SqlEngine` — GenericDialect AST → `LogicalPlan::Select { filters }` / `Insert { records }`
+- WHERE: flatten AND of BinaryOps into CBO `Filter`s; INSERT VALUES → `Record` maps
+- Proto: `RegisterTable`, `ExecuteQuery`, `TxnPutRecord`; leader runs CBO + returns EXPLAIN; put_record updates StatsEdit
+- `TakyonicClient::execute_sql` / `explain_sql` / `register_table` / `ClientTxn::put_record`
+- Harness (`examples/sql_interface.rs`): 1k SQL INSERTs (10 Ankara) → `SELECT ... status='active' AND city='Ankara'` → IndexScan(city) est=10, 10 rows PASS
+
+## PostgreSQL Wire Protocol (Step 19)
+- Dep: `pgwire` 0.40 (`server-api` only) + `async-trait`
+- `src/pg.rs`: `TakyonicPgBackend` (SimpleQueryHandler) → `execute_sql`; `AcceptAnyCleartext` auth (any user/pass)
+- Result mapping: `FieldInfo` + `DataRowEncoder` (INT8 / VARCHAR); INSERT → `CommandComplete` `INSERT 0 N`
+- Binary `takyonic-server`: single-node Raft + pgwire on `127.0.0.1:5433` (Raft gRPC `:15433`)
+- Single-node election fix: `run_election` promotes immediately when `peers.is_empty()` && quorum≤1
+- Crucible: `PGPASSWORD=any psql -h 127.0.0.1 -p 5433 -U admin -d postgres` → INSERT 0 1 + tabular SELECT PASS
+- Host note (2026-07-17): Ryzen 9 / x86_64 — `.cargo/config.toml` uses `CC=gcc` + gcc-16 lib path
+
 ## Ortam Notları
-- Host is proot/Ubuntu on aarch64; default `cc` may be Termux clang missing `-lgcc_s`
-- `.cargo/config.toml` sets `CC=aarch64-linux-gnu-gcc` and rustflags `-L` to gcc-15 lib dir
+- Host is Ryzen 9 9950X workstation (x86_64); `.cargo/config.toml` sets `CC=gcc`
+- Legacy note: older Termux/proot aarch64 setups needed `aarch64-linux-gnu-gcc`
 
 ## Mimari Kısıtlar (DO NOT VIOLATE)
 - Compaction I/O must NEVER starve WAL or Raft fsyncs

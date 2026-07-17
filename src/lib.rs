@@ -1,10 +1,14 @@
 //! Takyonic — embedded high-performance LSM-Tree key-value engine.
 //!
-//! Step 11 adds distributed Raft consensus over tonic/gRPC.
+//! Step 19 adds a PostgreSQL wire-protocol facade ([`pg`]) and the
+//! `takyonic-server` binary so standard clients (`psql`, DBeaver, …) can talk
+//! to the Raft / MVCC / CBO engine.
 
 #![warn(missing_docs)]
 
 pub mod admission;
+pub mod client;
+pub mod client_service;
 pub mod cluster;
 pub mod compaction;
 pub mod config;
@@ -15,11 +19,13 @@ pub mod group_commit;
 pub mod membership;
 pub mod memtable;
 pub mod network;
+pub mod pg;
 pub mod query;
 pub mod raft;
 pub mod raft_log;
 pub mod schema;
 pub mod snapshot;
+pub mod sql;
 pub mod sst;
 pub mod stats;
 pub mod telemetry;
@@ -29,6 +35,8 @@ pub mod types;
 pub mod wal;
 
 pub use admission::{AdmissionController, AdmissionDecision, AdmissionOutcome};
+pub use client::{ClientTxn, TakyonicClient};
+pub use client_service::{ClientGrpcService, LEADER_ADDR_META, NOT_LEADER_MSG};
 pub use cluster::{TakyonicNode, wait_for_leader};
 pub use compaction::{
     CompactionEngine, CompactionPool, CompactionResult, CompactionTicket, SstManager, SstMeta,
@@ -41,6 +49,7 @@ pub use group_commit::{ApplyHook, GroupCommitWal};
 pub use membership::ClusterMembership;
 pub use memtable::Memtable;
 pub use network::{PeerClients, RaftGrpcService};
+pub use pg::{AcceptAnyCleartext, TakyonicPgBackend, TakyonicPgFactory};
 pub use query::{ExecutionPlan, Filter, FilterOp, IndexCandidate, Query};
 pub use raft::{
     ApplyStatus, BatchApplyResult, CommittedEntry, LocalRaftNode, RaftCommand, RaftSnapshot,
@@ -49,6 +58,7 @@ pub use raft::{
 pub use raft_log::{RaftLog, RaftLogEntry};
 pub use schema::{IndexDef, Record, TableSchema, data_key, index_key};
 pub use snapshot::{SnapshotMeta, SnapshotPayload, SnapshotSst};
+pub use sql::{LogicalPlan, LogicalPlanner, SqlEngine};
 pub use sst::{DeleteStatus, SstId, SstInfo, SstPin, SstReader, SstRegistry, SstWriter};
 pub use stats::{StatsCatalog, TableStats};
 pub use telemetry::{EngineMetrics, HistogramSnapshot, LatencyHistogram};

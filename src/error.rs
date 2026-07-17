@@ -41,6 +41,17 @@ pub enum TakyonicError {
     #[error("transaction conflict: {0}")]
     Conflict(String),
 
+    /// This node is not the Raft leader; retry against `leader_address` if set.
+    #[error("not leader (hint={leader_address:?})")]
+    NotLeader {
+        /// Advertised `host:port` of the current leader, when known.
+        leader_address: Option<String>,
+    },
+
+    /// SQL parse / logical planning failure.
+    #[error("SQL error: {0}")]
+    Sql(String),
+
     /// Catch-all for unexpected failures wrapped via [`anyhow`].
     #[error(transparent)]
     Other(#[from] anyhow::Error),

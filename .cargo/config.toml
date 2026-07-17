@@ -1,7 +1,6 @@
-# Termux/proot hosts often expose Android clang as `cc`, which cannot find
-# Ubuntu's libgcc_s. Prefer the distro GCC and its library search path.
+# Ryzen / native Linux: use system GCC (not Termux/proot aarch64 cross).
 [env]
-CC = "aarch64-linux-gnu-gcc"
+CC = "gcc"
 
 [build]
-rustflags = ["-L", "/usr/lib/gcc/aarch64-linux-gnu/15"]
+rustflags = ["-L", "/usr/lib/gcc/x86_64-pc-linux-gnu/16"]

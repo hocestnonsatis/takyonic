@@ -199,10 +199,12 @@ impl TakyonicNode {
         self: &Arc<Self>,
     ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
         let raft = Arc::clone(&self.raft);
+        let engine = Arc::clone(&self.engine);
         let addr = self.addr;
+        let id = self.id;
         let server = tokio::spawn(async move {
-            if let Err(e) = network::serve_raft(addr, raft).await {
-                tracing::error!(%e, "Raft gRPC server exited");
+            if let Err(e) = network::serve_node(addr, id, engine, raft).await {
+                tracing::error!(%e, "Raft/Client gRPC server exited");
             }
         });
 

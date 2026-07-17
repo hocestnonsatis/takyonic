@@ -14,7 +14,9 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, transport::Channel};
 use tracing::{debug, warn};
 
+use crate::client_service::ClientGrpcService;
 use crate::consensus::RaftConsensus;
+use crate::engine::TakyonicEngine;
 use crate::error::{Result, TakyonicError};
 use crate::raft_log::RaftLogEntry;
 
@@ -24,6 +26,7 @@ pub mod proto {
     tonic::include_proto!("takyonic.raft.v1");
 }
 
+use proto::client_service_server::ClientServiceServer;
 use proto::raft_service_client::RaftServiceClient;
 use proto::raft_service_server::{RaftService, RaftServiceServer};
 use proto::{
@@ -345,6 +348,33 @@ pub async fn serve_raft(addr: SocketAddr, raft: Arc<RaftConsensus>) -> Result<()
         .map_err(|e| TakyonicError::Network(format!("serve {addr}: {e}")))
 }
 
+/// Serve Raft + ClientService on `addr` until the process exits.
+pub async fn serve_node(
+    addr: SocketAddr,
+    id: u64,
+    engine: Arc<TakyonicEngine>,
+    raft: Arc<RaftConsensus>,
+) -> Result<()> {
+    let raft_svc = RaftGrpcService::new(Arc::clone(&raft));
+    let client_svc = ClientGrpcService::new(id, addr, engine, raft);
+    debug!(%addr, "starting Raft + Client gRPC server");
+    tonic::transport::Server::builder()
+        .max_frame_size(Some(1024 * 1024))
+        .add_service(
+            RaftServiceServer::new(raft_svc)
+                .max_decoding_message_size(32 * 1024 * 1024)
+                .max_encoding_message_size(32 * 1024 * 1024),
+        )
+        .add_service(
+            ClientServiceServer::new(client_svc)
+                .max_decoding_message_size(32 * 1024 * 1024)
+                .max_encoding_message_size(32 * 1024 * 1024),
+        )
+        .serve(addr)
+        .await
+        .map_err(|e| TakyonicError::Network(format!("serve {addr}: {e}")))
+}
+
 /// Run one election round: RequestVote all peers; become leader on quorum.
 pub async fn run_election(raft: &Arc<RaftConsensus>, peers: &Arc<PeerClients>) {
     let (term, last_idx, last_term) = raft.start_election();
@@ -353,6 +383,15 @@ pub async fn run_election(raft: &Arc<RaftConsensus>, peers: &Arc<PeerClients>) {
         .await;
     let mut votes: HashMap<u64, bool> = HashMap::new();
     let peer_ids: Vec<u64> = raft.peers();
+
+    // Sole voter: `start_election` already recorded the self-vote; with
+    // quorum == 1 there are no peers to contact — promote immediately.
+    if peer_ids.is_empty() && raft.membership().quorum() <= 1 {
+        raft.become_leader(term);
+        replicate_to_all(raft, peers).await;
+        return;
+    }
+
     let mut tasks = Vec::new();
     for peer in peer_ids {
         let peers = Arc::clone(peers);

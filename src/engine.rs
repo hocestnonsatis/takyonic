@@ -217,6 +217,18 @@ impl TakyonicEngine {
         self.publish_watermark();
     }
 
+    /// Allocate a remote/local txn id at the current apply watermark.
+    pub(crate) fn begin_txn_id(&self) -> Result<(u64, CommitTs)> {
+        self.ensure_open()?;
+        let read_ts = self
+            .raft_node()?
+            .last_applied()
+            .min(u64::MAX.saturating_sub(1));
+        let txn_id = self.txn_tracker.begin(read_ts);
+        self.publish_watermark();
+        Ok((txn_id, read_ts))
+    }
+
     pub(crate) fn commit_transaction(
         &self,
         txn_id: u64,
@@ -231,8 +243,54 @@ impl TakyonicEngine {
             return Ok(read_ts);
         }
 
+        // Serialize OCC validate with local propose so two overlapping SI
+        // transactions cannot both pass validation before either commits.
         let _occ = self.txn_commit_mu.lock();
+        let ops = self.prepare_txn_commit_unlocked(txn_id, read_ts, reads, writes)?;
+        let node = self.raft_node()?;
+        let commit_ts = node.propose(RaftCommand::txn_batch(ops))?;
+        self.note_committed_keys(writes.keys().cloned(), commit_ts);
+        for edit in stats_edits {
+            match edit {
+                StatsEdit::Insert {
+                    table,
+                    index_values,
+                } => self.stats.on_insert(table, index_values),
+                StatsEdit::Delete {
+                    table,
+                    index_values,
+                } => self.stats.on_delete(table, index_values),
+            }
+        }
+        self.maybe_flush_node(&node)?;
+        self.end_transaction(txn_id);
+        drop(_occ);
+        Ok(commit_ts)
+    }
 
+    /// OCC-validate + admit a write-set; returns the Raft command ops.
+    ///
+    /// On conflict / admission failure the transaction is ended. Callers that
+    /// propose via networked Raft must serialize this with propose (e.g. an
+    /// async mutex) then call [`Self::finalize_txn_commit`] on success.
+    pub(crate) fn prepare_txn_commit(
+        &self,
+        txn_id: u64,
+        read_ts: CommitTs,
+        reads: &BTreeMap<Key, CommitTs>,
+        writes: &BTreeMap<Key, WriteOp>,
+    ) -> Result<Vec<(Key, Option<Value>)>> {
+        let _occ = self.txn_commit_mu.lock();
+        self.prepare_txn_commit_unlocked(txn_id, read_ts, reads, writes)
+    }
+
+    fn prepare_txn_commit_unlocked(
+        &self,
+        txn_id: u64,
+        read_ts: CommitTs,
+        reads: &BTreeMap<Key, CommitTs>,
+        writes: &BTreeMap<Key, WriteOp>,
+    ) -> Result<Vec<(Key, Option<Value>)>> {
         // OCC: any read-set key committed after our snapshot ⇒ conflict.
         {
             let last = self.last_commit.lock();
@@ -270,15 +328,21 @@ impl TakyonicEngine {
                 ));
             }
         }
+        Ok(ops)
+    }
 
-        let node = self.raft_node()?;
-        let commit_ts = node.propose(RaftCommand::txn_batch(ops))?;
-        {
-            let mut last = self.last_commit.lock();
-            for key in writes.keys() {
-                last.insert(key.clone(), commit_ts);
-            }
-        }
+    /// Record OCC timestamps + stats after a successful networked Raft commit.
+    ///
+    /// Call only after the write-set is already applied (propose has returned).
+    /// Prefer ending the txn *after* any flush that might run under the apply path.
+    pub(crate) fn finalize_txn_commit(
+        &self,
+        txn_id: u64,
+        commit_ts: CommitTs,
+        writes: &BTreeMap<Key, WriteOp>,
+        stats_edits: &[StatsEdit],
+    ) {
+        self.note_committed_keys(writes.keys().cloned(), commit_ts);
         for edit in stats_edits {
             match edit {
                 StatsEdit::Insert {
@@ -291,9 +355,19 @@ impl TakyonicEngine {
                 } => self.stats.on_delete(table, index_values),
             }
         }
-        self.maybe_flush_node(&node)?;
         self.end_transaction(txn_id);
-        Ok(commit_ts)
+    }
+
+    /// Update the OCC index for keys applied at `commit_ts` (local or replica).
+    pub(crate) fn note_committed_keys(
+        &self,
+        keys: impl IntoIterator<Item = Key>,
+        commit_ts: CommitTs,
+    ) {
+        let mut last = self.last_commit.lock();
+        for key in keys {
+            last.insert(key, commit_ts);
+        }
     }
 
     /// Register a table schema (enables `put_record` / CBO queries).
@@ -478,6 +552,22 @@ impl TakyonicEngine {
         }
         let node = self.raft_node()?;
         let result = node.apply_log(entries)?;
+        // Keep the OCC index warm on every replica so failover preserves SI.
+        for committed in entries {
+            if committed.command.is_meta() {
+                continue;
+            }
+            let keys: Vec<Key> = match &committed.command {
+                RaftCommand::Put { key, .. } | RaftCommand::Delete { key } => {
+                    vec![key.clone()]
+                }
+                RaftCommand::TxnBatch { ops } => ops.iter().map(|(k, _)| k.clone()).collect(),
+                _ => Vec::new(),
+            };
+            if !keys.is_empty() {
+                self.note_committed_keys(keys, committed.index);
+            }
+        }
         self.maybe_flush_node(&node)?;
         Ok(result)
     }
@@ -612,10 +702,7 @@ impl TakyonicEngine {
         let node = self.raft_node()?;
         let commit_ts = node.propose(command)?;
         if !keys.is_empty() {
-            let mut last = self.last_commit.lock();
-            for key in keys {
-                last.insert(key, commit_ts);
-            }
+            self.note_committed_keys(keys, commit_ts);
         }
         self.maybe_flush_node(&node)?;
         Ok(())

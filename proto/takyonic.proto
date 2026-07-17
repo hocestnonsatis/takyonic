@@ -62,3 +62,141 @@ message InstallSnapshotRequest {
 message InstallSnapshotResponse {
   uint64 term = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Client-facing KV / transaction API (Smart Client SDK).
+// Followers answer Ping / mutations with NotLeader(leader_address).
+// ---------------------------------------------------------------------------
+service ClientService {
+  // Topology probe: any node reports whether it is leader and the known
+  // leader address (when available).
+  rpc Ping (PingRequest) returns (PingResponse);
+
+  // Linearizable point read (served by the leader).
+  rpc Get (KvGetRequest) returns (KvGetResponse);
+
+  // Linearizable put (leader only).
+  rpc Put (KvPutRequest) returns (KvPutResponse);
+
+  // Snapshot-isolation transaction RPCs (leader-held sessions).
+  rpc BeginTxn (BeginTxnRequest) returns (BeginTxnResponse);
+  rpc TxnGet (TxnGetRequest) returns (TxnGetResponse);
+  rpc TxnPut (TxnPutRequest) returns (TxnPutResponse);
+  rpc TxnPutRecord (TxnPutRecordRequest) returns (TxnPutRecordResponse);
+  rpc TxnCommit (TxnCommitRequest) returns (TxnCommitResponse);
+  rpc TxnAbort (TxnAbortRequest) returns (TxnAbortResponse);
+
+  // Schema + cost-based query (SQL logical plan executed on the leader).
+  rpc RegisterTable (RegisterTableRequest) returns (RegisterTableResponse);
+  rpc ExecuteQuery (ExecuteQueryRequest) returns (ExecuteQueryResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  uint64 node_id = 1;
+  string self_address = 2;
+  bool is_leader = 3;
+  // Known leader id (0 if unknown).
+  uint64 leader_id = 4;
+  // Advertised host:port of the leader when known (empty if unknown).
+  string leader_address = 5;
+}
+
+message KvGetRequest {
+  bytes key = 1;
+}
+
+message KvGetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message KvPutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message KvPutResponse {
+  uint64 commit_ts = 1;
+}
+
+message BeginTxnRequest {}
+
+message BeginTxnResponse {
+  uint64 txn_id = 1;
+  uint64 read_ts = 2;
+}
+
+message TxnGetRequest {
+  uint64 txn_id = 1;
+  bytes key = 2;
+}
+
+message TxnGetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message TxnPutRequest {
+  uint64 txn_id = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message TxnPutResponse {}
+
+message TxnCommitRequest {
+  uint64 txn_id = 1;
+}
+
+message TxnCommitResponse {
+  uint64 commit_ts = 1;
+}
+
+message TxnAbortRequest {
+  uint64 txn_id = 1;
+}
+
+message TxnAbortResponse {}
+
+message TxnPutRecordRequest {
+  uint64 txn_id = 1;
+  string table = 2;
+  // Encoded Record (see schema::Record::encode).
+  bytes record = 3;
+}
+
+message TxnPutRecordResponse {}
+
+message IndexDefMsg {
+  string name = 1;
+  string column = 2;
+}
+
+message RegisterTableRequest {
+  string name = 1;
+  string primary_key = 2;
+  repeated IndexDefMsg indexes = 3;
+}
+
+message RegisterTableResponse {}
+
+message FilterPred {
+  string column = 1;
+  // "=", "!=", ">", ">=", "<", "<="
+  string op = 2;
+  string value = 3;
+}
+
+message ExecuteQueryRequest {
+  string table = 1;
+  repeated FilterPred filters = 2;
+}
+
+message ExecuteQueryResponse {
+  // Encoded Record values.
+  repeated bytes records = 1;
+  // CBO EXPLAIN text.
+  string explain = 2;
+}

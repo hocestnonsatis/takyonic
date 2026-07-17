@@ -413,7 +413,7 @@ impl SstReader {
         let bit_count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
         let hash_count = payload[4];
         let bits = &payload[5..];
-        if bit_count == 0 || !bit_count.is_multiple_of(8) || bits.len() != bit_count / 8 {
+        if bit_count == 0 || bit_count % 8 != 0 || bits.len() != bit_count / 8 {
             return Err(TakyonicError::Integrity(
                 "invalid SST filter dimensions".into(),
             ));

@@ -284,7 +284,7 @@ pub fn write_keys(writes: &BTreeMap<Key, WriteOp>) -> BTreeSet<Key> {
     writes.keys().cloned().collect()
 }
 
-fn index_store_value(raw: &str) -> String {
+pub(crate) fn index_store_value(raw: &str) -> String {
     if let Ok(n) = raw.parse::<i64>() {
         encode_sortable_int(n)
     } else {
