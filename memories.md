@@ -24,7 +24,8 @@ Güncelleme: 2026-07-17
 - Step 18 (SQL Parser + Logical Planner): completed 2026-07-17 — sqlparser GenericDialect → CBO/MVCC; execute_sql crucible PASS
 - Step 19 (PostgreSQL Wire Protocol): completed 2026-07-17 — pgwire on :5433; psql INSERT/SELECT PASS
 - Step 20 (V1.0 Repository Polish): completed 2026-07-17 — README, architecture guide, dual license, contributing guide, GitHub CI; all checks PASS
-- Package metadata is v1.0.0 with MSRV 1.85; initial six-step roadmap and Steps 7–20 are complete
+- Step 21 (Automated Release CI/CD): completed 2026-07-17 — `.github/workflows/release.yml`, tag-triggered (`v*`) cross-platform build matrix + GitHub Release publish
+- Package metadata is v1.0.0 with MSRV 1.85; initial six-step roadmap and Steps 7–21 are complete
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -167,6 +168,13 @@ Güncelleme: 2026-07-17
 - Single-node election fix: `run_election` promotes immediately when `peers.is_empty()` && quorum≤1
 - Crucible: `PGPASSWORD=any psql -h 127.0.0.1 -p 5433 -U admin -d postgres` → INSERT 0 1 + tabular SELECT PASS
 - Host note (2026-07-17): Ryzen 9 / x86_64 — `.cargo/config.toml` uses `CC=gcc` + gcc-16 lib path
+
+## Release Pipeline (Step 21)
+- `.github/workflows/release.yml`: triggers on `push` tags `v*`; `permissions: contents: write`
+- Build matrix: `ubuntu-latest`/x86_64-unknown-linux-gnu, `windows-latest`/x86_64-pc-windows-msvc, `macos-14`/aarch64-apple-darwin
+- protoc via `arduino/setup-protoc@v3` (cross-platform, needed for tonic-build); toolchain via `dtolnay/rust-toolchain@stable` with `targets`
+- Packages: `.tar.gz` (Linux/macOS, bash), `.zip` (Windows, pwsh Compress-Archive); bundles binary + README + both LICENSE files
+- Artifacts uploaded (upload-artifact@v4) then `release` job downloads (merge-multiple) and publishes via `softprops/action-gh-release@v2` with `generate_release_notes`
 
 ## Ortam Notları
 - Host is Ryzen 9 9950X workstation (x86_64); `.cargo/config.toml` sets `CC=gcc`

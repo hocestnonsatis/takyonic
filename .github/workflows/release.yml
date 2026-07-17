@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: takyonic-server
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: takyonic-server-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: takyonic-server-windows-x86_64.zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: takyonic-server-macos-aarch64.tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --bin takyonic-server --target ${{ matrix.target }}
+
+      - name: Package binary (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          staging="${{ env.BINARY_NAME }}"
+          mkdir -p "dist/${staging}"
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "dist/${staging}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${staging}/" 2>/dev/null || true
+          tar -czf "${{ matrix.archive }}" -C dist "${staging}"
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "${{ env.BINARY_NAME }}"
+          New-Item -ItemType Directory -Force -Path "dist/$staging" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "dist/$staging/"
+          foreach ($f in @("README.md", "LICENSE-MIT", "LICENSE-APACHE")) {
+            if (Test-Path $f) { Copy-Item $f "dist/$staging/" }
+          }
+          Compress-Archive -Path "dist/$staging/*" -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
