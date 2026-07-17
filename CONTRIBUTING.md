@@ -69,9 +69,9 @@ before merge.
 
 ## Reporting security issues
 
-Do not open a public issue for a suspected vulnerability. Use GitHub's private
-security advisory reporting for this repository so maintainers can investigate
-and coordinate disclosure.
+Do not open a public issue for a suspected vulnerability. Follow
+[SECURITY.md](SECURITY.md) so maintainers can investigate and coordinate
+disclosure privately.
 
 ## License
 

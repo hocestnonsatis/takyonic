@@ -87,8 +87,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
-a pull request.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md) before participating. For usage help, see
+[SUPPORT.md](SUPPORT.md). Report suspected vulnerabilities privately as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 

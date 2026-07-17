@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible defect in Takyonic
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. For suspected vulnerabilities, do not use
+        this form; follow `SECURITY.md` instead.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for duplicates.
+          required: true
+        - label: This report does not contain credentials or private data.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Takyonic version
+      description: Release tag or commit SHA
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Storage / compaction
+        - Raft / replication
+        - Transactions / MVCC
+        - SQL / query planner
+        - PostgreSQL wire protocol
+        - Client SDK
+        - Build / packaging
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable reproduction.
+      placeholder: |
+        1. Start Takyonic with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Rust version, and relevant configuration.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and additional context
+      description: Remove secrets and private data before pasting logs.
+      render: text

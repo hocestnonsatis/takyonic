@@ -3,7 +3,7 @@
 Güncelleme: 2026-07-17
 
 ## Proje Durumu
-- Private GitHub repository: `https://github.com/hocestnonsatis/takyonic` (`main`)
+- Public GitHub repository: `https://github.com/hocestnonsatis/takyonic` (`main`)
 - Step 1 (Foundation & Types): completed 2026-07-17 — types, Config, errors, tracing-init
 - Step 2 (WAL & Memtable): completed 2026-07-17 — WalWriter/WalReader (xxh3 + sync_data), Memtable (RwLock+BTreeMap)
 - Step 3 (SST & mmap Pinning): completed 2026-07-17 — block/index/Bloom layout, mmap reader, strict deferred deletion
@@ -25,6 +25,7 @@ Güncelleme: 2026-07-17
 - Step 19 (PostgreSQL Wire Protocol): completed 2026-07-17 — pgwire on :5433; psql INSERT/SELECT PASS
 - Step 20 (V1.0 Repository Polish): completed 2026-07-17 — README, architecture guide, dual license, contributing guide, GitHub CI; all checks PASS
 - Step 21 (Automated Release CI/CD): completed 2026-07-17 — `.github/workflows/release.yml`, tag-triggered (`v*`) cross-platform build matrix + GitHub Release publish
+- GitHub Community Standards completed 2026-07-17 — Code of Conduct, issue forms, PR template, security and support policies; Discussions and private vulnerability reporting enabled
 - Package metadata is v1.0.0 with MSRV 1.85; initial six-step roadmap and Steps 7–21 are complete
 
 ## Ingestion Path (Step 2)

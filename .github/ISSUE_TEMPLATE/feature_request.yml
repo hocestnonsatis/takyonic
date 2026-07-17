@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose an improvement to Takyonic
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for similar proposals.
+          required: true
+        - label: I reviewed the architecture and contribution guidelines.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or use case should this change address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior and, if relevant, the API or format changes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain other approaches and why they are insufficient.
+
+  - type: textarea
+    id: implications
+    attributes:
+      label: Correctness and compatibility
+      description: |
+        Describe effects on durability, Raft safety, on-disk compatibility,
+        performance, and existing clients. Write "None" where appropriate.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
