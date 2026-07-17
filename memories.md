@@ -25,8 +25,9 @@ Güncelleme: 2026-07-17
 - Step 19 (PostgreSQL Wire Protocol): completed 2026-07-17 — pgwire on :5433; psql INSERT/SELECT PASS
 - Step 20 (V1.0 Repository Polish): completed 2026-07-17 — README, architecture guide, dual license, contributing guide, GitHub CI; all checks PASS
 - Step 21 (Automated Release CI/CD): completed 2026-07-17 — `.github/workflows/release.yml`, tag-triggered (`v*`) cross-platform build matrix + GitHub Release publish
+- Step 22 (Cloud-Native Deployment): completed 2026-07-17 — multi-stage `Dockerfile` (distroless), 3-node `docker-compose.yml`, cluster-aware `takyonic-server`, GHCR `docker-publish` CI job
 - GitHub Community Standards completed 2026-07-17 — Code of Conduct, issue forms, PR template, security and support policies; Discussions and private vulnerability reporting enabled
-- Package metadata is v1.0.0 with MSRV 1.85; initial six-step roadmap and Steps 7–21 are complete
+- Package metadata is v1.0.1 with MSRV 1.85; initial six-step roadmap and Steps 7–22 are complete
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -176,6 +177,17 @@ Güncelleme: 2026-07-17
 - protoc via `arduino/setup-protoc@v3` (cross-platform, needed for tonic-build); toolchain via `dtolnay/rust-toolchain@stable` with `targets`
 - Packages: `.tar.gz` (Linux/macOS, bash), `.zip` (Windows, pwsh Compress-Archive); bundles binary + README + both LICENSE files
 - Artifacts uploaded (upload-artifact@v4) then `release` job downloads (merge-multiple) and publishes via `softprops/action-gh-release@v2` with `generate_release_notes`
+
+## Cloud-Native Deployment (Step 22)
+- `takyonic-server` is now cluster-aware: CLI flags `--node-id`, `--peers id:host:port,...`, `--raft-port` (5001), `--pg-port` (5433), `--bind-host` (0.0.0.0), `--data-dir`; env fallbacks `TAKYONIC_NODE_ID/PEERS/RAFT_PORT/PG_PORT/BIND_HOST/DATA`
+- Self binds `0.0.0.0:<raft-port>` (self endpoint only used to bind); peers keep advertised `host:port`; `leader_hint` resolves leader from each node's own membership so cross-node redirects use real hostnames
+- Binary no longer wipes data dir (defaults `/data`); pgwire client seeds = loopback + all peers, retries `connect()` up to 60s for leader election; SIGTERM/Ctrl-C → `node.close()` flush
+- `Dockerfile`: builder `rust:1.85-slim-bookworm` (protobuf-compiler + libprotobuf-dev for tonic-build) → cargo-chef-lite dep-cache layer (stub lib/bin build, then real src) → distroless `gcr.io/distroless/cc-debian12`; strips binary; EXPOSE 5001 5433; `/data` pre-created chown 65532 (nonroot) so named volume is writable; ENTRYPOINT `["/takyonic-server"]`
+- `.dockerignore` trims context to manifests+src+proto (Cargo.lock IS tracked/committed — required by build)
+- `docker-compose.yml`: 3 services node-1/2/3 on `takyonet` bridge, `image: ghcr.io/hocestnonsatis/takyonic:latest` + `build: .`; node-1 pgwire `5433:5433` (node-2→5434, node-3→5435); named volumes node{1,2,3}-data; peers via service DNS `--peers`
+- Image name is bare product brand `ghcr.io/<owner>/takyonic` (no `-server` suffix, postgres/mysql-style)
+- CI: `release.yml` gained `permissions: packages: write`, `IMAGE_NAME=ghcr.io/${{ github.repository }}`, and `docker-publish` job (`needs: build`) — buildx + docker/login-action (GITHUB_TOKEN) + metadata-action (tags: latest, semver {{version}}/{{major}}.{{minor}}, raw `v*` tag) + build-push-action@v6 with gha cache
+- NOT verified with a live `docker build` here — sandbox has no docker daemon access (no passwordless sudo, not in docker group); validated via `cargo check/clippy -D warnings/fmt --check` and `docker compose config`
 
 ## Ortam Notları
 - Host is Ryzen 9 9950X workstation (x86_64); `.cargo/config.toml` sets `CC=gcc`

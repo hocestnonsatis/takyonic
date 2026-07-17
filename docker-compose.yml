@@ -1,0 +1,74 @@
+# Takyonic — one-click 3-node local cluster.
+#
+#   docker compose up --build         # build locally and launch the cluster
+#   docker compose up -d              # pull ghcr.io image and launch detached
+#
+# Then connect a Postgres client to node-1 (published on the host):
+#   PGPASSWORD=any psql -h 127.0.0.1 -p 5433 -U admin -d postgres
+#
+# The nodes discover each other by service name over the `takyonet` bridge and
+# elect a Raft leader automatically. The smart pgwire frontend on every node
+# transparently forwards writes to whichever node is the current leader, so any
+# published port is a valid entry point.
+
+x-takyonic-common: &takyonic-common
+  # Build locally, but tag as the GHCR image so `docker compose pull` also works.
+  image: ghcr.io/hocestnonsatis/takyonic:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  networks:
+    - takyonet
+
+services:
+  node-1:
+    <<: *takyonic-common
+    container_name: takyonic-node-1
+    hostname: node-1
+    command:
+      - "--node-id"
+      - "1"
+      - "--peers"
+      - "2:node-2:5001,3:node-3:5001"
+    ports:
+      - "5433:5433"   # PostgreSQL wire (host entry point)
+    volumes:
+      - node1-data:/data
+
+  node-2:
+    <<: *takyonic-common
+    container_name: takyonic-node-2
+    hostname: node-2
+    command:
+      - "--node-id"
+      - "2"
+      - "--peers"
+      - "1:node-1:5001,3:node-3:5001"
+    ports:
+      - "5434:5433"   # optional: node-2 pgwire on host :5434
+    volumes:
+      - node2-data:/data
+
+  node-3:
+    <<: *takyonic-common
+    container_name: takyonic-node-3
+    hostname: node-3
+    command:
+      - "--node-id"
+      - "3"
+      - "--peers"
+      - "1:node-1:5001,2:node-2:5001"
+    ports:
+      - "5435:5433"   # optional: node-3 pgwire on host :5435
+    volumes:
+      - node3-data:/data
+
+networks:
+  takyonet:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

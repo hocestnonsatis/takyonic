@@ -1,0 +1,27 @@
+# Keep the build context tiny so `docker build` uploads fast and layer caching
+# stays effective. The image is built purely from Cargo manifests + src + proto.
+target/
+**/target/
+
+# VCS / CI / editor noise
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# Docker + compose files (not needed inside the build context)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Docs / misc that don't affect the compiled binary
+*.md
+memories.md
+LICENSE-MIT
+LICENSE-APACHE
+
+# Local data / logs
+data/
+wal/
+*.log
