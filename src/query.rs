@@ -299,10 +299,10 @@ fn execute_plan(engine: &TakyonicEngine, plan: &ExecutionPlan) -> Result<Vec<Rec
             .all(|f| matches_filter(&record, f))
         {
             // Also verify driving filter in case of stale index (should match).
-            if let Some(df) = &plan.driving_filter
-                && !matches_filter(&record, df)
-            {
-                continue;
+            if let Some(df) = &plan.driving_filter {
+                if !matches_filter(&record, df) {
+                    continue;
+                }
             }
             out.push(record);
         }

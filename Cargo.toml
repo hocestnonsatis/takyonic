@@ -1,6 +1,6 @@
 [package]
 name = "takyonic"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Distributed MVCC NewSQL database with custom Raft and PostgreSQL wire compatibility"
@@ -21,7 +21,7 @@ dashmap = "6"
 futures = "0.3"
 memmap2 = "0.9"
 parking_lot = "0.12"
-pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
+pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"] }
 prost = "0.13"
 sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 thiserror = "2"

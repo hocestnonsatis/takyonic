@@ -268,11 +268,10 @@ pub async fn wait_for_leader(nodes: &[Arc<TakyonicNode>], timeout: Duration) -> 
             }
             if let Some(leader) = n.leader_id() {
                 // Confirm that node actually believes it is leader.
-                if let Some(l) = nodes.iter().find(|x| x.id() == leader)
-                    && l.role() == Role::Leader
-                    && !l.raft().is_removed()
-                {
-                    return Ok(leader);
+                if let Some(l) = nodes.iter().find(|x| x.id() == leader) {
+                    if l.role() == Role::Leader && !l.raft().is_removed() {
+                        return Ok(leader);
+                    }
                 }
             }
         }

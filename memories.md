@@ -27,7 +27,7 @@ Güncelleme: 2026-07-17
 - Step 21 (Automated Release CI/CD): completed 2026-07-17 — `.github/workflows/release.yml`, tag-triggered (`v*`) cross-platform build matrix + GitHub Release publish
 - Step 22 (Cloud-Native Deployment): completed 2026-07-17 — multi-stage `Dockerfile` (distroless), 3-node `docker-compose.yml`, cluster-aware `takyonic-server`, GHCR `docker-publish` CI job
 - GitHub Community Standards completed 2026-07-17 — Code of Conduct, issue forms, PR template, security and support policies; Discussions and private vulnerability reporting enabled
-- Package metadata is v1.0.1 with MSRV 1.85; initial six-step roadmap and Steps 7–22 are complete
+- Package metadata is v1.0.2 with MSRV 1.85; initial six-step roadmap and Steps 7–22 are complete
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -163,7 +163,7 @@ Güncelleme: 2026-07-17
 - Harness (`examples/sql_interface.rs`): 1k SQL INSERTs (10 Ankara) → `SELECT ... status='active' AND city='Ankara'` → IndexScan(city) est=10, 10 rows PASS
 
 ## PostgreSQL Wire Protocol (Step 19)
-- Dep: `pgwire` 0.40 (`server-api` only) + `async-trait`
+- Dep: `pgwire` pinned to `=0.36.3` (`server-api` only) + `async-trait`; this is the latest line compatible with the project's Rust 1.85 MSRV (`pgwire` 0.37+ requires Rust 1.89)
 - `src/pg.rs`: `TakyonicPgBackend` (SimpleQueryHandler) → `execute_sql`; `AcceptAnyCleartext` auth (any user/pass)
 - Result mapping: `FieldInfo` + `DataRowEncoder` (INT8 / VARCHAR); INSERT → `CommandComplete` `INSERT 0 N`
 - Binary `takyonic-server`: single-node Raft + pgwire on `127.0.0.1:5433` (Raft gRPC `:15433`)

@@ -78,10 +78,10 @@ impl ClientGrpcService {
 
     fn not_leader_status(&self) -> Status {
         let mut status = Status::failed_precondition(NOT_LEADER_MSG);
-        if let Some(addr) = self.leader_hint()
-            && let Ok(v) = MetadataValue::try_from(addr.as_str())
-        {
-            status.metadata_mut().insert(LEADER_ADDR_META, v);
+        if let Some(addr) = self.leader_hint() {
+            if let Ok(v) = MetadataValue::try_from(addr.as_str()) {
+                status.metadata_mut().insert(LEADER_ADDR_META, v);
+            }
         }
         status
     }
@@ -99,10 +99,10 @@ impl ClientGrpcService {
             TakyonicError::Conflict(msg) => Status::aborted(format!("conflict:{msg}")),
             TakyonicError::NotLeader { leader_address } => {
                 let mut status = Status::failed_precondition(NOT_LEADER_MSG);
-                if let Some(addr) = leader_address
-                    && let Ok(v) = MetadataValue::try_from(addr.as_str())
-                {
-                    status.metadata_mut().insert(LEADER_ADDR_META, v);
+                if let Some(addr) = leader_address {
+                    if let Ok(v) = MetadataValue::try_from(addr.as_str()) {
+                        status.metadata_mut().insert(LEADER_ADDR_META, v);
+                    }
                 }
                 status
             }

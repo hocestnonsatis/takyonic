@@ -295,15 +295,15 @@ impl TakyonicEngine {
         {
             let last = self.last_commit.lock();
             for key in reads.keys().chain(writes.keys()) {
-                if let Some(&ts) = last.get(key)
-                    && ts > read_ts
-                {
-                    drop(last);
-                    self.end_transaction(txn_id);
-                    return Err(TakyonicError::Conflict(format!(
-                        "key {:?} committed at {ts} > read_ts {read_ts}",
-                        String::from_utf8_lossy(key.as_bytes())
-                    )));
+                if let Some(&ts) = last.get(key) {
+                    if ts > read_ts {
+                        drop(last);
+                        self.end_transaction(txn_id);
+                        return Err(TakyonicError::Conflict(format!(
+                            "key {:?} committed at {ts} > read_ts {read_ts}",
+                            String::from_utf8_lossy(key.as_bytes())
+                        )));
+                    }
                 }
             }
         }

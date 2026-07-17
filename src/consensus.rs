@@ -282,11 +282,12 @@ impl RaftConsensus {
         let commit = st.commit_index;
         drop(st);
         for idx in (commit + 1)..=self.log.last_index() {
-            if let Some(entry) = self.log.entry(idx)
-                && let Ok(cmd) = RaftCommand::decode(entry.command)
-                && cmd.is_config_change()
-            {
-                return true;
+            if let Some(entry) = self.log.entry(idx) {
+                if let Ok(cmd) = RaftCommand::decode(entry.command) {
+                    if cmd.is_config_change() {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -321,11 +322,12 @@ impl RaftConsensus {
         // Immediate-effect: apply ConfigChange entries as soon as they are appended.
         for i in 0..n {
             let index = start + i as u64;
-            if let Some(entry) = self.log.entry(index)
-                && let Ok(cmd) = RaftCommand::decode(entry.command)
-                && cmd.is_config_change()
-            {
-                self.apply_config_change_immediate(&cmd);
+            if let Some(entry) = self.log.entry(index) {
+                if let Ok(cmd) = RaftCommand::decode(entry.command) {
+                    if cmd.is_config_change() {
+                        self.apply_config_change_immediate(&cmd);
+                    }
+                }
             }
         }
         let mut st = self.state.lock();
@@ -579,10 +581,10 @@ impl RaftConsensus {
         }
         // Cooldown: exporting SSTs every heartbeat for a dead peer starves the cluster.
         const COOLDOWN: Duration = Duration::from_secs(2);
-        if let Some(prev) = st.snapshot_attempt.get(&peer)
-            && prev.elapsed() < COOLDOWN
-        {
-            return false;
+        if let Some(prev) = st.snapshot_attempt.get(&peer) {
+            if prev.elapsed() < COOLDOWN {
+                return false;
+            }
         }
         st.snapshot_attempt.insert(peer, Instant::now());
         true
@@ -855,10 +857,10 @@ impl RaftConsensus {
                 break;
             };
             let command = RaftCommand::decode(entry.command.clone())?;
-            if let RaftCommand::RemoveNode { id } = &command
-                && *id == self.id
-            {
-                committed_removes.push(idx);
+            if let RaftCommand::RemoveNode { id } = &command {
+                if *id == self.id {
+                    committed_removes.push(idx);
+                }
             }
             batch.push(CommittedEntry::new(idx, command));
         }
@@ -999,15 +1001,15 @@ impl RaftConsensus {
                 quorum = st.membership.quorum(),
                 "membership updated (immediate effect)"
             );
-            if let Some(peer) = peer_to_seed
-                && st.role == Role::Leader
-            {
-                st.match_index.insert(peer, 0);
-                let snap = self.log.snapshot_meta().last_included_index;
-                if snap > 0 {
-                    st.next_index.insert(peer, snap);
-                } else {
-                    st.next_index.insert(peer, 1);
+            if let Some(peer) = peer_to_seed {
+                if st.role == Role::Leader {
+                    st.match_index.insert(peer, 0);
+                    let snap = self.log.snapshot_meta().last_included_index;
+                    if snap > 0 {
+                        st.next_index.insert(peer, snap);
+                    } else {
+                        st.next_index.insert(peer, 1);
+                    }
                 }
             }
             if let RaftCommand::RemoveNode { id } = cmd {
@@ -1020,10 +1022,10 @@ impl RaftConsensus {
 
     fn apply_appended_config_changes(&self, entries: &[RaftLogEntry]) {
         for entry in entries {
-            if let Ok(cmd) = RaftCommand::decode(entry.command.clone())
-                && cmd.is_config_change()
-            {
-                self.apply_config_change_immediate(&cmd);
+            if let Ok(cmd) = RaftCommand::decode(entry.command.clone()) {
+                if cmd.is_config_change() {
+                    self.apply_config_change_immediate(&cmd);
+                }
             }
         }
     }
@@ -1037,10 +1039,10 @@ impl RaftConsensus {
             )
         };
         for entry in self.log.entries_from(snap_idx.saturating_add(1)) {
-            if let Ok(cmd) = RaftCommand::decode(entry.command)
-                && cmd.is_config_change()
-            {
-                apply_config_to(&mut live, &cmd);
+            if let Ok(cmd) = RaftCommand::decode(entry.command) {
+                if cmd.is_config_change() {
+                    apply_config_to(&mut live, &cmd);
+                }
             }
         }
         let mut st = self.state.lock();

@@ -6,6 +6,7 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
@@ -16,12 +17,9 @@ use pgwire::api::auth::{
 };
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{
-    ClientInfo, PgWireConnectionState, PgWireServerHandlers, PidSecretKeyGenerator,
-    RandomPidSecretKeyGenerator, Type,
-};
+use pgwire::api::{ClientInfo, PgWireConnectionState, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::startup::Authentication;
+use pgwire::messages::startup::{Authentication, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tracing::debug;
 
@@ -32,7 +30,7 @@ use crate::sql::{LogicalPlan, SqlEngine};
 /// Cleartext password handshake that always succeeds (any username/password).
 pub struct AcceptAnyCleartext {
     params: DefaultServerParameterProvider,
-    pid_gen: RandomPidSecretKeyGenerator,
+    next_pid: AtomicI32,
 }
 
 impl AcceptAnyCleartext {
@@ -43,7 +41,7 @@ impl AcceptAnyCleartext {
         params.client_encoding = Some("UTF8".into());
         Self {
             params,
-            pid_gen: RandomPidSecretKeyGenerator::default(),
+            next_pid: AtomicI32::new(1),
         }
     }
 }
@@ -74,8 +72,9 @@ impl StartupHandler for AcceptAnyCleartext {
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 let _ = pwd.into_password()?;
                 debug!("pgwire cleartext auth — accepting credentials");
-                let (pid, secret_key) = self.pid_gen.generate(client);
-                client.set_pid_and_secret_key(pid, secret_key);
+                let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
+                let secret = pid.rotate_left(13) ^ std::process::id() as i32;
+                client.set_pid_and_secret_key(pid, SecretKey::I32(secret));
                 finish_authentication(client, &self.params).await?;
             }
             _ => {}
@@ -187,7 +186,7 @@ fn encode_select_response(rows: Vec<Record>) -> PgWireResult<Response> {
                 }
             }
         }
-        encoded.push(Ok(encoder.take_row()));
+        encoded.push(encoder.finish());
     }
 
     Ok(Response::Query(QueryResponse::new(

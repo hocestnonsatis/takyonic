@@ -99,10 +99,10 @@ impl RaftLog {
         let wal = if path.exists() {
             let mut reader = WalReader::open(&path)?;
             reader.replay(|entry| {
-                if let Ok(e) = RaftLogEntry::from_wal_entry(&entry)
-                    && e.index > snap.last_included_index
-                {
-                    recovered.push(e);
+                if let Ok(e) = RaftLogEntry::from_wal_entry(&entry) {
+                    if e.index > snap.last_included_index {
+                        recovered.push(e);
+                    }
                 }
             })?;
             if reader.has_torn_tail() {
