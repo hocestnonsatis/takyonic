@@ -1,0 +1,7 @@
+# Termux/proot hosts often expose Android clang as `cc`, which cannot find
+# Ubuntu's libgcc_s. Prefer the distro GCC and its library search path.
+[env]
+CC = "aarch64-linux-gnu-gcc"
+
+[build]
+rustflags = ["-L", "/usr/lib/gcc/aarch64-linux-gnu/15"]

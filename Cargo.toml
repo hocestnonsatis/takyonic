@@ -1,0 +1,35 @@
+[package]
+name = "takyonic"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded high-performance LSM-Tree key-value engine with Raft consensus"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Opt-in helper that installs a default tracing-subscriber from RUST_LOG.
+tracing-init = ["dep:tracing-subscriber"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+crossbeam-channel = "0.5"
+dashmap = "6"
+futures = "0.3"
+memmap2 = "0.9"
+parking_lot = "0.12"
+prost = "0.13"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
