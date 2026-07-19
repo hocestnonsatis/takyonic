@@ -172,7 +172,7 @@ pub fn run_mvcc_soak(cfg: MvccSoakConfig) -> ReliabilityReport {
         let ops = Arc::clone(&ops);
         let violations = Arc::clone(&violations);
         let accounts = cfg.accounts;
-        let mut rng = cfg.seed ^ ((w as u64 + 1) * 0x9E37_79B9_7F4A_7C15);
+        let mut rng = cfg.seed ^ ((w as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let from = (xorshift(&mut rng) as usize) % accounts;
