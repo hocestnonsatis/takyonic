@@ -11,6 +11,8 @@ repository = "https://github.com/hocestnonsatis/takyonic"
 default = []
 # Opt-in helper that installs a default tracing-subscriber from RUST_LOG.
 tracing-init = []
+# Real AWS S3 / MinIO backend via aws-sdk-s3 (tests use InMemoryObjectStore mock).
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
 anyhow = "1"
@@ -19,10 +21,14 @@ bytes = "1"
 crossbeam-channel = "0.5"
 dashmap = "6"
 futures = "0.3"
+libc = "0.2.186"
 memmap2 = "0.9"
 parking_lot = "0.12"
-pgwire = { version = "=0.36.3", default-features = false, features = ["server-api"] }
+# `server-api-ring` enables SCRAM-SHA-256 (SASL) via ring + base64 + stringprep.
+pgwire = { version = "=0.36.3", default-features = false, features = ["server-api-ring"] }
 prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
@@ -30,7 +36,15 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cranelift = "0.133"
+cranelift-codegen = "0.133"
+cranelift-jit = "0.133"
+cranelift-module = "0.133"
+cranelift-native = "0.133"
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
+argon2 = { version = "0.5.3", features = ["password-hash"] }
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -38,6 +52,7 @@ tonic-build = "0.12"
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+proptest = "1.6"
 
 [[bin]]
 name = "takyonic-server"

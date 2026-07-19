@@ -4,6 +4,9 @@ pub mod ha_soak;
 pub mod mvcc_soak;
 pub mod sql_fuzzer;
 
+#[cfg(test)]
+pub mod props;
+
 use std::time::Duration;
 
 /// Aggregate outcome of a reliability run (fuzz / soak / HA).
