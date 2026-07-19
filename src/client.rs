@@ -8,11 +8,13 @@
 //! Step 18 adds [`TakyonicClient::execute_sql`]: parse → CBO plan / MVCC
 //! `put_record` → leader execution with the same OCC / NotLeader retries.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use parking_lot::RwLock as SyncRwLock;
 use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::transport::Channel;
@@ -20,15 +22,16 @@ use tracing::{debug, warn};
 
 use crate::client_service::status_to_error;
 use crate::error::{Result, TakyonicError};
+use crate::executor::{self, ExecutionContext, value_to_field};
 use crate::network::proto::client_service_client::ClientServiceClient;
 use crate::network::proto::{
     BeginTxnRequest, ExecuteQueryRequest, FilterPred, IndexDefMsg, KvGetRequest, KvPutRequest,
-    PingRequest, RegisterTableRequest, TxnAbortRequest, TxnCommitRequest, TxnGetRequest,
-    TxnPutRecordRequest, TxnPutRequest,
+    PingRequest, RegisterTableRequest, TxnAbortRequest, TxnCommitRequest, TxnDeleteRecordRequest,
+    TxnGetRequest, TxnPutRecordRequest, TxnPutRequest,
 };
 use crate::query::FilterOp;
-use crate::schema::{IndexDef, Record, TableSchema};
-use crate::sql::{LogicalPlan, SqlEngine};
+use crate::schema::{IndexDef, Record, TableSchema, data_key};
+use crate::sql::{Expression, LogicalPlan, SqlEngine};
 use crate::types::{Key, Value};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -46,6 +49,8 @@ struct Inner {
     seeds: Vec<String>,
     leader: RwLock<Option<LeaderConn>>,
     rng: AtomicU64,
+    /// Schemas known via [`TakyonicClient::register_table`] (for PK UPDATE/DELETE).
+    schemas: SyncRwLock<HashMap<String, TableSchema>>,
 }
 
 /// Topology-aware Takyonic client.
@@ -67,6 +72,7 @@ impl TakyonicClient {
                 seeds,
                 leader: RwLock::new(None),
                 rng: AtomicU64::new(seed ^ 0x9E37_79B9_7F4A_7C15),
+                schemas: SyncRwLock::new(HashMap::new()),
             }),
         }
     }
@@ -125,13 +131,17 @@ impl TakyonicClient {
     /// Register a table schema on every reachable seed (so any elected leader
     /// can serve `put_record` / CBO queries).
     pub async fn register_table(&self, schema: TableSchema) -> Result<()> {
+        self.inner
+            .schemas
+            .write()
+            .insert(schema.name.clone(), schema.clone());
         let req = RegisterTableRequest {
             name: schema.name.clone(),
             primary_key: schema.primary_key.clone(),
             indexes: schema
                 .indexes
                 .iter()
-                .map(|IndexDef { name, column }| IndexDefMsg {
+                .map(|IndexDef { name, column, .. }| IndexDefMsg {
                     name: name.clone(),
                     column: column.clone(),
                 })
@@ -158,13 +168,23 @@ impl TakyonicClient {
 
     /// Parse `sql`, translate to a logical plan, and execute on the Raft leader.
     ///
-    /// * `INSERT` → [`Self::execute_txn`] + [`ClientTxn::put_record`] (MVCC + indexes)
+    /// * `INSERT` → evaluate VALUES → [`Self::execute_txn`] + [`ClientTxn::put_record`]
     /// * `SELECT` → CBO on the leader (`engine.query(...).filter(...)`)
+    /// * `UPDATE` / `DELETE` → PK-equality WHERE via `put_record` / [`ClientTxn::delete_record`]
     ///
     /// OCC conflicts and NotLeader redirects are retried by the SDK.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<Record>> {
         match SqlEngine::plan(sql)? {
-            LogicalPlan::Insert { table, records } => {
+            LogicalPlan::Insert {
+                table,
+                columns,
+                values,
+            } => {
+                let records = executor::materialize_insert_records(
+                    &columns,
+                    &values,
+                    &ExecutionContext::new(),
+                )?;
                 self.execute_txn(|txn| {
                     let table = table.clone();
                     let records = records.clone();
@@ -178,17 +198,86 @@ impl TakyonicClient {
                 .await?;
                 Ok(Vec::new())
             }
-            LogicalPlan::Select { table, filters } => {
+            LogicalPlan::Select { table, filters, .. } => {
                 let (records, _explain) = self.execute_select(table, filters).await?;
                 Ok(records)
             }
+            LogicalPlan::Update {
+                table,
+                assignments,
+                selection,
+            } => {
+                let pk = extract_pk_equality(&table, selection.as_ref(), &self.inner.schemas)?;
+                self.execute_txn(|txn| {
+                    let table = table.clone();
+                    let assignments = assignments.clone();
+                    let pk = pk.clone();
+                    async move {
+                        let key = data_key(&table, &pk);
+                        let Some(raw) = txn.get(key).await? else {
+                            return Ok(());
+                        };
+                        let mut record = Record::decode(&raw)?;
+                        let ctx = ExecutionContext::new();
+                        for (col, expr) in &assignments {
+                            let v = executor::evaluate(expr, &record, &ctx)?;
+                            record = record.set(col.clone(), value_to_field(&v));
+                        }
+                        txn.put_record(table, record).await?;
+                        Ok(())
+                    }
+                })
+                .await?;
+                Ok(Vec::new())
+            }
+            LogicalPlan::Delete { table, selection } => {
+                let pk = extract_pk_equality(&table, selection.as_ref(), &self.inner.schemas)?;
+                self.execute_txn(|txn| {
+                    let table = table.clone();
+                    let pk = pk.clone();
+                    async move {
+                        txn.delete_record(table, pk).await?;
+                        Ok(())
+                    }
+                })
+                .await?;
+                Ok(Vec::new())
+            }
+            LogicalPlan::Join { .. }
+            | LogicalPlan::DistributedJoin { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::DistributedAggregate { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Limit { .. } => Err(TakyonicError::Sql(
+                "JOIN/Aggregate/Sort/Limit require the local Volcano path (SessionState)".into(),
+            )),
+            LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback => {
+                Err(TakyonicError::Sql(
+                    "BEGIN/COMMIT/ROLLBACK require SessionState (local pgwire session)".into(),
+                ))
+            }
+            LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::DropRole { .. }
+            | LogicalPlan::Grant { .. }
+            | LogicalPlan::Revoke { .. }
+            | LogicalPlan::GrantRole { .. }
+            | LogicalPlan::Explain { .. }
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::Vacuum { .. }
+            | LogicalPlan::Filter { .. }
+            | LogicalPlan::SubqueryAlias { .. } => Err(TakyonicError::Sql(
+                "CREATE/DROP INDEX, ROLE/GRANT, ANALYZE, VACUUM, EXPLAIN, Filter, and CTE views require the local Volcano path (SessionState)"
+                    .into(),
+            )),
         }
     }
 
     /// Like [`Self::execute_sql`] for SELECT, but also returns the CBO EXPLAIN text.
     pub async fn explain_sql(&self, sql: &str) -> Result<(Vec<Record>, String)> {
         match SqlEngine::plan(sql)? {
-            LogicalPlan::Select { table, filters } => self.execute_select(table, filters).await,
+            LogicalPlan::Select { table, filters, .. } => self.execute_select(table, filters).await,
             other => Err(TakyonicError::Sql(format!(
                 "EXPLAIN requires SELECT, got {other:?}"
             ))),
@@ -411,6 +500,25 @@ impl TakyonicClient {
         .await
     }
 
+    async fn txn_delete_record(&self, txn_id: u64, table: String, pk: String) -> Result<()> {
+        self.with_leader(|mut client| {
+            let table = table.clone();
+            let pk = pk.clone();
+            async move {
+                client
+                    .txn_delete_record(Request::new(TxnDeleteRecordRequest {
+                        txn_id,
+                        table,
+                        pk,
+                    }))
+                    .await
+                    .map_err(status_to_error)?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
     async fn with_leader<F, Fut, T>(&self, f: F) -> Result<T>
     where
         F: Fn(ClientServiceClient<Channel>) -> Fut,
@@ -572,6 +680,62 @@ impl ClientTxn {
         self.client
             .txn_put_record(self.txn_id, table.into(), record)
             .await
+    }
+
+    /// Delete a structured record by primary key (data key + secondary indexes).
+    pub async fn delete_record(
+        &self,
+        table: impl Into<String>,
+        pk: impl Into<String>,
+    ) -> Result<()> {
+        self.client
+            .txn_delete_record(self.txn_id, table.into(), pk.into())
+            .await
+    }
+}
+
+/// Extract `pk_column = literal` from a Smart Client UPDATE/DELETE WHERE clause.
+fn extract_pk_equality(
+    table: &str,
+    selection: Option<&Expression>,
+    schemas: &SyncRwLock<HashMap<String, TableSchema>>,
+) -> Result<String> {
+    let schema = schemas.read().get(table).cloned().ok_or_else(|| {
+        TakyonicError::Sql(format!(
+            "table `{table}` schema unknown to Smart Client — call register_table first"
+        ))
+    })?;
+    let Some(expr) = selection else {
+        return Err(TakyonicError::Sql(
+            "Smart Client UPDATE/DELETE requires a primary-key equality WHERE clause".into(),
+        ));
+    };
+    match expr {
+        Expression::BinaryOp {
+            left,
+            op: FilterOp::Eq,
+            right,
+        } => {
+            let (col, lit) = match (left.as_ref(), right.as_ref()) {
+                (Expression::Column(c), Expression::Literal(v)) => (c.as_str(), v.as_str()),
+                (Expression::Literal(v), Expression::Column(c)) => (c.as_str(), v.as_str()),
+                _ => {
+                    return Err(TakyonicError::Sql(
+                        "Smart Client UPDATE/DELETE requires `pk = literal`".into(),
+                    ));
+                }
+            };
+            if col != schema.primary_key {
+                return Err(TakyonicError::Sql(format!(
+                    "Smart Client UPDATE/DELETE requires equality on primary key `{}`, got `{col}`",
+                    schema.primary_key
+                )));
+            }
+            Ok(lit.to_string())
+        }
+        _ => Err(TakyonicError::Sql(
+            "Smart Client UPDATE/DELETE requires `pk = literal`".into(),
+        )),
     }
 }
 

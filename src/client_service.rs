@@ -19,8 +19,9 @@ use crate::network::proto::{
     BeginTxnRequest, BeginTxnResponse, ExecuteQueryRequest, ExecuteQueryResponse, FilterPred,
     IndexDefMsg, KvGetRequest, KvGetResponse, KvPutRequest, KvPutResponse, PingRequest,
     PingResponse, RegisterTableRequest, RegisterTableResponse, TxnAbortRequest, TxnAbortResponse,
-    TxnCommitRequest, TxnCommitResponse, TxnGetRequest, TxnGetResponse, TxnPutRecordRequest,
-    TxnPutRecordResponse, TxnPutRequest, TxnPutResponse,
+    TxnCommitRequest, TxnCommitResponse, TxnDeleteRecordRequest, TxnDeleteRecordResponse,
+    TxnGetRequest, TxnGetResponse, TxnPutRecordRequest, TxnPutRecordResponse, TxnPutRequest,
+    TxnPutResponse,
 };
 use crate::raft::RaftCommand;
 use crate::schema::{IndexDef, Record, TableSchema, data_key, index_key};
@@ -111,12 +112,15 @@ impl ClientGrpcService {
     }
 
     fn is_leadership_error(e: &TakyonicError) -> bool {
-        matches!(
-            e,
-            TakyonicError::Raft(m) if m.contains("not leader")
-                || m.contains("leadership lost")
-                || m.contains("lost leadership")
-        )
+        match e {
+            TakyonicError::NotLeader { .. } => true,
+            TakyonicError::Raft(m) => {
+                m.contains("not leader")
+                    || m.contains("leadership lost")
+                    || m.contains("lost leadership")
+            }
+            _ => false,
+        }
     }
 
     fn session_get(
@@ -215,6 +219,37 @@ impl ClientGrpcService {
         session.stats_edits.push(StatsEdit::Insert {
             table: table.to_string(),
             index_values: new_idx,
+        });
+        Ok(())
+    }
+
+    fn session_delete_record(
+        &self,
+        session: &mut Session,
+        table: &str,
+        pk: &str,
+    ) -> Result<(), Status> {
+        let schema = self.engine.table_schema(table).map_err(Self::map_err)?;
+        let dkey = data_key(table, pk);
+        let Some(old_val) = self.session_get(session, dkey.clone())? else {
+            return Ok(());
+        };
+        let old = Record::decode(&old_val).map_err(Self::map_err)?;
+        let mut old_idx = Vec::new();
+        for idx in &schema.indexes {
+            if idx.is_vector() {
+                continue;
+            }
+            if let Some(v) = old.get(&idx.column) {
+                let encoded = index_store_value(v);
+                self.session_delete(session, index_key(table, &idx.name, &encoded, pk))?;
+                old_idx.push((idx.name.clone(), encoded));
+            }
+        }
+        self.session_delete(session, dkey)?;
+        session.stats_edits.push(StatsEdit::Delete {
+            table: table.to_string(),
+            index_values: old_idx,
         });
         Ok(())
     }
@@ -352,6 +387,20 @@ impl ClientService for ClientGrpcService {
         Ok(Response::new(TxnPutRecordResponse {}))
     }
 
+    async fn txn_delete_record(
+        &self,
+        request: Request<TxnDeleteRecordRequest>,
+    ) -> std::result::Result<Response<TxnDeleteRecordResponse>, Status> {
+        self.require_leader()?;
+        let req = request.into_inner();
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(&req.txn_id)
+            .ok_or_else(|| Status::not_found(format!("unknown txn {}", req.txn_id)))?;
+        self.session_delete_record(session, &req.table, &req.pk)?;
+        Ok(Response::new(TxnDeleteRecordResponse {}))
+    }
+
     async fn txn_commit(
         &self,
         request: Request<TxnCommitRequest>,
@@ -386,6 +435,12 @@ impl ClientService for ClientGrpcService {
             Ok(ops) => ops,
             Err(e) => return Err(Self::map_err(e)),
         };
+
+        // WAL-before-data (ARIES): Commit must be durable before Raft apply.
+        if let Err(e) = self.engine.log_txn_wal(txn_id, &session.writes) {
+            self.engine.end_transaction(txn_id);
+            return Err(Self::map_err(e));
+        }
 
         match self.raft.propose(RaftCommand::txn_batch(ops)).await {
             Ok(commit_ts) => {

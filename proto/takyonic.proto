@@ -83,6 +83,7 @@ service ClientService {
   rpc TxnGet (TxnGetRequest) returns (TxnGetResponse);
   rpc TxnPut (TxnPutRequest) returns (TxnPutResponse);
   rpc TxnPutRecord (TxnPutRecordRequest) returns (TxnPutRecordResponse);
+  rpc TxnDeleteRecord (TxnDeleteRecordRequest) returns (TxnDeleteRecordResponse);
   rpc TxnCommit (TxnCommitRequest) returns (TxnCommitResponse);
   rpc TxnAbort (TxnAbortRequest) returns (TxnAbortResponse);
 
@@ -169,6 +170,14 @@ message TxnPutRecordRequest {
 
 message TxnPutRecordResponse {}
 
+message TxnDeleteRecordRequest {
+  uint64 txn_id = 1;
+  string table = 2;
+  string pk = 3;
+}
+
+message TxnDeleteRecordResponse {}
+
 message IndexDefMsg {
   string name = 1;
   string column = 2;
@@ -200,3 +209,63 @@ message ExecuteQueryResponse {
   // CBO EXPLAIN text.
   string explain = 2;
 }
+
+// ---------------------------------------------------------------------------
+// MPP shuffle / fragment execution (coordinator ↔ workers).
+// ---------------------------------------------------------------------------
+service ShuffleService {
+  // Push a batch of rows into a shuffle partition buffer (with backpressure).
+  rpc PushShuffle (PushShuffleRequest) returns (PushShuffleResponse);
+
+  // Fetch (and drain) rows for one shuffle partition on this node.
+  rpc FetchShuffle (FetchShuffleRequest) returns (FetchShuffleResponse);
+
+  // Execute a worker fragment and return produced rows (local scan / partial agg).
+  rpc ExecuteFragment (ExecuteFragmentRequest) returns (ExecuteFragmentResponse);
+
+  // Tear down shuffle buffers for a finished query.
+  rpc CloseShuffle (CloseShuffleRequest) returns (CloseShuffleResponse);
+}
+
+message PushShuffleRequest {
+  uint64 query_id = 1;
+  uint64 shuffle_id = 2;
+  uint32 partition = 3;
+  // Encoded Record payloads.
+  repeated bytes rows = 4;
+  bool eos = 5;
+}
+
+message PushShuffleResponse {
+  // True when the receiver accepted the batch (buffer had capacity).
+  bool accepted = 1;
+  // Hint: wait this many ms before retrying if !accepted.
+  uint32 retry_after_ms = 2;
+}
+
+message FetchShuffleRequest {
+  uint64 query_id = 1;
+  uint64 shuffle_id = 2;
+  uint32 partition = 3;
+}
+
+message FetchShuffleResponse {
+  repeated bytes rows = 1;
+  bool eos = 2;
+}
+
+message ExecuteFragmentRequest {
+  // Opaque fragment encoding (see crate::mpp::FragmentSpec::encode).
+  bytes fragment = 1;
+}
+
+message ExecuteFragmentResponse {
+  repeated bytes rows = 1;
+}
+
+message CloseShuffleRequest {
+  uint64 query_id = 1;
+  uint64 shuffle_id = 2;
+}
+
+message CloseShuffleResponse {}

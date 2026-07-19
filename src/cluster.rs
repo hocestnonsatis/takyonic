@@ -118,6 +118,8 @@ impl TakyonicNode {
         }
         let peers = Arc::new(PeerClients::new(peer_endpoints));
 
+        engine.attach_raft_node(&raft);
+
         Ok(Self {
             id,
             addr,
@@ -281,5 +283,318 @@ pub async fn wait_for_leader(nodes: &[Arc<TakyonicNode>], timeout: Duration) -> 
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::TakyonicClient;
+    use crate::error::TakyonicError;
+    use crate::pg::SessionState;
+    use crate::schema::TableSchema;
+    use crate::types::Key;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn node_config(root: &std::path::Path, id: u64) -> Config {
+        Config::default()
+            .data_dir(root.join(format!("node-{id}")).join("data"))
+            .wal_dir(root.join(format!("node-{id}")).join("wal"))
+            .memtable_size_bytes(8 * 1024 * 1024)
+            .l0_soft_limit(16)
+            .l0_hard_limit(48)
+            .l0_rapid_pool_threads(1)
+            .ln_haul_pool_threads(1)
+            .compaction_write_bytes_per_sec(32 * 1024 * 1024)
+            .write_admission_ops_per_sec(500_000)
+            .write_admission_min_ops_per_sec(10_000)
+            .write_admission_burst(50_000)
+    }
+
+    async fn boot_cluster(
+        n: u64,
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        Vec<Arc<TakyonicNode>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("takyonic-raft-ha-{label}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut endpoints = HashMap::new();
+        for id in 1..=n {
+            endpoints.insert(id, format!("127.0.0.1:{}", free_port()));
+        }
+
+        let mut nodes = Vec::new();
+        let mut handles = Vec::new();
+        for id in 1..=n {
+            let node = Arc::new(
+                TakyonicNode::open(
+                    id,
+                    root.join(format!("node-{id}")),
+                    endpoints.clone(),
+                    node_config(&root, id),
+                )
+                .expect("open node"),
+            );
+            let (s, t) = node.start_background();
+            handles.push(s);
+            handles.push(t);
+            nodes.push(node);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (root, nodes, handles)
+    }
+
+    async fn wait_key(
+        nodes: &[Arc<TakyonicNode>],
+        key: &Key,
+        expect: Option<&[u8]>,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let ok = nodes.iter().all(|n| match (n.get(key).ok().flatten(), expect) {
+                (Some(v), Some(e)) => v.as_bytes() == e,
+                (None, None) => true,
+                _ => false,
+            });
+            if ok {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for key replication");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_election_and_sql_insert_replicates() {
+        let (root, nodes, handles) = boot_cluster(3, "sql").await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(10))
+            .await
+            .expect("elect leader");
+        let leader = nodes.iter().find(|n| n.id() == leader_id).unwrap();
+        assert_eq!(leader.role(), Role::Leader);
+
+        let seeds: Vec<String> = nodes.iter().map(|n| n.addr().to_string()).collect();
+        let client = TakyonicClient::new(seeds);
+        client.connect().await.expect("connect");
+        client
+            .register_table(TableSchema::new("users", "id", Vec::new()))
+            .await
+            .expect("register");
+
+        for i in 1..=5 {
+            client
+                .execute_sql(&format!(
+                    "INSERT INTO users (id, name) VALUES ('{i}', 'user{i}')"
+                ))
+                .await
+                .expect("insert");
+        }
+
+        // Followers must eventually serve the same rows via local state machine.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut all_ok = true;
+            for n in &nodes {
+                for i in 1..=5u64 {
+                    let key = Key::new(format!("Data_users_{i}"));
+                    match n.get(&key).ok().flatten() {
+                        Some(v) => {
+                            let s = String::from_utf8_lossy(v.as_bytes());
+                            if !s.contains(&format!("user{i}")) {
+                                all_ok = false;
+                            }
+                        }
+                        None => all_ok = false,
+                    }
+                }
+            }
+            if all_ok {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("followers missing replicated INSERT rows");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // OCC on a follower SessionState must reject (NotLeader), not silently
+        // write through the local Raft stand-in.
+        let follower = nodes.iter().find(|n| n.role() != Role::Leader).unwrap();
+        let mut session = SessionState::new(Arc::clone(follower.engine()));
+        let err = session
+            .execute_sql("INSERT INTO users (id, name) VALUES ('x', 'nope')")
+            .expect_err("follower must reject DML");
+        assert!(
+            matches!(err, TakyonicError::NotLeader { .. }),
+            "expected NotLeader, got {err:?}"
+        );
+
+        for h in handles {
+            h.abort();
+        }
+        for n in &nodes {
+            let _ = n.close();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn smart_client_update_and_delete_record_via_txn_rpc() {
+        let (root, nodes, handles) = boot_cluster(1, "upd-del").await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(10))
+            .await
+            .expect("elect leader");
+        let leader = nodes.iter().find(|n| n.id() == leader_id).unwrap();
+        assert_eq!(leader.role(), Role::Leader);
+
+        let seeds: Vec<String> = nodes.iter().map(|n| n.addr().to_string()).collect();
+        let client = TakyonicClient::new(seeds);
+        client.connect().await.expect("connect");
+        client
+            .register_table(TableSchema::new("users", "id", Vec::new()))
+            .await
+            .expect("register");
+
+        client
+            .execute_sql("INSERT INTO users (id, name) VALUES ('1', 'Ada')")
+            .await
+            .expect("insert");
+        client
+            .execute_sql("UPDATE users SET name = 'Ada Lovelace' WHERE id = '1'")
+            .await
+            .expect("update");
+
+        let rows = client
+            .execute_sql("SELECT * FROM users WHERE id = '1'")
+            .await
+            .expect("select after update");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name"), Some("Ada Lovelace"));
+
+        client
+            .execute_sql("DELETE FROM users WHERE id = '1'")
+            .await
+            .expect("delete");
+        let rows = client
+            .execute_sql("SELECT * FROM users WHERE id = '1'")
+            .await
+            .expect("select after delete");
+        assert!(rows.is_empty(), "row must be gone after DELETE");
+
+        for h in handles {
+            h.abort();
+        }
+        for n in &nodes {
+            let _ = n.close();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_crash_triggers_reelection_and_safe_writes() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("takyonic-raft-ha-crash-{nanos}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut endpoints = HashMap::new();
+        for id in 1u64..=3 {
+            endpoints.insert(id, format!("127.0.0.1:{}", free_port()));
+        }
+
+        let mut live: HashMap<u64, (Arc<TakyonicNode>, Vec<tokio::task::JoinHandle<()>>)> =
+            HashMap::new();
+        for id in 1u64..=3 {
+            let node = Arc::new(
+                TakyonicNode::open(
+                    id,
+                    root.join(format!("node-{id}")),
+                    endpoints.clone(),
+                    node_config(&root, id),
+                )
+                .expect("open"),
+            );
+            let (s, t) = node.start_background();
+            live.insert(id, (node, vec![s, t]));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let all_nodes = || -> Vec<Arc<TakyonicNode>> {
+            live.values().map(|(n, _)| Arc::clone(n)).collect()
+        };
+
+        let leader_id = wait_for_leader(&all_nodes(), Duration::from_secs(10))
+            .await
+            .expect("elect");
+        let leader = Arc::clone(&live.get(&leader_id).unwrap().0);
+        leader
+            .put(Key::new(b"k0".as_slice()), b"v0".as_slice())
+            .await
+            .expect("bootstrap put");
+        wait_key(
+            &all_nodes(),
+            &Key::new(b"k0".as_slice()),
+            Some(b"v0"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Forcefully shut down the leader (abort tasks + drop node).
+        let (_killed, tasks) = live.remove(&leader_id).unwrap();
+        for h in tasks {
+            h.abort();
+        }
+        drop(_killed);
+
+        let survivors: Vec<Arc<TakyonicNode>> =
+            live.values().map(|(n, _)| Arc::clone(n)).collect();
+        let new_leader = wait_for_leader(&survivors, Duration::from_secs(15))
+            .await
+            .expect("reelect after crash");
+        assert_ne!(new_leader, leader_id);
+
+        let leader = survivors.iter().find(|n| n.id() == new_leader).unwrap();
+        leader
+            .put(Key::new(b"k1".as_slice()), b"v1".as_slice())
+            .await
+            .expect("write after failover");
+        wait_key(
+            &survivors,
+            &Key::new(b"k1".as_slice()),
+            Some(b"v1"),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        for (_, (n, tasks)) in live {
+            for h in tasks {
+                h.abort();
+            }
+            let _ = n.close();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
