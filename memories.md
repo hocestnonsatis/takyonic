@@ -1,9 +1,10 @@
 # Takyonic — Persistent Context
 
-Güncelleme: 2026-07-17
+Güncelleme: 2026-07-19
 
 ## Proje Durumu
 - Public GitHub repository: `https://github.com/hocestnonsatis/takyonic` (`main`)
+- MPP scaffolding: `LogicalPlan::{DistributedAggregate,DistributedJoin}` + `src/shuffle.rs` (`Distribution`); optimizer lowers both to local Aggregate / HashJoin|NestedLoopJoin (2026-07-19)
 - Step 1 (Foundation & Types): completed 2026-07-17 — types, Config, errors, tracing-init
 - Step 2 (WAL & Memtable): completed 2026-07-17 — WalWriter/WalReader (xxh3 + sync_data), Memtable (RwLock+BTreeMap)
 - Step 3 (SST & mmap Pinning): completed 2026-07-17 — block/index/Bloom layout, mmap reader, strict deferred deletion
@@ -21,13 +22,189 @@ Güncelleme: 2026-07-17
 - Step 15 (MVCC + Snapshot Isolation): completed 2026-07-17 — InternalKey versions, Transaction OCC, watermark GC; bank invariant PASS
 - Step 16 (Secondary Indexes + CBO): completed 2026-07-17 — Data_/Idx_ projection, TableStats NDV, cost-based planner; cbo_planner PASS
 - Step 17 (Smart Client SDK): completed 2026-07-17 — TakyonicClient topology/routing + execute_txn OCC backoff; leader-kill bank crucible PASS
-- Step 18 (SQL Parser + Logical Planner): completed 2026-07-17 — sqlparser GenericDialect → CBO/MVCC; execute_sql crucible PASS
+- Step 18 (SQL Parser + Logical Planner): completed 2026-07-17 — sqlparser → CBO/MVCC; now `PostgreSqlDialect` (Step 41) for `<->` / `ARRAY`
 - Step 19 (PostgreSQL Wire Protocol): completed 2026-07-17 — pgwire on :5433; psql INSERT/SELECT PASS
 - Step 20 (V1.0 Repository Polish): completed 2026-07-17 — README, architecture guide, dual license, contributing guide, GitHub CI; all checks PASS
 - Step 21 (Automated Release CI/CD): completed 2026-07-17 — `.github/workflows/release.yml`, tag-triggered (`v*`) cross-platform build matrix + GitHub Release publish
 - Step 22 (Cloud-Native Deployment): completed 2026-07-17 — multi-stage `Dockerfile` (distroless), 3-node `docker-compose.yml`, cluster-aware `takyonic-server`, GHCR `docker-publish` CI job
+- Step 23 (Prepared Statements + Join Infrastructure): scaffolding 2026-07-19 — pgwire Extended Query (`SessionState` Parse/Bind/Execute/Sync), `LogicalPlan::Join` + INNER JOIN ON parse, Volcano `NestedLoopJoin` + unit test (3 matching rows)
+- Step 24 (Parameter Substitution & Binding): completed 2026-07-19 — `Expression::Parameter`, `sql::Value`, `ExecutionContext`, Bind byte→Value decode, Volcano `Filter` with `$1`; tests: `age > $1` + `Int(25)` → Ada/Di
+- Step 25 (TableScan ↔ MVCC Storage): completed 2026-07-19 — `Transaction::scan_table_records`, `TableScanExec` via `open_executor_with_txn`, catalog PK check + `record_to_sql_values`; integration tests PASS
+- Step 26 (DML INSERT/UPDATE/DELETE): completed 2026-07-19 — expression-based `LogicalPlan::{Insert,Update,Delete}`, Volcano `InsertExec`/`UpdateExec`/`DeleteExec`, implicit `Transaction::commit` after DML; tests PASS (Ada age=31 only)
+- Step 27 (PK IndexScan + CBO heuristic): completed 2026-07-19 — `PhysicalPlan::IndexScan` + `Transaction::get_record`; optimizer rewrites `pk = lit|$n` → IndexScan; Update/Delete inherit; `pk_equality_optimizes_to_index_scan` PASS
+- Step 28 (Explicit txn BEGIN/COMMIT/ROLLBACK): completed 2026-07-19 — `LogicalPlan::{Begin,Commit,Rollback}`; `Transaction` owns `Arc<Engine>`; `SessionState.active_txn` Idle/InTransaction; isolation+rollback test PASS
+- Step 29 (HashJoin equi-join): completed 2026-07-19 — `PhysicalPlan::HashJoin` + `HashJoinExec` build/probe; optimizer rewrites `col=col` → HashJoin (else NestedLoop); `hash_join_users_orders_via_sql` PASS (3 rows)
+- Step 30 (SCRAM-SHA-256 SASL auth): completed 2026-07-19 — pgwire `server-api-ring` + `SASLAuthStartupHandler`/`ScramAuth`; bootstrap `postgres`/`password`; psql login PASS / wrong pass FAIL
+- Step 31 (Aggregations + GROUP BY): completed 2026-07-19 — `Expression::AggregateFunction`, `LogicalPlan::Aggregate`, `PhysicalPlan::Aggregate` + `AggregateExec` (Count/Sum/Avg/Min/Max); `group_by_count_sum_via_sql` PASS
+- Step 32 (Sort / Limit / TopN): completed 2026-07-19 — `LogicalPlan::{Sort,Limit}`, `SortExec`/`LimitExec`, CBO fuses Sort→Limit into `TopNExec` (bounded heap); `group_by_order_by_limit_topn_e2e` PASS
+- Step 33 (Secondary Index DDL + Volcano IndexScan + CBO): completed 2026-07-19 — `CREATE/DROP INDEX`, durable `CATALOG`, secondary `IndexScanExec`, IndexSelectionRule; EXPLAIN chooses `IndexScan(idx_dept)` PASS
+- Step 34 (ARIES Txn WAL + Crash Redo): completed 2026-07-19 — `WalManager`/`WalRecord` (Insert/Update/Delete/Commit), WAL-before-apply on OCC commit, Redo on `Engine::open`; crash-abandon SQL recovery PASS
+- Step 35 (CTE + Subquery + SemiJoin unnesting): completed 2026-07-19 — `WITH` CTEs, `IN`/`EXISTS`/scalar subqueries, `HashSemiJoin` SubqueryUnnestingRule; E2E EXPLAIN + SELECT PASS
+- Step 36 (ANALYZE + Table Statistics + CBO selectivity): completed 2026-07-19 — `ANALYZE <table>`, durable `STATS`, HyperLogLog/reservoir, IndexSelection + HashJoin build-side; EXPLAIN skew plan switch PASS
+- Step 37 (MVCC VACUUM / Garbage Collection): completed 2026-07-19 — `VACUUM <table>`, EpochManager watermark, VacuumExec + engine GC, index cleanup; SI pin + 10k reclaim PASS
+- Step 38 (Buffer Pool Manager + Direct I/O + LRU-K): completed 2026-07-19 — Page/DiskManager(O_DIRECT)/BPM, SST data blocks via BPM, dirty flush + scan-resistance; 123 lib tests PASS
+- Step 39 (Raft HA / Quorum OCC): completed 2026-07-19 — `RaftNode` alias, engine↔Raft attach, follower `NotLeader`, quorum propose before apply; mock election + 3-node SQL INSERT + leader-crash tests; **126** lib tests PASS
+- Step 40 (JIT Query Compiler / Cranelift): completed 2026-07-19 — `JitCompiler`, expression codegen + Volcano fallback, HyPer-style `JitExec` push pipeline, CBO attach; arith/`Value::Float`; E2E + bench; **132** lib tests PASS
+- Step 41 (Vector Search + HNSW): completed 2026-07-19 — `VectorValue`/SIMD distance, HNSW graph + durable `HNSW_<name>`, `CREATE VECTOR INDEX`, `VectorIndexScanExec`, CBO VectorIndexSelectionRule, VACUUM prune; **139** lib tests PASS
+- Step 42 (RBAC / Security): completed 2026-07-19 — AUTH catalog, Argon2id + SCRAM, `CREATE USER/ROLE`, `GRANT`/`REVOKE`, `AuthorizationManager`, SessionState `current_user`; **145** lib tests PASS
+- Step 43 (Telemetry / Observability): completed 2026-07-19 — `MetricsManager`, Prometheus `/metrics`, BPM/JIT/Raft/Txn instrumentation, `metrics_enabled`; **191** lib tests PASS
+- Step 44 (MPP Distributed Query): completed 2026-07-19 — Exchange/Shuffle, Fragmenter, Coordinator/Worker, DistributedAggregate/Join, 3-node agg+shuffle tests; **156** lib tests PASS
+- Step 45 (Multi-Engine LSM + B-Tree): completed 2026-07-19 — `LSMStorage`/`LSMReader`/`BTreeStorage`/`StorageManager`, per-table engine, K-way merge, VACUUM/ANALYZE + throughput bench; **164** lib tests PASS
+- Step 46 (Partitioning + Partition Pruning): completed 2026-07-19 — Hash/Range strategy, catalog PMAP, Router, PartitionPruningRule, Coordinator::execute_insert, Rebalancer; **170** lib tests PASS
+- Step 47 (Storage–Compute Decoupling): completed 2026-07-19 — ObjectStorage, LocalFile/S3-mock/optional aws-sdk-s3, ManifestManager, DiskManager+BPM two-tier cache; Engine::open loads shared manifest; **190** lib tests PASS
+- Step 48 (SIMD JIT Vectorization): completed 2026-07-19 — VectorBatch, AVX2/AVX-512 kernels, Cranelift `F64X2` batch JIT, VectorizedExec, JITVectorizationRule; **191** lib tests PASS
+- Step 49 (Distributed 2PC Coordinator): completed 2026-07-19 — `TransactionCoordinator`, Raft `TxnPrepare`/`TxnCommit`/`TxnAbort`, global SI clock, recovery; **191** lib tests PASS
 - GitHub Community Standards completed 2026-07-17 — Code of Conduct, issue forms, PR template, security and support policies; Discussions and private vulnerability reporting enabled
-- Package metadata is v1.0.2 with MSRV 1.85; initial six-step roadmap and Steps 7–22 are complete
+- Package metadata is v1.0.2 with MSRV 1.85; Steps 7–49 complete (Merge join + Smart Client UPDATE/DELETE RPC still pending)
+
+## Step 49 — Distributed Transaction Coordinator / 2PC (2026-07-19)
+- `src/dtxn.rs`: `TransactionCoordinator` + `TwopcState::{Preparing,Prepared,Committed,Aborted}`; `LocalShard` participants with exclusive prepare locks + OCC
+- Raft SM: `RaftCommand::{TxnPrepare,TxnCommit,TxnAbort}` (opcodes 7–9); Prepare/Abort are `is_meta` (durable log, no LSM apply); Commit applies write-set at global `commit_ts`
+- Phase 1 prepare → all ACK → TC durable decision → Phase 2 commit; any prepare failure → abort all; crash-after-PREPARED → query TC on recover (`recover_participant`, presumed abort)
+- `GlobalClock` issues cross-shard snapshot `read_ts` + commit timestamps for SI
+- Metrics: `takyonic_distributed_txn_{prepared,committed,aborted}_total`
+- Tests: cross-shard atomicity, prepare-failure rollback, crash recovery, concurrent stress (no leftover prepared), SI snapshot, Prometheus names; **191** lib tests PASS
+
+## Step 48 — SIMD-Optimized JIT Vectorization (2026-07-19)
+- `src/vectorized.rs`: `VectorBatch` (N=1024), `SimdKernels` (AVX-512 zmm / AVX2 ymm / portable), bitmask filters, `VectorizedScanExec` / `VectorizedAggregateExec`
+- Cranelift: `JitCompiler::compile_batch_arith` emits packed `F64X2` load/op/store loops (`JitBatchBinOpFn`)
+- CBO `JITVectorizationRule`: `PhysicalPlan::VectorizedExec` when estimated rows ≥ 256 and exprs are SIMD-lowerable; else scalar `JitExec`
+- EXPLAIN shows `VectorizedExec(simd=avx512|avx2|sse2|scalar)`; results match scalar interpreter
+- Tests: scalar vs SIMD mul/sum, masked BETWEEN, TPC-H Q6-style 100k-row throughput, Cranelift F64X2 batch, CBO rule; **191** lib tests PASS
+
+## Step 47 — Storage–Compute Decoupling (2026-07-19)
+- `src/object_store.rs`: `ObjectStorage` trait (`read`/`write`/`list`/`delete`); `LocalFileBackend`; `InMemoryObjectStore` (shared S3/MinIO mock); `S3Backend` (+ `--features s3` → aws-sdk-s3)
+- `src/manifest.rs`: versioned JSON `StorageManifest` + `ManifestManager` (`manifest/CURRENT.json`) for SST/B-Tree/pages source of truth
+- `DiskManager::open_with_remote`: Tier-1 local PAGES cache, Tier-2 remote hydrate/write-through; `BufferPoolManager` tracks `remote_fetches`
+- Engine: `Config::object_store_root`, `open_with_object_storage`, loads manifest on open, `publish_storage_manifest` on close/checkpoint
+- Tests: S3-mock cross-node, cold-start hydrate, 3-node restart integrity, engine manifest open + concurrent readers; **190** lib tests PASS
+
+## Step 46 — Partitioning & Partition Pruning (2026-07-19)
+- `src/partition.rs`: `PartitioningStrategy::{Hash,Range}`, `PartitionMap`, `PartitionRouter`, `PartitionPruningRule`, `Rebalancer`
+- Catalog: `PARTITION HASH|RANGE …` + `PMAP node…`; `TableSchema::with_partitioning` / `with_partition_map`
+- CBO: partitioned tables lower to `PhysicalPlan::DistributedScan` with pruned `RemoteWorker(node, partition)` list
+- MPP: `Fragmenter::fragment_aggregate_pruned`, `Coordinator::execute_insert` routes to owning shard (no broadcast)
+- Tests: hash spread across 3 nodes, EXPLAIN single RemoteWorker, INSERT ownership routing, rebalancer hot→cold; **170** lib tests PASS
+
+## Step 45 — Multi-Engine LSM + B-Tree Storage (2026-07-19)
+- Existing LSM path (Memtable → L0 SST → leveled compaction + Bloom) exposed as `LSMStorage` / `LSMReader` / `CompactionManager`
+- `BTreeStorage`: in-memory MVCC B-Tree for read-friendly tables
+- `StorageManager` + `StorageEngineKind::{Lsm,BTree}`; catalog `TABLE name pk [LSM|BTREE]`; `TableSchema::with_engine`
+- Engine: `router_only` StorageManager; B-Tree tables mirrored on OCC commit; get/scan/VACUUM/ANALYZE routed by engine kind
+- Public `KWayMergeIterator::from_sorted_runs` for SST merge / latest-version selection
+- Tests: SST flush roundtrip, K-way latest version, multi-flush LSMReader, BTree vs LSM write throughput (50k debug / 1M release), VACUUM+ANALYZE across engines; **164** lib tests PASS
+
+## Step 44 — MPP Distributed Query Execution (2026-07-19)
+- `src/shuffle.rs`: `Distribution` (Hash/Range/RoundRobin), `ShuffleManager` (bounded channels + backpressure), `ExchangeExec` Volcano operator
+- `src/mpp.rs`: `FragmentSpec`/`Fragmenter`, `Worker`/`Coordinator`, `maybe_distribute` → `LogicalPlan::{DistributedAggregate,DistributedJoin}`, virtual `hash(pk)%N` shards
+- `src/shuffle_service.rs` + proto `ShuffleService` (Push/Fetch/ExecuteFragment/Close) on every node gRPC server
+- Config: `mpp_enabled`
+- Metrics: `takyonic_mpp_shuffle_rows_{sent,recv}_total`, `takyonic_mpp_fragments_total`
+- Tests: exchange roundtrip, distributed agg (virtual 3 workers), INSERT…SELECT hash shuffle, `three_node_cluster_distributed_aggregate_and_shuffle_metrics`; **156** lib tests PASS
+
+## Step 43 — Telemetry & Observability (2026-07-19)
+- `src/telemetry.rs`: expanded `EngineMetrics` (BPM, JIT, Raft, txn/VACUUM atomics + histograms), `MetricsManager` OS-thread HTTP scrape server, Prometheus text format
+- Config: `metrics_enabled` / `metrics_bind` (default `127.0.0.1:9090`, use `:0` in tests)
+- Instrumentation: BPM dual-write, `JitCompiler`/`JitPipelineExec`, Raft election/append/heartbeat, OCC commit + active txn gauges, VACUUM cycle latency
+- Engine: starts `MetricsManager` on open when enabled; `metrics_bind_addr()` / `render_metrics()`
+- Tests: concurrent atomics, Prometheus text, HTTP scrape, overhead (<1% release / <10% debug), `metrics_http_scrape_reflects_jit_bpm_and_txn`; **191** lib tests PASS
+
+## Step 42 — Role-Based Access Control & Security (2026-07-19)
+- `src/rbac.rs`: `AuthCatalog` (`data_dir/AUTH`), `RoleDef`, `Privilege` (SELECT/INSERT/UPDATE/DELETE), Argon2id PHC + SCRAM credentials, `AuthorizationManager` / AccessControlRule
+- DDL: `CREATE USER … WITH PASSWORD` (preprocess → `CREATE ROLE … LOGIN`), `CREATE ROLE`, `DROP ROLE/USER`, `GRANT`/`REVOKE` on tables, `GRANT role TO member`
+- `SessionState`: `current_user` / `AuthContext`; `as_user`; authorize before every `run_plan`
+- SUPERUSER-only: `VACUUM`, `ANALYZE`, `CREATE/DROP INDEX`, role/grant DDL
+- PgWire: `TakyonicAuthSource` reads engine AUTH catalog (SCRAM-SHA-256); bootstrap `postgres`/`password` seeded on open
+- Error: `TakyonicError::PermissionDenied`
+- Tests: `rbac::*`, `parses_create_user_grant_revoke`, `session_rbac_analyst_select_ok_delete_denied`
+
+## Step 41 — Vector Search + HNSW Indexing (2026-07-19)
+- `src/vector.rs`: `VectorValue` (f32), `DistanceMetric` (Euclidean/Cosine), `euclidean_simd` (AVX2/SSE), `VectorIndexSpec`
+- `src/hnsw.rs`: thread-safe `HnswIndex` (insert/delete/search_knn/prune); exact kNN for ≤256 nodes; snapshot `data_dir/HNSW_<name>`
+- DDL: preprocess `CREATE VECTOR INDEX` → `CREATE INDEX … WITH (DIMENSION=…, TYPE=HNSW)`; parser uses `PostgreSqlDialect` (`<->`, `ARRAY[]`)
+- Catalog: `VINDEX table name col dim metric type`; `IndexDef.vector: Option<VectorIndexSpec>`
+- Engine: HNSW registry; OCC `StatsEdit::{VectorUpsert,VectorDelete}`; VACUUM `retain_pks`; save on create/close/vacuum
+- Exec: `PhysicalPlan::VectorIndexScan` / `VectorIndexScanExec`; CBO rewrites `ORDER BY col <-> query LIMIT k`
+- Distance eval uses SIMD Euclidean for `<->`
+- Tests: `hnsw_2d_*`, `hnsw_3d_*`, `simd_euclidean_vs_scalar_throughput`, `session_vector_index_hnsw_explain_and_knn`
+
+## Step 40 — JIT Query Compiler (Cranelift) (2026-07-19)
+- Deps: `cranelift` / `cranelift-jit` / `cranelift-module` / `cranelift-codegen` 0.133
+- `src/jit.rs`: `JitCompiler` owns `JITModule`; `JitIrType` maps Int→I64, Float→F64, Bool→I64, String→fallback
+- Expression: `ArithOp` / `Expression::Arith` / `Expression::Or`; SQL `+ - * /` and `OR`; `Value::Float`
+- Compile predicates + scalar arith to `extern "C" fn(*const i64, i64) -> i64`; string/unsupported → interpreter
+- `PhysicalPlan::JitExec` — single push loop Scan→Filter→Aggregate (no Volcano vcalls between); CBO `maybe_attach_jit` when compilable
+- `optimize_without_jit` for baseline benches; EXPLAIN prints `JitExec(agg|filter)`
+- Tests: `jit_*` unit, `jit_sum_salary_times_tax_e2e`, `session_jit_olap_sum_filter_via_sql`, `jit_benchmark_*`
+
+## Step 39 — Raft Distributed Consensus & Quorum OCC (2026-07-19)
+- `RaftNode` = `RaftConsensus` (role, term, `voted_for`, `commit_index`); gRPC `AppendEntries` / `RequestVote` via `network`; membership in `ClusterMembership`
+- `TakyonicEngine::attach_raft_node` (Weak, no cycle): cluster nodes gate local put/OCC through networked Raft
+- Follower OCC/DML → `TakyonicError::NotLeader { leader_address }`; leader `block_in_place` + quorum `propose` after ARIES `log_txn_wal`
+- Vote safety: `RaftLog::is_up_to_date` in `handle_request_vote`; randomized election timeout unchanged
+- Tests: `mock_election_follower_candidate_leader`, `three_node_election_and_sql_insert_replicates`, `leader_crash_triggers_reelection_and_safe_writes`
+
+## Step 23–38 Extended Query + Volcano + … + Buffer Pool Manager (2026-07-19)
+- `SessionState` owns `Arc<TakyonicEngine>` + `active_txn: Option<Transaction>` (Idle vs InTransaction)
+- `SessionState::run_plan` / `execute_sql`: BEGIN opens txn; COMMIT/ROLLBACK consume it; DQL/DML reuse workspace or auto-commit
+- `Transaction` holds `Arc<TakyonicEngine>` (no lifetime) so sessions can store it; `Engine::begin(self: &Arc<Self>)`
+- `LogicalPlan::{Begin,Commit,Rollback}` from sqlparser `StartTransaction` / `Commit` / `Rollback`
+- PgWire Simple/Extended Query route through SessionState (local Volcano); factory takes `(client, engine)`
+- Isolation: uncommitted INSERT invisible to a second `engine.begin()` snapshot; visible after COMMIT; ROLLBACK discards workspace
+- `PhysicalPlan::IndexScan { table, index, index_column, key_value }` — PK (`index=None`) or secondary two-step lookup
+- Optimizer: PK equality → IndexScan(pk); indexed `col = lit|$n` via IndexSelection (pre-ANALYZE: `eq_cost < rows`; post-ANALYZE: MCV/NDV ≤ 5% selectivity)
+- `PhysicalPlan::HashJoin { left, right, left_key, right_key }` — build `HashMap<Value, Vec<Record>>`, probe right
+- Equi-join rewrite: `Column == Column` → HashJoin (schema hints assign sides); `<`/`>`/`!=` → NestedLoopJoin
+- SCRAM-SHA-256: `pgwire` feature `server-api-ring`; `TakyonicAuthSource` seeds `postgres`/`password` (fixed salt + PBKDF2 SaltedPassword); per-connection `SASLAuthStartupHandler` (never share SASL state); `AuthStage` documents handshake; SessionState tests bypass wire auth
+- Connect: `PGPASSWORD=password psql -h 127.0.0.1 -p 5433 -U postgres -d postgres`
+- Aggregates: `Expression::AggregateFunction` + `LogicalPlan::Aggregate { input, group_exprs, aggr_exprs }`; COUNT/SUM/AVG/MIN/MAX
+- `PhysicalPlan::Aggregate` → `AggregateExec` drains child, `HashMap<Vec<Value>, Accumulators>`, emits group keys + aggregate columns (sorted by group key)
+- Accumulators: `CountAccumulator`, `SumAccumulator`, `AvgAccumulator` (int div), `MinAccumulator`, `MaxAccumulator`
+- Sort/Limit: `SortExpr` + `LogicalPlan::{Sort,Limit}`; chain Scan→Filter→Aggregate→Sort→Limit
+- `ORDER BY SUM(x)` rewrites to column `sum(x)` after Aggregate; `SortExec` (full drain+sort), `LimitExec` (streaming skip/fetch)
+- Top-N CBO: `Limit(Sort(_))` with fetch → `PhysicalPlan::TopN` / `TopNExec` (BinaryHeap size skip+fetch)
+- Secondary indexes (Step 33):
+  - DDL: `LogicalPlan::{CreateIndex,DropIndex,Explain}`; `CREATE INDEX name ON table(col)` / `DROP INDEX [IF EXISTS] name` / `EXPLAIN <stmt>`
+  - Catalog: `data_dir/CATALOG` (`TABLE` / `INDEX` lines); load on `Engine::open`; save on register/create/drop
+  - Storage: non-unique `Idx_<table>_<index>_<value>_<pk>` keys; `put_record`/`delete_record` maintain all secondary B-Trees in the same OCC txn; `create_index` backfills + `on_index_backfill` NDV
+  - Volcano: `Transaction::lookup_by_index` → `IndexScanExec` two-step; `explain_physical` prints `IndexScan(idx_dept) on table.col`
+  - Tests: catalog reopen, MVCC index key maintain, `session_create_index_explain_index_scan` (EXPLAIN + SELECT Engineering)
+- ARIES transactional WAL (Step 34):
+  - `src/txn_wal.rs`: `WalRecord::{Insert,Update,Delete,Commit}` + `WalManager` (`data_dir/TXN_WAL`, xxh3 framing, `sync_data`)
+  - OCC commit: `log_txn_wal` (ops + Commit + fsync) **before** Raft/memtable apply; also on gRPC `txn_commit`
+  - `Engine::open`: Redo committed batches → memtable, handoff into LSM WAL, truncate TXN_WAL; incomplete write-sets without Commit discarded
+  - `abandon_for_crash_test`: hard crash without SST flush; tests `aries_wal_recovers_*` + `crash_abandon_recovers_committed_sql_from_wal`
+- CTE / subqueries (Step 35):
+  - `WITH alias AS (query)` → CTE map; `FROM alias` → `LogicalPlan::SubqueryAlias` (inline view)
+  - Expressions: `InSubquery` / `Exists` / `ScalarSubquery` / `InList`; `LogicalPlan::Filter` for WHERE over non-base scans
+  - Uncorrelated `IN (SELECT …)` → CBO `SubqueryUnnestingRule` → `HashJoin` with `JoinType::Semi` (EXPLAIN: `HashSemiJoin`); `NOT IN` → Anti
+  - Residual / scalar / EXISTS: `rewrite_uncorrelated_subqueries` at Filter open (materialize once into InList/Literal)
+  - Correlation flag + best-effort rewrite; true OuterRef Apply still pending
+  - Tests: parser WITH/IN/EXISTS/scalar; `in_list_and_scalar_subquery_filter`; `cte_in_subquery_unnests_to_hash_semi_join`
+- ANALYZE / table statistics (Step 36):
+  - SQL: `LogicalPlan::Analyze` from sqlparser `ANALYZE <table>`; Volcano `PhysicalPlan::Analyze` / `AnalyzeExec`
+  - Stats: `ColumnStats` (null_frac, NDV via HyperLogLog, min/max, MCV, equal-height histogram) + `TableStats.page_count`
+  - Persistence: `data_dir/STATS`; load on `Engine::open`; `apply_analyzed_stats` after ANALYZE
+  - Algorithms: full scan + reservoir (`ANALYZE_SAMPLE_SIZE`) for MCV/histogram; HLL for large-table NDV
+  - CBO IndexSelection: after ANALYZE, IndexScan only if `eq_rows <= 5%` of table (MCV-aware); else Filter(TableScan)
+  - CBO HashJoin: Inner join builds the smaller side by estimated cardinality
+  - Tests: catalog reopen, AnalyzeExec NDV/min/max, `session_analyze_explain_switches_plan_on_skew`
+- VACUUM / MVCC GC (Step 37):
+  - `EpochManager` (`src/epoch.rs`): active txn epochs; watermark = oldest `read_ts`; idle → `last_applied+1`
+  - Visibility: keep `commit_ts >= watermark` + newest below (snapshot floor); older shadowed versions are dead
+  - SQL: `LogicalPlan::Vacuum` / `PhysicalPlan::Vacuum` / `VacuumExec`; SessionState runs Vacuum **without** an open snapshot
+  - Engine: `vacuum_table` — classify dead Data_/Idx_ versions, memtable prefix GC, flush, drain compaction; dangling Idx_ purge pass
+  - Tests: epoch watermark unit tests; `vacuum_respects_long_running_snapshot`; `session_vacuum_reclaims_dead_versions_after_updates` (10k)
+- Buffer Pool Manager (Step 38):
+  - `Page` / `DiskManager` (`src/page.rs`, `src/disk.rs`): fixed-size aligned frames; Linux `O_DIRECT` with buffered fallback; primary `data_dir/PAGES`
+  - `BufferPoolManager` (`src/bpm.rs`): pre-allocated pool, pin/unpin, dirty flush on eviction + `flush_all` checkpoint; **LRU-K** (K=2) scan-resistant
+  - Config: `bpm_pool_size` / `bpm_page_size` / `bpm_lru_k` (default 1024×4KiB, K=2; `0` disables)
+  - SST integration: registry attaches BPM; data blocks read via page-aligned Direct I/O cache (`fetch_file_page`); mmap kept for index/Bloom
+  - Engine: owns BPM, `checkpoint_buffer_pool` after memtable→L0 flush; txn mutations mark pages dirty via `PageGuard::write`
+  - Tests: eviction+dirty flush, pin protection, LRU-K scan resistance, `session_bpm_caches_sst_reads_after_flush`
+- Not yet wired: Merge join, TxnDeleteRecord RPC, persistent role catalog, HAVING, correlated OuterRef Apply
+- Done: per-connection SessionState (pid-keyed DashMap + SCRAM user bind) — 2026-07-19
+- Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (Tasks 1–6; AUTH disk load/save already exists — Task 2 is reopen e2e close-out)
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -163,12 +340,12 @@ Güncelleme: 2026-07-17
 - Harness (`examples/sql_interface.rs`): 1k SQL INSERTs (10 Ankara) → `SELECT ... status='active' AND city='Ankara'` → IndexScan(city) est=10, 10 rows PASS
 
 ## PostgreSQL Wire Protocol (Step 19)
-- Dep: `pgwire` pinned to `=0.36.3` (`server-api` only) + `async-trait`; this is the latest line compatible with the project's Rust 1.85 MSRV (`pgwire` 0.37+ requires Rust 1.89)
-- `src/pg.rs`: `TakyonicPgBackend` (SimpleQueryHandler) → `execute_sql`; `AcceptAnyCleartext` auth (any user/pass)
+- Dep: `pgwire` pinned to `=0.36.3` (`server-api-ring` for SCRAM) + `async-trait`; latest line compatible with Rust 1.85 MSRV (`pgwire` 0.37+ requires Rust 1.89)
+- `src/pg.rs`: `TakyonicPgBackend` + SCRAM via `SASLAuthStartupHandler` / `TakyonicAuthSource` (bootstrap `postgres`/`password`)
 - Result mapping: `FieldInfo` + `DataRowEncoder` (INT8 / VARCHAR); INSERT → `CommandComplete` `INSERT 0 N`
 - Binary `takyonic-server`: single-node Raft + pgwire on `127.0.0.1:5433` (Raft gRPC `:15433`)
 - Single-node election fix: `run_election` promotes immediately when `peers.is_empty()` && quorum≤1
-- Crucible: `PGPASSWORD=any psql -h 127.0.0.1 -p 5433 -U admin -d postgres` → INSERT 0 1 + tabular SELECT PASS
+- Crucible: `PGPASSWORD=password psql -h 127.0.0.1 -p 5433 -U postgres -d postgres` → SCRAM ok; wrong password → FATAL auth failed
 - Host note (2026-07-17): Ryzen 9 / x86_64 — `.cargo/config.toml` uses `CC=gcc` + gcc-16 lib path
 
 ## Release Pipeline (Step 21)
@@ -187,7 +364,8 @@ Güncelleme: 2026-07-17
 - `docker-compose.yml`: 3 services node-1/2/3 on `takyonet` bridge, `image: ghcr.io/hocestnonsatis/takyonic:latest` + `build: .`; node-1 pgwire `5433:5433` (node-2→5434, node-3→5435); named volumes node{1,2,3}-data; peers via service DNS `--peers`
 - Image name is bare product brand `ghcr.io/<owner>/takyonic` (no `-server` suffix, postgres/mysql-style)
 - CI: `release.yml` gained `permissions: packages: write`, `IMAGE_NAME=ghcr.io/${{ github.repository }}`, and `docker-publish` job (`needs: build`) — buildx + docker/login-action (GITHUB_TOKEN) + metadata-action (tags: latest, semver {{version}}/{{major}}.{{minor}}, raw `v*` tag) + build-push-action@v6 with gha cache
-- NOT verified with a live `docker build` here — sandbox has no docker daemon access (no passwordless sudo, not in docker group); validated via `cargo check/clippy -D warnings/fmt --check` and `docker compose config`
+- Live verify 2026-07-17: `docker compose build` + `up` 3-node cluster PASS — node-1 elected leader; INSERT via :5433, SELECT via follower :5434, INSERT via :5435 all replicated; psql INSERT 0 N + tabular SELECT OK
+- GHCR pull still 403 for anonymous/`gh` token (no `read:packages`); package visibility is private — make `ghcr.io/hocestnonsatis/takyonic` public under Package settings → Change visibility, then `docker pull` works without auth
 
 ## Ortam Notları
 - Host is Ryzen 9 9950X workstation (x86_64); `.cargo/config.toml` sets `CC=gcc`
