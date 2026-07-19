@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{env_secs, env_u64};
+use super::{ReliabilityReport, env_secs, env_u64};
 
 /// Knob set for [`run_continuous_chaos`] / CI smoke.
 #[derive(Clone, Debug)]
@@ -191,17 +191,156 @@ pub fn round_raft_chaos(_cfg: &ContinuousChaosConfig, timeout: Duration) -> Roun
     }
 }
 
+/// Run `mobile_stress` example.
+pub fn round_mobile_stress(_cfg: &ContinuousChaosConfig, timeout: Duration) -> RoundResult {
+    let bin = cargo_bin_example("mobile_stress");
+    if bin == "cargo" {
+        run_command_round(
+            "mobile_stress",
+            "cargo",
+            &["run", "--release", "--example", "mobile_stress"],
+            &[],
+            timeout,
+        )
+    } else {
+        run_command_round("mobile_stress", &bin, &[], &[], timeout)
+    }
+}
+
+/// Run a short `ha_soak` round.
+pub fn round_ha_soak(cfg: &ContinuousChaosConfig, timeout: Duration) -> RoundResult {
+    let env = [
+        ("TAKYONIC_HA_SECS", "30".to_string()),
+        ("TAKYONIC_FUZZ_SEED", cfg.seed.to_string()),
+    ];
+    let bin = cargo_bin_example("ha_soak");
+    if bin == "cargo" {
+        run_command_round(
+            "ha_soak",
+            "cargo",
+            &["run", "--release", "--example", "ha_soak"],
+            &env,
+            timeout,
+        )
+    } else {
+        run_command_round("ha_soak", &bin, &[], &env, timeout)
+    }
+}
+
+/// Run a short `reliability_soak` round.
+pub fn round_reliability_soak(cfg: &ContinuousChaosConfig, timeout: Duration) -> RoundResult {
+    let env = [
+        ("TAKYONIC_SOAK_SECS", "30".to_string()),
+        ("TAKYONIC_FUZZ_ITERS", "200".to_string()),
+        ("TAKYONIC_FUZZ_SEED", cfg.seed.to_string()),
+    ];
+    let bin = cargo_bin_example("reliability_soak");
+    if bin == "cargo" {
+        run_command_round(
+            "reliability_soak",
+            "cargo",
+            &["run", "--release", "--example", "reliability_soak"],
+            &env,
+            timeout,
+        )
+    } else {
+        run_command_round("reliability_soak", &bin, &[], &env, timeout)
+    }
+}
+
+fn dry_run_round(name: &'static str) -> RoundResult {
+    RoundResult {
+        name,
+        ok: true,
+        detail: "dry-run".into(),
+        elapsed: Duration::from_millis(1),
+    }
+}
+
+/// Run chaos rounds until `cfg.duration` elapses; stop early on first failure.
+pub fn run_continuous_chaos(
+    cfg: ContinuousChaosConfig,
+    heartbeat: Option<&Path>,
+) -> ReliabilityReport {
+    let mut report = ReliabilityReport::new(cfg.seed);
+    let deadline = Instant::now() + cfg.duration;
+    let dry = env_u64("TAKYONIC_CONTINUOUS_DRY_RUN", 0) != 0;
+    let mut round_idx: u64 = 0;
+
+    while Instant::now() < deadline {
+        round_idx += 1;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Per-round timeout = min(remaining, 30m) so one hung child cannot eat the budget.
+        let per = remaining.min(Duration::from_secs(30 * 60));
+
+        let schedule: Vec<RoundResult> = if dry {
+            vec![
+                dry_run_round("crash_recovery"),
+                dry_run_round("raft_chaos"),
+            ]
+        } else {
+            let mut v = vec![
+                round_crash_recovery(&cfg, per),
+                round_raft_chaos(&cfg, per),
+            ];
+            if cfg.include_mobile {
+                v.push(round_mobile_stress(&cfg, per));
+            }
+            if cfg.include_reliability {
+                v.push(round_reliability_soak(&cfg, per));
+            }
+            if cfg.include_ha {
+                v.push(round_ha_soak(&cfg, per));
+            }
+            v
+        };
+
+        for r in schedule {
+            report.record_op();
+            let line = format!(
+                "ts_ns={} round={} name={} ok={} elapsed_ms={} detail={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                round_idx,
+                r.name,
+                r.ok,
+                r.elapsed.as_millis(),
+                r.detail.replace('\n', " "),
+            );
+            if let Some(path) = heartbeat {
+                let _ = append_heartbeat(path, &line);
+            }
+            if !r.ok {
+                report.fail(format!("{} failed: {}", r.name, r.detail));
+                return report;
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn from_env_defaults_are_sane() {
-        // SAFETY: unique keys, test-only.
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: unique keys, test-only, serialized via ENV_LOCK.
         unsafe {
             std::env::remove_var("TAKYONIC_CONTINUOUS_SECS");
             std::env::remove_var("TAKYONIC_CRASH_ITERS");
+            std::env::remove_var("TAKYONIC_CONTINUOUS_DRY_RUN");
+            std::env::remove_var("TAKYONIC_INCLUDE_MOBILE");
         }
         let c = ContinuousChaosConfig::from_env();
         assert_eq!(c.duration, Duration::from_secs(120));
@@ -228,5 +367,29 @@ mod tests {
         assert!(ok.ok, "{:?}", ok.detail);
         let bad = run_command_round("false_cmd", "/bin/false", &[], &[], Duration::from_secs(5));
         assert!(!bad.ok, "false must fail");
+    }
+
+    #[test]
+    fn continuous_chaos_smoke_completes_tiny_budget() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: test-only env isolation, serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var("TAKYONIC_CONTINUOUS_DRY_RUN", "1");
+            std::env::set_var("TAKYONIC_CONTINUOUS_SECS", "2");
+            std::env::set_var("TAKYONIC_INCLUDE_MOBILE", "0");
+            std::env::set_var("TAKYONIC_INCLUDE_HA", "0");
+            std::env::set_var("TAKYONIC_INCLUDE_RELIABILITY", "0");
+        }
+        let cfg = ContinuousChaosConfig::from_env();
+        let report = run_continuous_chaos(cfg, None);
+        unsafe {
+            std::env::remove_var("TAKYONIC_CONTINUOUS_DRY_RUN");
+            std::env::remove_var("TAKYONIC_CONTINUOUS_SECS");
+            std::env::remove_var("TAKYONIC_INCLUDE_MOBILE");
+            std::env::remove_var("TAKYONIC_INCLUDE_HA");
+            std::env::remove_var("TAKYONIC_INCLUDE_RELIABILITY");
+        }
+        assert!(report.ok(), "{}", report.summary());
+        assert!(report.ops >= 1, "expected at least one dry-run round");
     }
 }

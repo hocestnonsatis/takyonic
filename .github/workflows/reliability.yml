@@ -11,6 +11,10 @@ on:
         description: HA soak seconds
         required: false
         default: "600"
+      continuous_secs:
+        description: Continuous chaos wall seconds (hour-scale on GHA)
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -48,3 +52,14 @@ jobs:
         env:
           TAKYONIC_HA_SECS: ${{ inputs.ha_secs }}
         run: cargo run --release --example ha_soak
+
+      - name: Continuous chaos (optional)
+        if: ${{ inputs.continuous_secs != '0' }}
+        env:
+          TAKYONIC_CONTINUOUS_SECS: ${{ inputs.continuous_secs }}
+          TAKYONIC_CRASH_ITERS: "4"
+          TAKYONIC_INCLUDE_MOBILE: "1"
+          TAKYONIC_INCLUDE_HA: "0"
+          TAKYONIC_INCLUDE_RELIABILITY: "1"
+          TAKYONIC_HEARTBEAT_PATH: continuous-heartbeat.log
+        run: cargo run --release --example continuous_chaos
