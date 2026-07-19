@@ -109,6 +109,19 @@ pub enum PhysicalPlan {
         /// Logical join kind (only Inner is evaluated today).
         join_type: JoinType,
     },
+    /// Sort-merge equi-join: both children sorted ascending on join keys.
+    MergeJoin {
+        /// Left (sorted) child.
+        left: Box<PhysicalPlan>,
+        /// Right (sorted) child.
+        right: Box<PhysicalPlan>,
+        /// Key expression evaluated on left rows.
+        left_key: Expression,
+        /// Key expression evaluated on right rows.
+        right_key: Expression,
+        /// Logical join kind (Inner only).
+        join_type: JoinType,
+    },
     /// `INSERT INTO … VALUES …` — evaluates expressions and writes records.
     Insert {
         /// Target table.
@@ -362,6 +375,19 @@ fn optimize_plan_tree(
             if let Some((left_key, right_key)) =
                 match_equi_join_keys(on, left, right, schema_of)
             {
+                // Prefer MergeJoin when both sides are already sorted on the join key.
+                if *join_type == JoinType::Inner
+                    && is_sorted_on(&left_phys, &left_key)
+                    && is_sorted_on(&right_phys, &right_key)
+                {
+                    return Ok(PhysicalPlan::MergeJoin {
+                        left: left_phys,
+                        right: right_phys,
+                        left_key,
+                        right_key,
+                        join_type: *join_type,
+                    });
+                }
                 // Inner HashJoin: build the smaller side (by estimated cardinality).
                 let (build, probe, build_key, probe_key) = if *join_type == JoinType::Inner {
                     let left_rows = estimate_physical_rows(&left_phys, stats_of);
@@ -1001,7 +1027,8 @@ fn estimate_physical_rows(
         }
         PhysicalPlan::Values { rows } => rows.len() as u64,
         PhysicalPlan::NestedLoopJoin { left, right, .. }
-        | PhysicalPlan::HashJoin { left, right, .. } => estimate_physical_rows(left, stats_of)
+        | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. } => estimate_physical_rows(left, stats_of)
             .saturating_mul(estimate_physical_rows(right, stats_of))
             .max(1),
         PhysicalPlan::Aggregate { input, .. }
@@ -1015,6 +1042,19 @@ fn estimate_physical_rows(
         PhysicalPlan::JitExec { input, .. } => estimate_physical_rows(input, stats_of),
         PhysicalPlan::VectorizedExec { input, .. } => estimate_physical_rows(input, stats_of),
         PhysicalPlan::DistributedScan { input, .. } => estimate_physical_rows(input, stats_of),
+    }
+}
+
+/// True when `plan` is (or wraps) an ascending Sort whose leading key equals `key`.
+fn is_sorted_on(plan: &PhysicalPlan, key: &Expression) -> bool {
+    match plan {
+        PhysicalPlan::Sort { exprs, .. } => exprs
+            .first()
+            .is_some_and(|se| se.asc && &se.expr == key),
+        PhysicalPlan::Limit { input, .. } | PhysicalPlan::Filter { input, .. } => {
+            is_sorted_on(input, key)
+        }
+        _ => false,
     }
 }
 
@@ -1340,6 +1380,28 @@ fn open_executor_with_storage(
                 build_key,
                 probe_key,
                 join_type,
+                ctx.clone(),
+            )))
+        }
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
+        } => {
+            if join_type != JoinType::Inner {
+                return Err(TakyonicError::Sql(format!(
+                    "only INNER merge join is implemented; got {join_type:?}"
+                )));
+            }
+            let left_exec = open_executor_with_storage(*left, ctx, storage.as_deref_mut())?;
+            let right_exec = open_executor_with_storage(*right, ctx, storage)?;
+            Ok(Box::new(MergeJoinExec::new(
+                left_exec,
+                right_exec,
+                left_key,
+                right_key,
                 ctx.clone(),
             )))
         }
@@ -1904,6 +1966,11 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
                     _ => "HashJoin",
                 };
                 let _ = writeln!(out, "{pad}{label}");
+                walk(left, indent + 1, out);
+                walk(right, indent + 1, out);
+            }
+            PhysicalPlan::MergeJoin { left, right, .. } => {
+                let _ = writeln!(out, "{pad}MergeJoin");
                 walk(left, indent + 1, out);
                 walk(right, indent + 1, out);
             }
@@ -2526,6 +2593,187 @@ impl Executor for HashJoinExec {
                 self.match_idx = 0;
                 self.current_probe = Some(probe_row);
             },
+        }
+    }
+}
+
+/// Sort-merge equi-join over two inputs already sorted ascending on join keys.
+pub struct MergeJoinExec {
+    left: Box<dyn Executor>,
+    right: Box<dyn Executor>,
+    left_key: Expression,
+    right_key: Expression,
+    ctx: ExecutionContext,
+    left_cur: Option<Record>,
+    right_cur: Option<Record>,
+    left_run: Vec<Record>,
+    right_run: Vec<Record>,
+    li: usize,
+    ri: usize,
+    primed: bool,
+}
+
+impl MergeJoinExec {
+    /// Construct a merge join over sorted children.
+    pub fn new(
+        left: Box<dyn Executor>,
+        right: Box<dyn Executor>,
+        left_key: Expression,
+        right_key: Expression,
+        ctx: ExecutionContext,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            left_key,
+            right_key,
+            ctx,
+            left_cur: None,
+            right_cur: None,
+            left_run: Vec::new(),
+            right_run: Vec::new(),
+            li: 0,
+            ri: 0,
+            primed: false,
+        }
+    }
+
+    /// Convenience: wrap two in-memory sorted tables.
+    pub fn from_sorted_rows(
+        left_rows: Vec<Record>,
+        right_rows: Vec<Record>,
+        left_key: Expression,
+        right_key: Expression,
+    ) -> Self {
+        Self::new(
+            Box::new(ValuesExec {
+                rows: left_rows,
+                idx: 0,
+            }),
+            Box::new(ValuesExec {
+                rows: right_rows,
+                idx: 0,
+            }),
+            left_key,
+            right_key,
+            ExecutionContext::new(),
+        )
+    }
+
+    fn key_of(&self, side: bool, row: &Record) -> Result<Value> {
+        let expr = if side {
+            &self.left_key
+        } else {
+            &self.right_key
+        };
+        evaluate(expr, row, &self.ctx)
+    }
+
+    fn load_left_run(&mut self) -> Result<()> {
+        self.left_run.clear();
+        let Some(first) = self.left_cur.take() else {
+            return Ok(());
+        };
+        let run_key = self.key_of(true, &first)?;
+        self.left_run.push(first);
+        if matches!(run_key, Value::Null) {
+            self.left_cur = self.left.next_row()?;
+            return Ok(());
+        }
+        loop {
+            let Some(next) = self.left.next_row()? else {
+                self.left_cur = None;
+                break;
+            };
+            let k = self.key_of(true, &next)?;
+            if k == run_key {
+                self.left_run.push(next);
+            } else {
+                self.left_cur = Some(next);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_right_run(&mut self) -> Result<()> {
+        self.right_run.clear();
+        let Some(first) = self.right_cur.take() else {
+            return Ok(());
+        };
+        let run_key = self.key_of(false, &first)?;
+        self.right_run.push(first);
+        if matches!(run_key, Value::Null) {
+            self.right_cur = self.right.next_row()?;
+            return Ok(());
+        }
+        loop {
+            let Some(next) = self.right.next_row()? else {
+                self.right_cur = None;
+                break;
+            };
+            let k = self.key_of(false, &next)?;
+            if k == run_key {
+                self.right_run.push(next);
+            } else {
+                self.right_cur = Some(next);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Executor for MergeJoinExec {
+    fn next_row(&mut self) -> Result<Option<Record>> {
+        if !self.primed {
+            self.left_cur = self.left.next_row()?;
+            self.right_cur = self.right.next_row()?;
+            self.primed = true;
+        }
+
+        loop {
+            // Emit remaining cross-product of current equal-key runs.
+            if self.li < self.left_run.len() && self.ri < self.right_run.len() {
+                let combined = combine_rows(&self.left_run[self.li], &self.right_run[self.ri]);
+                self.ri += 1;
+                if self.ri >= self.right_run.len() {
+                    self.ri = 0;
+                    self.li += 1;
+                }
+                return Ok(Some(combined));
+            }
+            self.left_run.clear();
+            self.right_run.clear();
+            self.li = 0;
+            self.ri = 0;
+
+            let (Some(lref), Some(rref)) = (&self.left_cur, &self.right_cur) else {
+                return Ok(None);
+            };
+            let lk = self.key_of(true, lref)?;
+            let rk = self.key_of(false, rref)?;
+            if matches!(lk, Value::Null) {
+                self.left_cur = self.left.next_row()?;
+                continue;
+            }
+            if matches!(rk, Value::Null) {
+                self.right_cur = self.right.next_row()?;
+                continue;
+            }
+            match value_ord(&lk, &rk) {
+                Ordering::Less => {
+                    self.left_cur = self.left.next_row()?;
+                }
+                Ordering::Greater => {
+                    self.right_cur = self.right.next_row()?;
+                }
+                Ordering::Equal => {
+                    self.load_left_run()?;
+                    self.load_right_run()?;
+                    // loop will emit cross-product
+                }
+            }
         }
     }
 }
@@ -3543,6 +3791,83 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn merge_join_exec_matches_sorted_inputs() {
+        let users = vec![
+            Record::new().set("id", "1").set("name", "Ada"),
+            Record::new().set("id", "2").set("name", "Bob"),
+            Record::new().set("id", "3").set("name", "Cy"),
+        ];
+        let orders = vec![
+            Record::new().set("order_id", "10").set("user_id", "1"),
+            Record::new().set("order_id", "11").set("user_id", "1"),
+            Record::new().set("order_id", "20").set("user_id", "3"),
+        ];
+        let mut join = MergeJoinExec::from_sorted_rows(
+            users,
+            orders,
+            Expression::Column("id".into()),
+            Expression::Column("user_id".into()),
+        );
+        let mut rows = Vec::new();
+        while let Some(r) = join.next_row().unwrap() {
+            rows.push(r);
+        }
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get("name"), Some("Ada"));
+        assert_eq!(rows[0].get("order_id"), Some("10"));
+        assert_eq!(rows[1].get("order_id"), Some("11"));
+        assert_eq!(rows[2].get("name"), Some("Cy"));
+        assert_eq!(rows[2].get("order_id"), Some("20"));
+    }
+
+    #[test]
+    fn equi_join_prefers_merge_when_both_sides_sorted() {
+        let plan = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Select {
+                    table: "users".into(),
+                    filters: vec![],
+                    predicate: None,
+                }),
+                exprs: vec![SortExpr::asc(Expression::Column("id".into()))],
+            }),
+            right: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Select {
+                    table: "orders".into(),
+                    filters: vec![],
+                    predicate: None,
+                }),
+                exprs: vec![SortExpr::asc(Expression::Column("user_id".into()))],
+            }),
+            on: Expression::BinaryOp {
+                left: Box::new(Expression::Column("id".into())),
+                op: FilterOp::Eq,
+                right: Box::new(Expression::Column("user_id".into())),
+            },
+            join_type: JoinType::Inner,
+        };
+        let physical = optimize(&plan).unwrap();
+        let text = explain_physical(&physical);
+        assert!(
+            text.contains("MergeJoin"),
+            "EXPLAIN must show MergeJoin, got:\n{text}"
+        );
+        match physical {
+            PhysicalPlan::MergeJoin {
+                left_key,
+                right_key,
+                join_type,
+                ..
+            } => {
+                assert_eq!(join_type, JoinType::Inner);
+                assert_eq!(left_key, Expression::Column("id".into()));
+                assert_eq!(right_key, Expression::Column("user_id".into()));
+            }
+            other => panic!("expected MergeJoin, got {other:?}"),
+        }
     }
 
     #[test]
