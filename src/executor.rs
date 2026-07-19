@@ -1411,12 +1411,33 @@ fn open_executor_with_storage(
             } else {
                 predicate
             };
-            let child = open_executor_with_storage(*input, ctx, storage)?;
-            Ok(Box::new(FilterExec {
-                input: child,
-                predicate,
-                ctx: ctx.clone(),
-            }))
+            if predicate_has_correlated(&predicate) {
+                let mut child =
+                    open_executor_with_storage(*input, ctx, storage.as_deref_mut())?;
+                let rows = drain_executor(child.as_mut())?;
+                let txn = storage.as_deref_mut().ok_or_else(|| {
+                    TakyonicError::Sql(
+                        "correlated subquery Filter requires an active MVCC transaction".into(),
+                    )
+                })?;
+                let mut kept = Vec::new();
+                for row in rows {
+                    if evaluate_bool_correlated(&predicate, &row, ctx, txn)? {
+                        kept.push(row);
+                    }
+                }
+                Ok(Box::new(ValuesExec {
+                    rows: kept,
+                    idx: 0,
+                }))
+            } else {
+                let child = open_executor_with_storage(*input, ctx, storage)?;
+                Ok(Box::new(FilterExec {
+                    input: child,
+                    predicate,
+                    ctx: ctx.clone(),
+                }))
+            }
         }
         PhysicalPlan::Insert {
             table,
@@ -3410,6 +3431,14 @@ pub fn evaluate(expr: &Expression, row: &Record, ctx: &ExecutionContext) -> Resu
             .get(name)
             .map(Value::from_text)
             .ok_or_else(|| TakyonicError::Sql(format!("column `{name}` not found"))),
+        Expression::OuterRef(name) => row
+            .get(name)
+            .map(Value::from_text)
+            .ok_or_else(|| {
+                TakyonicError::Sql(format!(
+                    "outer reference `{name}` not found on current row"
+                ))
+            }),
         Expression::Literal(s) => Ok(Value::from_text(s)),
         Expression::Parameter(idx) => Ok(ctx.param(*idx)?.clone()),
         Expression::BinaryOp { left, op, right } => {
@@ -3586,7 +3615,65 @@ fn rewrite_uncorrelated_subqueries(
             let v = list.into_iter().next().unwrap_or(Value::Null);
             Ok(Expression::Literal(v.to_display()))
         }
-        // Correlated: Nested-loop Apply — re-evaluate subquery per outer row at filter time.
+        // Correlated: leave intact for per-row Apply evaluation in Filter open.
+        Expression::InSubquery {
+            correlated: true, ..
+        }
+        | Expression::Exists {
+            correlated: true, ..
+        }
+        | Expression::ScalarSubquery {
+            correlated: true, ..
+        } => Ok(expr),
+        other => Ok(other),
+    }
+}
+
+fn predicate_has_correlated(expr: &Expression) -> bool {
+    match expr {
+        Expression::InSubquery {
+            correlated: true, ..
+        }
+        | Expression::Exists {
+            correlated: true, ..
+        }
+        | Expression::ScalarSubquery {
+            correlated: true, ..
+        } => true,
+        Expression::BinaryOp { left, right, .. }
+        | Expression::And { left, right }
+        | Expression::Or { left, right }
+        | Expression::Arith { left, right, .. } => {
+            predicate_has_correlated(left) || predicate_has_correlated(right)
+        }
+        Expression::InList { expr, .. } => predicate_has_correlated(expr),
+        _ => false,
+    }
+}
+
+/// Bind [`Expression::OuterRef`] nodes to literals from the outer row, then
+/// evaluate correlated IN/EXISTS/scalar subqueries for that row.
+fn evaluate_bool_correlated(
+    expr: &Expression,
+    row: &Record,
+    ctx: &ExecutionContext,
+    txn: &mut Transaction,
+) -> Result<bool> {
+    match expr {
+        Expression::And { left, right } => Ok(evaluate_bool_correlated(left, row, ctx, txn)?
+            && evaluate_bool_correlated(right, row, ctx, txn)?),
+        Expression::Or { left, right } => Ok(evaluate_bool_correlated(left, row, ctx, txn)?
+            || evaluate_bool_correlated(right, row, ctx, txn)?),
+        Expression::Exists {
+            subquery,
+            negated,
+            correlated: true,
+        } => {
+            let bound = bind_outer_refs_plan(subquery, row)?;
+            let rows = execute_subquery_rows(&bound, ctx, txn)?;
+            let exists = !rows.is_empty();
+            Ok(if *negated { !exists } else { exists })
+        }
         Expression::InSubquery {
             expr: inner,
             subquery,
@@ -3594,42 +3681,145 @@ fn rewrite_uncorrelated_subqueries(
             negated,
             correlated: true,
         } => {
-            // Defer: store as-is; FilterExec can't re-run without txn per row.
-            // Materialize once using current outer-unaware plan (best-effort), then
-            // fall through to InList — true correlation needs OuterRef substitution.
-            let list = execute_subquery_column(&subquery, &value_column, ctx, txn)?;
-            Ok(Expression::InList {
-                expr: inner,
-                list,
-                negated,
-            })
+            let needle = evaluate(inner, row, ctx)?;
+            let bound = bind_outer_refs_plan(subquery, row)?;
+            let list = execute_subquery_column(&bound, value_column, ctx, txn)?;
+            let found = list.iter().any(|v| values_equal(&needle, v));
+            Ok(if *negated { !found } else { found })
         }
-        Expression::Exists {
-            subquery,
-            negated,
-            correlated: true,
-        } => {
-            let rows = execute_subquery_rows(&subquery, ctx, txn)?;
-            let exists = !rows.is_empty();
-            let flag = if negated { !exists } else { exists };
-            Ok(Expression::Literal(if flag { "true" } else { "false" }.into()))
+        Expression::BinaryOp { left, op, right } => {
+            // Scalar subquery may sit on either side.
+            let lv = evaluate_value_correlated(left, row, ctx, txn)?;
+            let rv = evaluate_value_correlated(right, row, ctx, txn)?;
+            Ok(compare_sql_values(&lv, *op, &rv))
         }
+        other => evaluate_bool(other, row, ctx),
+    }
+}
+
+fn evaluate_value_correlated(
+    expr: &Expression,
+    row: &Record,
+    ctx: &ExecutionContext,
+    txn: &mut Transaction,
+) -> Result<Value> {
+    match expr {
         Expression::ScalarSubquery {
             subquery,
             value_column,
             correlated: true,
         } => {
-            let list = execute_subquery_column(&subquery, &value_column, ctx, txn)?;
+            let bound = bind_outer_refs_plan(subquery, row)?;
+            let list = execute_subquery_column(&bound, value_column, ctx, txn)?;
             if list.len() > 1 {
                 return Err(TakyonicError::Sql(
                     "scalar subquery returned more than one row".into(),
                 ));
             }
-            let v = list.into_iter().next().unwrap_or(Value::Null);
-            Ok(Expression::Literal(v.to_display()))
+            Ok(list.into_iter().next().unwrap_or(Value::Null))
         }
-        other => Ok(other),
+        other => evaluate(other, row, ctx),
     }
+}
+
+fn bind_outer_refs_plan(plan: &LogicalPlan, outer: &Record) -> Result<LogicalPlan> {
+    Ok(match plan {
+        LogicalPlan::Select {
+            table,
+            filters,
+            predicate,
+        } => LogicalPlan::Select {
+            table: table.clone(),
+            filters: filters.clone(),
+            predicate: predicate
+                .as_ref()
+                .map(|p| bind_outer_refs_expr(p, outer))
+                .transpose()?,
+        },
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(bind_outer_refs_plan(input, outer)?),
+            predicate: bind_outer_refs_expr(predicate, outer)?,
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+        } => LogicalPlan::Join {
+            left: Box::new(bind_outer_refs_plan(left, outer)?),
+            right: Box::new(bind_outer_refs_plan(right, outer)?),
+            on: bind_outer_refs_expr(on, outer)?,
+            join_type: *join_type,
+        },
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            aggr_exprs,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(bind_outer_refs_plan(input, outer)?),
+            group_exprs: group_exprs
+                .iter()
+                .map(|e| bind_outer_refs_expr(e, outer))
+                .collect::<Result<Vec<_>>>()?,
+            aggr_exprs: aggr_exprs
+                .iter()
+                .map(|e| bind_outer_refs_expr(e, outer))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        LogicalPlan::Sort { input, exprs } => LogicalPlan::Sort {
+            input: Box::new(bind_outer_refs_plan(input, outer)?),
+            exprs: exprs.clone(),
+        },
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
+            input: Box::new(bind_outer_refs_plan(input, outer)?),
+            skip: *skip,
+            fetch: *fetch,
+        },
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias: alias.clone(),
+            input: Box::new(bind_outer_refs_plan(input, outer)?),
+        },
+        other => other.clone(),
+    })
+}
+
+fn bind_outer_refs_expr(expr: &Expression, outer: &Record) -> Result<Expression> {
+    Ok(match expr {
+        Expression::OuterRef(name) => {
+            let text = outer.get(name).ok_or_else(|| {
+                TakyonicError::Sql(format!("outer reference `{name}` missing on outer row"))
+            })?;
+            Expression::Literal(text.to_string())
+        }
+        Expression::BinaryOp { left, op, right } => Expression::BinaryOp {
+            left: Box::new(bind_outer_refs_expr(left, outer)?),
+            op: *op,
+            right: Box::new(bind_outer_refs_expr(right, outer)?),
+        },
+        Expression::And { left, right } => Expression::And {
+            left: Box::new(bind_outer_refs_expr(left, outer)?),
+            right: Box::new(bind_outer_refs_expr(right, outer)?),
+        },
+        Expression::Or { left, right } => Expression::Or {
+            left: Box::new(bind_outer_refs_expr(left, outer)?),
+            right: Box::new(bind_outer_refs_expr(right, outer)?),
+        },
+        Expression::Arith { left, op, right } => Expression::Arith {
+            left: Box::new(bind_outer_refs_expr(left, outer)?),
+            op: *op,
+            right: Box::new(bind_outer_refs_expr(right, outer)?),
+        },
+        Expression::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Expression::InList {
+            expr: Box::new(bind_outer_refs_expr(inner, outer)?),
+            list: list.clone(),
+            negated: *negated,
+        },
+        other => other.clone(),
+    })
 }
 
 fn execute_subquery_rows(
@@ -4385,6 +4575,56 @@ mod tests {
         assert_eq!(out.len(), 1, "expected only Sales group, got {out:?}");
         assert_eq!(out[0].get("department"), Some("Sales"));
         assert_eq!(out[0].get("count(*)"), Some("2"));
+
+        engine.close().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn correlated_exists_filters_per_outer_row() {
+        let (engine, root) = temp_engine("outerref");
+        engine
+            .register_table(TableSchema::new("employees", "id", vec![]))
+            .unwrap();
+        engine
+            .register_table(TableSchema::new("dept_budget", "dept", vec![]))
+            .unwrap();
+        let ctx = ExecutionContext::new();
+
+        execute_plan_autocommit(
+            &LogicalPlanner::plan(
+                "INSERT INTO employees (id, dept) VALUES \
+                 (1, 'Engineering'), (2, 'Sales'), (3, 'Engineering')",
+            )
+            .unwrap(),
+            &ctx,
+            engine.begin().unwrap(),
+        )
+        .unwrap();
+        execute_plan_autocommit(
+            &LogicalPlanner::plan(
+                "INSERT INTO dept_budget (dept, budget) VALUES ('Engineering', 100)",
+            )
+            .unwrap(),
+            &ctx,
+            engine.begin().unwrap(),
+        )
+        .unwrap();
+
+        let sql = "SELECT id FROM employees e WHERE EXISTS (
+            SELECT 1 FROM dept_budget d WHERE d.dept = e.dept
+        )";
+        let plan = LogicalPlanner::plan(sql).unwrap();
+        let mut txn = engine.begin().unwrap();
+        let out = execute_plan(&plan, &ctx, &mut txn).unwrap();
+        txn.abort();
+
+        let mut ids: Vec<_> = out
+            .iter()
+            .map(|r| r.get("id").unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1".to_string(), "3".to_string()]);
 
         engine.close().unwrap();
         let _ = fs::remove_dir_all(root);

@@ -260,6 +260,8 @@ pub enum JoinType {
 pub enum Expression {
     /// Column reference (`id`, `users.id` → leaf name).
     Column(String),
+    /// Reference to a column from an outer query row (correlated subquery).
+    OuterRef(String),
     /// Literal value (string form; coerced at eval time).
     Literal(String),
     /// Prepared-statement parameter `$1`, `$2`, … stored **0-based** (`$1` → `0`).
@@ -668,10 +670,31 @@ impl LogicalPlanner {
         }
         let from = &select.from[0];
 
+        let local_from = {
+            let mut s = from_relation_scope_names(&from.relation);
+            for join in &from.joins {
+                s.extend(from_relation_scope_names(&join.relation));
+            }
+            s
+        };
+
         // Resolve FROM (base table, CTE alias, or derived subquery).
         let mut plan = Self::plan_from_item(&from.relation, &ctes)?;
+        // Parent outer + this query's FROM aliases — nested subqueries see these
+        // as OuterRef candidates. This query's own WHERE uses `outer_columns` only
+        // for OuterRef (so local aliases stay as Column).
+        let scope_for_subqueries = {
+            let mut s = outer_columns.to_vec();
+            s.extend(local_from.iter().cloned());
+            s
+        };
         for join in &from.joins {
-            let (join_type, on) = plan_join_operator_ctx(&join.join_operator, &ctes, outer_columns)?;
+            let (join_type, on) = plan_join_operator_ctx(
+                &join.join_operator,
+                &ctes,
+                outer_columns,
+                &scope_for_subqueries,
+            )?;
             let right = Self::plan_from_item(&join.relation, &ctes)?;
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
@@ -681,15 +704,21 @@ impl LogicalPlanner {
             };
         }
 
-        // WHERE — may contain IN/EXISTS/scalar subqueries.
-        let scope = {
-            let mut s = outer_columns.to_vec();
+        // Refresh scope with plan hints after joins are attached.
+        let scope_for_subqueries = {
+            let mut s = scope_for_subqueries;
             s.extend(collect_plan_output_hints(&plan));
             s
         };
+
+        // WHERE — may contain IN/EXISTS/scalar subqueries.
         if let Some(selection) = &select.selection {
-            let (filters, predicate) =
-                plan_where_ctx(Some(selection), &ctes, &scope)?;
+            let (filters, predicate) = plan_where_ctx(
+                Some(selection),
+                &ctes,
+                outer_columns,
+                &scope_for_subqueries,
+            )?;
             plan = match plan {
                 LogicalPlan::Select {
                     table,
@@ -716,8 +745,12 @@ impl LogicalPlanner {
             };
         }
 
-        let (group_exprs, aggr_exprs, has_agg, having) =
-            plan_projection_aggregates_ctx(select, &ctes, &scope)?;
+        let (group_exprs, aggr_exprs, has_agg, having) = plan_projection_aggregates_ctx(
+            select,
+            &ctes,
+            outer_columns,
+            &scope_for_subqueries,
+        )?;
         if has_agg || !group_exprs.is_empty() {
             plan = LogicalPlan::Aggregate {
                 input: Box::new(plan),
@@ -738,7 +771,8 @@ impl LogicalPlanner {
         }
 
         if let Some(order_by) = &query.order_by {
-            let exprs = plan_order_by_ctx(order_by, &ctes, &scope)?;
+            let exprs =
+                plan_order_by_ctx(order_by, &ctes, outer_columns, &scope_for_subqueries)?;
             if !exprs.is_empty() {
                 plan = LogicalPlan::Sort {
                     input: Box::new(plan),
@@ -1036,18 +1070,20 @@ impl SqlEngine {
 #[allow(dead_code)]
 #[allow(dead_code)]
 fn plan_where(selection: Option<&Expr>) -> Result<(Vec<Filter>, Option<Expression>)> {
-    plan_where_ctx(selection, &HashMap::new(), &[])
+    plan_where_ctx(selection, &HashMap::new(), &[], &[])
 }
 
 fn plan_where_ctx(
     selection: Option<&Expr>,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<(Vec<Filter>, Option<Expression>)> {
     match selection {
         None => Ok((Vec::new(), None)),
         Some(expr) => {
-            let predicate = expr_to_expression_ctx(expr, ctes, outer_columns)?;
+            let predicate =
+                expr_to_expression_ctx(expr, ctes, outer_ref_scope, subquery_outer)?;
             // Parameterized / subquery / complex WHERE: CBO gets no driving filter.
             let filters = if expression_has_subquery(&predicate) {
                 Vec::new()
@@ -1119,7 +1155,10 @@ fn expression_has_subquery(expr: &Expression) -> bool {
         Expression::InList { expr, .. } => expression_has_subquery(expr),
         Expression::AggregateFunction { args, .. } => args.iter().any(expression_has_subquery),
         Expression::Array(items) => items.iter().any(expression_has_subquery),
-        Expression::Column(_) | Expression::Literal(_) | Expression::Parameter(_) => false,
+        Expression::Column(_)
+        | Expression::OuterRef(_)
+        | Expression::Literal(_)
+        | Expression::Parameter(_) => false,
     }
 }
 
@@ -1220,6 +1259,7 @@ fn walk_columns(expr: &Expression, f: &mut dyn FnMut(&str)) {
         }
         Expression::Exists { .. }
         | Expression::ScalarSubquery { .. }
+        | Expression::OuterRef(_)
         | Expression::Literal(_)
         | Expression::Parameter(_) => {}
     }
@@ -1462,12 +1502,12 @@ fn parse_vector_index_with(with: &[Expr]) -> Result<Option<VectorIndexSpec>> {
 fn first_projection_column(
     select: &sqlparser::ast::Select,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
 ) -> Result<String> {
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(e) => {
-                let planned = expr_to_expression_ctx(e, ctes, outer_columns)?;
+                let planned = expr_to_expression_ctx(e, ctes, outer_ref_scope, outer_ref_scope)?;
                 return match planned {
                     Expression::Column(c) => Ok(c),
                     Expression::AggregateFunction { .. } => aggregate_result_column(&planned)
@@ -1502,15 +1542,16 @@ fn first_projection_column(
 fn plan_projection_aggregates(
     select: &sqlparser::ast::Select,
 ) -> Result<(Vec<Expression>, Vec<Expression>, bool, Option<Expression>)> {
-    plan_projection_aggregates_ctx(select, &HashMap::new(), &[])
+    plan_projection_aggregates_ctx(select, &HashMap::new(), &[], &[])
 }
 
 fn plan_projection_aggregates_ctx(
     select: &sqlparser::ast::Select,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<(Vec<Expression>, Vec<Expression>, bool, Option<Expression>)> {
-    let group_exprs = plan_group_by_ctx(&select.group_by, ctes, outer_columns)?;
+    let group_exprs = plan_group_by_ctx(&select.group_by, ctes, outer_ref_scope, subquery_outer)?;
     let mut aggr_exprs = Vec::new();
     let mut has_agg = false;
 
@@ -1531,7 +1572,7 @@ fn plan_projection_aggregates_ctx(
                 ));
             }
         };
-        let planned = expr_to_expression_ctx(expr, ctes, outer_columns)?;
+        let planned = expr_to_expression_ctx(expr, ctes, outer_ref_scope, subquery_outer)?;
         if matches!(planned, Expression::AggregateFunction { .. }) {
             has_agg = true;
             aggr_exprs.push(planned);
@@ -1545,7 +1586,7 @@ fn plan_projection_aggregates_ctx(
     }
 
     let having = if let Some(h) = &select.having {
-        Some(expr_to_expression_ctx(h, ctes, outer_columns)?)
+        Some(expr_to_expression_ctx(h, ctes, outer_ref_scope, subquery_outer)?)
     } else {
         None
     };
@@ -1555,13 +1596,14 @@ fn plan_projection_aggregates_ctx(
 
 #[allow(dead_code)]
 fn plan_group_by(group_by: &GroupByExpr) -> Result<Vec<Expression>> {
-    plan_group_by_ctx(group_by, &HashMap::new(), &[])
+    plan_group_by_ctx(group_by, &HashMap::new(), &[], &[])
 }
 
 fn plan_group_by_ctx(
     group_by: &GroupByExpr,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<Vec<Expression>> {
     match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
@@ -1572,7 +1614,7 @@ fn plan_group_by_ctx(
             }
             exprs
                 .iter()
-                .map(|e| expr_to_expression_ctx(e, ctes, outer_columns))
+                .map(|e| expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer))
                 .collect()
         }
         GroupByExpr::All(_) => Err(TakyonicError::Sql(
@@ -1583,13 +1625,14 @@ fn plan_group_by_ctx(
 
 #[allow(dead_code)]
 fn plan_order_by(order_by: &OrderBy) -> Result<Vec<SortExpr>> {
-    plan_order_by_ctx(order_by, &HashMap::new(), &[])
+    plan_order_by_ctx(order_by, &HashMap::new(), &[], &[])
 }
 
 fn plan_order_by_ctx(
     order_by: &OrderBy,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<Vec<SortExpr>> {
     if order_by.interpolate.is_some() {
         return Err(TakyonicError::Sql(
@@ -1602,20 +1645,21 @@ fn plan_order_by_ctx(
         )),
         OrderByKind::Expressions(exprs) => exprs
             .iter()
-            .map(|e| plan_order_by_expr_ctx(e, ctes, outer_columns))
+            .map(|e| plan_order_by_expr_ctx(e, ctes, outer_ref_scope, subquery_outer))
             .collect(),
     }
 }
 
 #[allow(dead_code)]
 fn plan_order_by_expr(obe: &OrderByExpr) -> Result<SortExpr> {
-    plan_order_by_expr_ctx(obe, &HashMap::new(), &[])
+    plan_order_by_expr_ctx(obe, &HashMap::new(), &[], &[])
 }
 
 fn plan_order_by_expr_ctx(
     obe: &OrderByExpr,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<SortExpr> {
     if obe.with_fill.is_some() {
         return Err(TakyonicError::Sql(
@@ -1625,7 +1669,8 @@ fn plan_order_by_expr_ctx(
     let expr = rewrite_sort_expr_for_output(expr_to_expression_ctx(
         &obe.expr,
         ctes,
-        outer_columns,
+        outer_ref_scope,
+        subquery_outer,
     )?);
     let asc = obe.options.asc.unwrap_or(true);
     Ok(SortExpr { expr, asc })
@@ -1688,13 +1733,14 @@ fn is_aggregate_fn(name: &str) -> bool {
 
 #[allow(dead_code)]
 fn function_to_expression(func: &Function) -> Result<Expression> {
-    function_to_expression_ctx(func, &HashMap::new(), &[])
+    function_to_expression_ctx(func, &HashMap::new(), &[], &[])
 }
 
 fn function_to_expression_ctx(
     func: &Function,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<Expression> {
     let name = object_name_leaf(&func.name)?;
     let upper = name.to_ascii_uppercase();
@@ -1718,7 +1764,7 @@ fn function_to_expression_ctx(
         FunctionArguments::List(list) => {
             let mut out = Vec::with_capacity(list.args.len());
             for arg in &list.args {
-                out.push(function_arg_to_expression_ctx(arg, ctes, outer_columns)?);
+                out.push(function_arg_to_expression_ctx(arg, ctes, outer_ref_scope, subquery_outer)?);
             }
             out
         }
@@ -1744,17 +1790,18 @@ fn function_to_expression_ctx(
 
 #[allow(dead_code)]
 fn function_arg_to_expression(arg: &FunctionArg) -> Result<Expression> {
-    function_arg_to_expression_ctx(arg, &HashMap::new(), &[])
+    function_arg_to_expression_ctx(arg, &HashMap::new(), &[], &[])
 }
 
 fn function_arg_to_expression_ctx(
     arg: &FunctionArg,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<Expression> {
     match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-            expr_to_expression_ctx(e, ctes, outer_columns)
+            expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer)
         }
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
         | FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
@@ -1771,13 +1818,14 @@ fn function_arg_to_expression_ctx(
 
 #[allow(dead_code)]
 fn plan_join_operator(op: &JoinOperator) -> Result<(JoinType, Expression)> {
-    plan_join_operator_ctx(op, &HashMap::new(), &[])
+    plan_join_operator_ctx(op, &HashMap::new(), &[], &[])
 }
 
 fn plan_join_operator_ctx(
     op: &JoinOperator,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<(JoinType, Expression)> {
     let (join_type, constraint) = match op {
         JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, c),
@@ -1791,7 +1839,7 @@ fn plan_join_operator_ctx(
         }
     };
     let on = match constraint {
-        JoinConstraint::On(expr) => expr_to_expression_ctx(expr, ctes, outer_columns)?,
+        JoinConstraint::On(expr) => expr_to_expression_ctx(expr, ctes, outer_ref_scope, subquery_outer)?,
         other => {
             return Err(TakyonicError::Sql(format!(
                 "JOIN requires ON condition, got {other:?}"
@@ -1803,44 +1851,54 @@ fn plan_join_operator_ctx(
 
 /// Translate a SQL expression into our simplified [`Expression`] tree.
 fn expr_to_expression(expr: &Expr) -> Result<Expression> {
-    expr_to_expression_ctx(expr, &HashMap::new(), &[])
+    expr_to_expression_ctx(expr, &HashMap::new(), &[], &[])
 }
 
 fn expr_to_expression_ctx(
     expr: &Expr,
     ctes: &HashMap<String, LogicalPlan>,
-    outer_columns: &[String],
+    outer_ref_scope: &[String],
+    subquery_outer: &[String],
 ) -> Result<Expression> {
     match expr {
         Expr::Identifier(ident) => Ok(Expression::Column(ident.value.clone())),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map(|i| Expression::Column(i.value.clone()))
-            .ok_or_else(|| TakyonicError::Sql("empty compound identifier".into())),
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 {
+                let qual = &parts[parts.len() - 2].value;
+                let col = &parts[parts.len() - 1].value;
+                if outer_ref_scope.iter().any(|o| o == qual) {
+                    return Ok(Expression::OuterRef(col.clone()));
+                }
+            }
+            parts
+                .last()
+                .map(|i| Expression::Column(i.value.clone()))
+                .ok_or_else(|| TakyonicError::Sql("empty compound identifier".into()))
+        }
         Expr::Value(ValueWithSpan { value, .. }) => match value {
             SqlValue::Placeholder(p) => Ok(Expression::Parameter(parse_placeholder(p)?)),
             other => Ok(Expression::Literal(sql_value_to_string(other)?)),
         },
-        Expr::Nested(inner) => expr_to_expression_ctx(inner, ctes, outer_columns),
+        Expr::Nested(inner) => expr_to_expression_ctx(inner, ctes, outer_ref_scope, subquery_outer),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => Ok(Expression::And {
-            left: Box::new(expr_to_expression_ctx(left, ctes, outer_columns)?),
-            right: Box::new(expr_to_expression_ctx(right, ctes, outer_columns)?),
+            left: Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?),
+            right: Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?),
         }),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Or,
             right,
         } => Ok(Expression::Or {
-            left: Box::new(expr_to_expression_ctx(left, ctes, outer_columns)?),
-            right: Box::new(expr_to_expression_ctx(right, ctes, outer_columns)?),
+            left: Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?),
+            right: Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?),
         }),
         Expr::BinaryOp { left, op, right } => {
-            let left_e = Box::new(expr_to_expression_ctx(left, ctes, outer_columns)?);
-            let right_e = Box::new(expr_to_expression_ctx(right, ctes, outer_columns)?);
+            let left_e = Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?);
+            let right_e = Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?);
             if let Some(arith) = match op {
                 BinaryOperator::Plus => Some(ArithOp::Add),
                 BinaryOperator::Minus => Some(ArithOp::Sub),
@@ -1883,20 +1941,20 @@ fn expr_to_expression_ctx(
         Expr::Array(Array { elem, .. }) => {
             let mut items = Vec::with_capacity(elem.len());
             for e in elem {
-                items.push(expr_to_expression_ctx(e, ctes, outer_columns)?);
+                items.push(expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer)?);
             }
             Ok(Expression::Array(items))
         }
-        Expr::Function(func) => function_to_expression_ctx(func, ctes, outer_columns),
+        Expr::Function(func) => function_to_expression_ctx(func, ctes, outer_ref_scope, subquery_outer),
         Expr::InSubquery {
             expr: left,
             subquery,
             negated,
         } => {
-            let left_expr = expr_to_expression_ctx(left, ctes, outer_columns)?;
-            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, outer_columns)?;
-            let value_column = subquery_value_column(subquery, ctes, outer_columns)?;
-            let correlated = plan_is_correlated(&sub_plan, outer_columns);
+            let left_expr = expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?;
+            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, subquery_outer)?;
+            let value_column = subquery_value_column(subquery, ctes, subquery_outer)?;
+            let correlated = plan_is_correlated(&sub_plan, subquery_outer);
             Ok(Expression::InSubquery {
                 expr: Box::new(left_expr),
                 subquery: Box::new(sub_plan),
@@ -1906,8 +1964,8 @@ fn expr_to_expression_ctx(
             })
         }
         Expr::Exists { subquery, negated } => {
-            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, outer_columns)?;
-            let correlated = plan_is_correlated(&sub_plan, outer_columns);
+            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, subquery_outer)?;
+            let correlated = plan_is_correlated(&sub_plan, subquery_outer);
             Ok(Expression::Exists {
                 subquery: Box::new(sub_plan),
                 negated: *negated,
@@ -1915,9 +1973,9 @@ fn expr_to_expression_ctx(
             })
         }
         Expr::Subquery(subquery) => {
-            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, outer_columns)?;
-            let value_column = subquery_value_column(subquery, ctes, outer_columns)?;
-            let correlated = plan_is_correlated(&sub_plan, outer_columns);
+            let sub_plan = LogicalPlanner::plan_query(subquery, ctes, subquery_outer)?;
+            let value_column = subquery_value_column(subquery, ctes, subquery_outer)?;
+            let correlated = plan_is_correlated(&sub_plan, subquery_outer);
             Ok(Expression::ScalarSubquery {
                 subquery: Box::new(sub_plan),
                 value_column,
@@ -1929,10 +1987,10 @@ fn expr_to_expression_ctx(
             list,
             negated,
         } => {
-            let left_expr = expr_to_expression_ctx(left, ctes, outer_columns)?;
+            let left_expr = expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?;
             let mut values = Vec::with_capacity(list.len());
             for item in list {
-                match expr_to_expression_ctx(item, ctes, outer_columns)? {
+                match expr_to_expression_ctx(item, ctes, outer_ref_scope, subquery_outer)? {
                     Expression::Literal(s) => values.push(Value::from_text(&s)),
                     Expression::Parameter(_) => {
                         return Err(TakyonicError::Sql(
@@ -1975,6 +2033,9 @@ fn subquery_value_column(
 }
 
 fn plan_is_correlated(plan: &LogicalPlan, outer_columns: &[String]) -> bool {
+    if plan_has_outer_ref(plan) {
+        return true;
+    }
     if outer_columns.is_empty() {
         return false;
     }
@@ -1984,6 +2045,72 @@ fn plan_is_correlated(plan: &LogicalPlan, outer_columns: &[String]) -> bool {
     walk_plan_columns(plan, &mut |c| cols.push(c.to_string()));
     cols.iter()
         .any(|c| outer_columns.iter().any(|o| o == c) && !inner.contains(c))
+}
+
+fn plan_has_outer_ref(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Select {
+            predicate: Some(p), ..
+        } => expr_has_outer_ref(p),
+        LogicalPlan::Filter { input, predicate } => {
+            expr_has_outer_ref(predicate) || plan_has_outer_ref(input)
+        }
+        LogicalPlan::Join { left, right, on, .. }
+        | LogicalPlan::DistributedJoin { left, right, on, .. } => {
+            expr_has_outer_ref(on) || plan_has_outer_ref(left) || plan_has_outer_ref(right)
+        }
+        LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::DistributedAggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Explain { plan: input } => plan_has_outer_ref(input),
+        _ => false,
+    }
+}
+
+fn expr_has_outer_ref(expr: &Expression) -> bool {
+    match expr {
+        Expression::OuterRef(_) => true,
+        Expression::BinaryOp { left, right, .. }
+        | Expression::And { left, right }
+        | Expression::Or { left, right }
+        | Expression::Arith { left, right, .. }
+        | Expression::VectorDistance { left, right, .. } => {
+            expr_has_outer_ref(left) || expr_has_outer_ref(right)
+        }
+        Expression::InList { expr, .. } => expr_has_outer_ref(expr),
+        Expression::InSubquery { expr, subquery, .. } => {
+            expr_has_outer_ref(expr) || plan_has_outer_ref(subquery)
+        }
+        Expression::Exists { subquery, .. } | Expression::ScalarSubquery { subquery, .. } => {
+            plan_has_outer_ref(subquery)
+        }
+        Expression::AggregateFunction { args, .. } => args.iter().any(expr_has_outer_ref),
+        Expression::Array(items) => items.iter().any(expr_has_outer_ref),
+        Expression::Column(_) | Expression::Literal(_) | Expression::Parameter(_) => false,
+    }
+}
+
+/// Table / alias names visible for OuterRef qualification in this FROM item.
+fn from_relation_scope_names(factor: &TableFactor) -> Vec<String> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let mut names = Vec::new();
+            if let Ok(table) = object_name_leaf(name) {
+                names.push(table);
+            }
+            if let Some(a) = alias {
+                names.push(a.name.value.clone());
+            }
+            names
+        }
+        TableFactor::Derived { alias, .. } => alias
+            .as_ref()
+            .map(|a| vec![a.name.value.clone()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// Parse `$1` / `$2` → 0-based index.
@@ -2559,6 +2686,37 @@ mod tests {
                 );
             }
             other => panic!("expected Select+InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_correlated_exists_with_outer_ref() {
+        let plan = LogicalPlanner::plan(
+            "SELECT id FROM employees e WHERE EXISTS (
+                SELECT 1 FROM dept_budget d WHERE d.dept = e.dept
+             )",
+        )
+        .unwrap();
+        let pred = match &plan {
+            LogicalPlan::Select {
+                predicate: Some(p), ..
+            }
+            | LogicalPlan::Filter { predicate: p, .. } => p,
+            other => panic!("expected Select/Filter with predicate, got {other:?}"),
+        };
+        match pred {
+            Expression::Exists {
+                correlated: true,
+                subquery,
+                ..
+            } => {
+                let dbg = format!("{subquery:?}");
+                assert!(
+                    dbg.contains("OuterRef"),
+                    "subquery should contain OuterRef, got {subquery:?}"
+                );
+            }
+            other => panic!("expected correlated Exists, got {other:?}"),
         }
     }
 
