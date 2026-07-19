@@ -39,6 +39,7 @@ pub mod query;
 pub mod raft;
 pub mod raft_log;
 pub mod rbac;
+pub mod reliability;
 pub mod schema;
 pub mod shuffle;
 pub mod shuffle_service;
