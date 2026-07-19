@@ -54,6 +54,11 @@ When changing recovery, replication, snapshots, transactions, or compaction,
 also run the relevant example stress harness. Include the command, workload,
 hardware, and result in the pull request so performance claims are reproducible.
 
+## Reliability
+
+Short SQL fuzz and MVCC soak run as part of `cargo test --release`.
+For long soak and HA failover runs, see [docs/RELIABILITY.md](docs/RELIABILITY.md).
+
 ## Pull requests
 
 Use a concise title and explain:

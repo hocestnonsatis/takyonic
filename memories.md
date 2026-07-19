@@ -211,6 +211,12 @@ Güncelleme: 2026-07-19
 - Done: correlated OuterRef Apply (per-row EXISTS/IN/scalar) — 2026-07-19
 - Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (complete)
 
+## Sonraki büyüme aşaması (2026-07-19)
+- Spec approved: `docs/superpowers/specs/2026-07-19-reliability-suite-design.md`
+- Plan: `docs/superpowers/plans/2026-07-19-reliability-suite.md`
+- Done: Reliability Suite (`src/reliability/`, examples `reliability_soak`/`ha_soak`, `docs/RELIABILITY.md`, `workflow_dispatch` CI) — 2026-07-19
+- Next: remaining SQL completeness (window, UPSERT/MERGE, deeper correlate) → backup/PITR → production guide/Grafana → TPC karşılaştırması
+
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
 - Durability: `File::sync_data` (fdatasync-style); WAL lives under `wal_dir`

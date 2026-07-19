@@ -1,0 +1,50 @@
+name: Reliability
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_secs:
+        description: MVCC soak seconds
+        required: false
+        default: "600"
+      ha_secs:
+        description: HA soak seconds
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: SQL fuzz + MVCC + HA soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: SQL + MVCC soak
+        env:
+          TAKYONIC_SOAK_SECS: ${{ inputs.soak_secs }}
+          TAKYONIC_FUZZ_ITERS: "50000"
+          TAKYONIC_FUZZ_SEED: "1"
+        run: cargo run --release --example reliability_soak
+
+      - name: HA soak
+        env:
+          TAKYONIC_HA_SECS: ${{ inputs.ha_secs }}
+        run: cargo run --release --example ha_soak
