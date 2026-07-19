@@ -215,6 +215,9 @@ Güncelleme: 2026-07-19
 - Spec approved: `docs/superpowers/specs/2026-07-19-reliability-suite-design.md`
 - Plan: `docs/superpowers/plans/2026-07-19-reliability-suite.md`
 - Done: Reliability Suite (`src/reliability/`, examples `reliability_soak`/`ha_soak`, `docs/RELIABILITY.md`, `workflow_dispatch` CI) — 2026-07-19
+- Done: Continuous Hardening (multi-day chaos soak + proptest MVCC/OCC/2PC + unsafe/SIMD/JIT audit) — 2026-07-19
+  - Plan: `docs/superpowers/plans/2026-07-19-continuous-hardening.md`
+  - `examples/continuous_chaos`, `src/reliability/props/*`, `docs/UNSAFE_AUDIT.md`
 - Next: remaining SQL completeness (window, UPSERT/MERGE, deeper correlate) → backup/PITR → production guide/Grafana → TPC karşılaştırması
 
 ## Ingestion Path (Step 2)

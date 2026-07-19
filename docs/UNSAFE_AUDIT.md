@@ -3,47 +3,51 @@
 Güncelleme: 2026-07-19
 
 Independent review of `unsafe` blocks, SIMD kernels (AVX2/AVX-512), and
-Cranelift JIT (`src/jit.rs`). Complements unit tests with an explicit checklist.
+Cranelift JIT (`src/jit.rs`). Complements unit tests with an explicit checklist
+and `reliability::props::simd_jit` equivalence properties.
 
 ## Inventory
 
 | Site | File | Kind | Precondition documented? | Equivalence test? | Status |
 |------|------|------|--------------------------|-------------------|--------|
-| `mul8_avx512` / `add8` / `sub8` / `sum_*` | `src/vectorized.rs` | SIMD intrinsics | TBD | Task 8 | Open |
-| `euclidean_avx2` / `euclidean_sse` | `src/vector.rs` | SIMD distance | TBD | existing throughput + Task 8 | Open |
-| `JitScalarFn` / `JitBatchBinOpFn` transmute | `src/jit.rs` | JIT fn ptr | TBD | Task 8 | Open |
-| JIT scratch call sites | `src/jit.rs` | raw ptr + len | TBD | Task 8 | Open |
-| SST `MmapOptions::map` | `src/sst.rs` | mmap | OS file lifetime | existing SST tests | Open |
-| page zeroing / alloc | `src/page.rs` | layout | TBD | existing page tests | Open |
-| test-only `env::set_var` | `src/reliability/mod.rs` | test | N/A | N/A | Accepted |
+| `mul8_avx512` / `add8` / `sub8` / `sum_*` | `src/vectorized.rs` | SIMD intrinsics | Yes (feature detect + loop `i + width <= n`) | `prop_simd_*` | Reviewed |
+| `euclidean_avx2` / `euclidean_sse` | `src/vector.rs` | SIMD distance | Yes (`is_x86_feature_detected!` + len loops) | `prop_euclidean_simd_matches_scalar` | Reviewed |
+| `JitScalarFn` / `JitBatchBinOpFn` transmute | `src/jit.rs` | JIT fn ptr | Yes (only after `get_finalized_function`) | `prop_jit_batch_mul_matches_scalar` | Reviewed |
+| JIT scratch call sites | `src/jit.rs` | raw ptr + len | Yes (scratch sized to column set / `n`) | existing + prop | Reviewed |
+| SST `MmapOptions::map` | `src/sst.rs` | mmap | Yes (via `SstRegistry` pin lifetime) | existing SST tests | Reviewed |
+| page `aligned_zeroed` | `src/page.rs` | alloc | Yes (power-of-two len == align) | `page_is_aligned` | Reviewed |
+| test-only `env::set_var` | `src/reliability/*.rs` | test | N/A | N/A | Accepted |
 
-## Checklist (reviewer must answer Yes/No + notes)
+## Checklist
 
 ### SIMD kernels (`vectorized.rs` / `vector.rs`)
 
-- [ ] Every `unsafe` intrinsic call is gated by `is_x86_feature_detected!` **and** length ≥ lane width.
-- [ ] Pointers passed to `_mm256_*` / `_mm512_*` are derived from `&[T]` / `&mut [T]` with `n` bounds checked (or `debug_assert!` + proven loop invariant).
-- [ ] No aliasing of mutable output with inputs unless `out` is disjoint (document if in-place forbidden).
-- [ ] Scalar tail handles `n % lane != 0`; empty `n=0` is safe.
-- [ ] Float NaN/Inf behavior matches scalar (document if not required).
+- [x] Every `unsafe` intrinsic call is gated by `is_x86_feature_detected!` **and** length ≥ lane width.
+- [x] Pointers passed to `_mm256_*` / `_mm512_*` are derived from `&[T]` / `&mut [T]` with `n` bounds checked (loop invariant `i + width <= n`; entry uses `debug_assert!` on public wrappers).
+- [x] No in-place aliasing required — public kernels take distinct `out` slices; in-tree callers use separate buffers.
+- [x] Scalar tail handles `n % lane != 0`; empty `n=0` is safe (loops do not enter).
+- [x] Float NaN/Inf: bit-identical mul/add/sub vs scalar for finite inputs (props); IEEE NaN payload identity not required.
 
 ### Cranelift JIT (`jit.rs`)
 
-- [ ] `transmute` of `*const u8` → fn pointer only on pointers returned by `JITModule::get_finalized_function`.
-- [ ] Scalar JIT: scratch buffer length ≥ max column index read by compiled code.
-- [ ] Batch JIT: `len` argument matches all three slice lengths; no call with `len > slice.len()`.
-- [ ] Fallback path used when type is not JIT-lowerable (String etc.) — no partial compile UB.
-- [ ] Module drop order: no fn pointer use after `JitCompiler` drop.
+- [x] `transmute` only on pointers from `JITModule::get_finalized_function`.
+- [x] Scalar JIT scratch length covers compiled column indices (existing unit tests).
+- [x] Batch JIT: callers pass `n` matching slice lengths (`prop_jit_batch_mul_matches_scalar` + `cranelift_simd_f64x2_batch_mul_matches_scalar`).
+- [x] Non-lowerable exprs fall back (`compile_predicate` → `None` / interpreter); no half-compiled call.
+- [x] `CompiledFn` / batch fn pointers are not retained past owning `JitCompiler` in production paths (engine-scoped).
 
 ### mmap / pages
 
-- [ ] Mmap lifetime ≤ file handle / SST registration; no use-after-unmap.
-- [ ] Page `unsafe` only for alignment/zeroing with size == `PAGE_SIZE`.
+- [x] Mmap lifetime tied to `SstPin` / registry; unlink deferred until pins drop.
+- [x] Page `unsafe` only for `alloc_zeroed` with `Layout` size==align power-of-two.
 
 ## Findings
 
-_(Filled in Task 9 after review pass.)_
+1. **[Low]** `src/vectorized.rs` — Public `SimdKernels::{mul,add,sub,sum}` enforce slice/`n` consistency with `debug_assert!` only. A release build with a buggy caller could pass `n` larger than slice length and hit UB in the SIMD path. **Action:** accept for v1 (all in-tree callers pass `batch.len` / prop-tested `n`); follow-up optional `assert!` or checked `get_unchecked` wrappers if these APIs are ever exported as a public crate surface beyond the engine.
+
+2. **[None otherwise]** No High/Medium defects found in AVX2/AVX-512 kernels, Euclidean SIMD, Cranelift transmute sites, mmap pinning, or page allocation as of 2026-07-19.
 
 ## Residual risk
 
-- Multi-day continuous soak may still miss rare JIT/SIMD races under concurrent BPM — tracked via Workstream A heartbeats.
+- Multi-day continuous soak may still miss rare JIT/SIMD races under concurrent BPM — tracked via `examples/continuous_chaos` heartbeats (`TAKYONIC_HEARTBEAT_PATH`).
+- Property tests sample finite random floats; they do not exhaustively cover NaN signaling payloads or denormals under every CPU microcode.

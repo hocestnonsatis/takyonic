@@ -60,6 +60,15 @@ TAKYONIC_CONTINUOUS_DRY_RUN=1 TAKYONIC_CONTINUOUS_SECS=5 \
 GitHub Actions: set `continuous_secs` on `workflow_dispatch` (hour-scale).
 True multi-day runs are local/self-hosted — GHA job timeouts cannot cover days.
 
+## Property tests (proptest)
+
+```bash
+cargo test --release --lib reliability::props -- --nocapture
+```
+
+Covers MVCC/OCC, 2PC, and SIMD/JIT equivalence. See also
+[UNSAFE_AUDIT.md](UNSAFE_AUDIT.md).
+
 ## Interpreting failures
 
 - **SQL fuzz:** unexpected errors (not `Sql` / `Conflict` / `PermissionDenied`) or

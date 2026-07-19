@@ -57,7 +57,9 @@ hardware, and result in the pull request so performance claims are reproducible.
 ## Reliability
 
 Short SQL fuzz and MVCC soak run as part of `cargo test --release`.
-For long soak and HA failover runs, see [docs/RELIABILITY.md](docs/RELIABILITY.md).
+For long soak, continuous chaos, HA failover, and proptest property tests, see
+[docs/RELIABILITY.md](docs/RELIABILITY.md). Unsafe/SIMD/JIT review notes live in
+[docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md).
 
 ## Pull requests
 
