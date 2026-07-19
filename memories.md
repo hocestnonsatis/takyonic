@@ -202,9 +202,10 @@ Güncelleme: 2026-07-19
   - SST integration: registry attaches BPM; data blocks read via page-aligned Direct I/O cache (`fetch_file_page`); mmap kept for index/Bloom
   - Engine: owns BPM, `checkpoint_buffer_pool` after memtable→L0 flush; txn mutations mark pages dirty via `PageGuard::write`
   - Tests: eviction+dirty flush, pin protection, LRU-K scan resistance, `session_bpm_caches_sst_reads_after_flush`
-- Not yet wired: Merge join, TxnDeleteRecord RPC, persistent role catalog, HAVING, correlated OuterRef Apply
+- Not yet wired: Merge join, TxnDeleteRecord RPC, HAVING, correlated OuterRef Apply
 - Done: per-connection SessionState (pid-keyed DashMap + SCRAM user bind) — 2026-07-19
-- Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (Tasks 1–6; AUTH disk load/save already exists — Task 2 is reopen e2e close-out)
+- Done: persistent role catalog reopen e2e (`create_user_grant_survives_engine_reopen`) — 2026-07-19
+- Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (Tasks 3–6 remaining)
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
