@@ -1,8 +1,9 @@
-//! Reliability suite: SQL grammar fuzz, MVCC soak, HA soak.
+//! Reliability suite: SQL grammar fuzz, MVCC soak, HA soak, W–AA chaos.
 pub mod continuous;
 pub mod ha_soak;
 pub mod mvcc_soak;
 pub mod sql_fuzzer;
+pub mod waa_chaos;
 
 #[cfg(test)]
 pub mod props;

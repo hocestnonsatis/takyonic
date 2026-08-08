@@ -45,6 +45,12 @@ xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
 argon2 = { version = "0.5.3", features = ["password-hash"] }
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
+regex = "1"
+md-5 = "0.10"
+base64 = "0.22"
+# IANA Time Zone Database for AT TIME ZONE / SET TimeZone (DST-aware).
+tzdb = { version = "0.7", default-features = false, features = ["std"] }
+tz-rs = { version = "0.7", default-features = false, features = ["std"] }
 
 [build-dependencies]
 tonic-build = "0.12"

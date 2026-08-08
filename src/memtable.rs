@@ -204,14 +204,23 @@ impl Memtable {
     }
 
     /// Drop versions that compaction GC would remove (tests / forced GC).
-    pub fn gc_below_watermark(&self, watermark: CommitTs) {
+    ///
+    /// Returns the number of internal-key versions physically removed.
+    pub fn gc_below_watermark(&self, watermark: CommitTs) -> u64 {
+        self.gc_below_watermark_prefix(watermark, b"")
+    }
+
+    /// Like [`Self::gc_below_watermark`], but only for user keys starting with `prefix`.
+    pub fn gc_below_watermark_prefix(&self, watermark: CommitTs, prefix: &[u8]) -> u64 {
         let mut map = self.map.write();
         let keys: Vec<Key> = map
             .keys()
+            .filter(|k| prefix.is_empty() || k.user_key.as_bytes().starts_with(prefix))
             .map(|k| k.user_key.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        let mut removed = 0u64;
         for user_key in keys {
             let versions: Vec<InternalKey> = map
                 .range((
@@ -230,7 +239,9 @@ impl Memtable {
                     kept_below = true;
                     continue;
                 }
-                map.remove(&ikey);
+                if map.remove(&ikey).is_some() {
+                    removed += 1;
+                }
             }
         }
         // Recompute approx size lazily by scanning (rare path).
@@ -243,6 +254,22 @@ impl Memtable {
             })
             .sum();
         self.approx_size.store(size, Ordering::Relaxed);
+        removed
+    }
+
+    /// All versions whose user key starts with `prefix` (newest-first per key groups
+    /// are not required — returns internal-key order).
+    pub fn scan_all_versions_prefix(&self, prefix: &[u8]) -> Vec<Entry> {
+        let map = self.map.read();
+        map.iter()
+            .filter(|(ikey, _)| ikey.user_key.as_bytes().starts_with(prefix))
+            .map(|(ikey, slot)| Entry {
+                key: ikey.user_key.clone(),
+                value: slot.value.clone(),
+                seq: ikey.commit_ts,
+                tombstone: slot.tombstone,
+            })
+            .collect()
     }
 }
 

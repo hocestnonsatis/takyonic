@@ -1,13 +1,21 @@
-//! Single-group Raft consensus core.
+//! Single-group Raft consensus core ([`RaftNode`] / [`RaftConsensus`]).
 //!
-//! Implements leader election ([`RequestVote`](crate::network)) and log
-//! replication ([`AppendEntries`](crate::network)) against a durable
-//! [`RaftLog`]. Committed entries are applied to [`TakyonicEngine`] via
-//! [`TakyonicEngine::apply_committed`].
+//! Soft state per node: [`Role`] (Follower / Candidate / Leader), `current_term`,
+//! `voted_for`, and `commit_index`. Leader election uses randomized timeouts and
+//! [`RequestVote`](crate::network); log replication / heartbeats use
+//! [`AppendEntries`](crate::network) against a durable [`RaftLog`]. Committed
+//! entries are applied to [`TakyonicEngine`] via
+//! [`TakyonicEngine::apply_committed`] only after a majority quorum.
 //!
 //! Membership uses Ongaro's **single-server change** rule: a `ConfigChange`
 //! takes effect for quorum calculations as soon as it is appended, and rolls
 //! back if that log suffix is truncated.
+//!
+//! Vote safety (§5.4.1): a voter grants a ballot only when the candidate's log
+//! is at least as up-to-date as its own ([`RaftLog::is_up_to_date`]).
+
+/// Public name for the Raft node state machine (alias of [`RaftConsensus`]).
+pub type RaftNode = RaftConsensus;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -59,6 +67,8 @@ struct SoftState {
     match_index: HashMap<u64, u64>,
     /// Last time we heard from a leader / granted a vote / started election.
     last_heartbeat: Instant,
+    /// When the current election attempt started (`None` if not candidate).
+    election_started_at: Option<Instant>,
     election_timeout: Duration,
     waiters: Vec<Waiter>,
     /// Proposals waiting to be coalesced into a Raft log / AppendEntries batch.
@@ -151,6 +161,7 @@ impl RaftConsensus {
                 next_index,
                 match_index,
                 last_heartbeat: Instant::now(),
+                election_started_at: None,
                 election_timeout: randomized_election_timeout(id),
                 waiters: Vec::new(),
                 pending: Vec::new(),
@@ -201,6 +212,11 @@ impl RaftConsensus {
         self.state.lock().current_term
     }
 
+    /// Candidate id this node voted for in the current term (`None` if unset).
+    pub fn voted_for(&self) -> Option<u64> {
+        self.state.lock().voted_for
+    }
+
     /// Known leader, if any.
     pub fn leader_id(&self) -> Option<u64> {
         self.state.lock().leader_id
@@ -209,6 +225,13 @@ impl RaftConsensus {
     /// Commit index.
     pub fn commit_index(&self) -> u64 {
         self.state.lock().commit_index
+    }
+
+    /// Advertised `host:port` for the known leader, when membership has it.
+    pub fn leader_address(&self) -> Option<String> {
+        let st = self.state.lock();
+        st.leader_id
+            .and_then(|id| st.membership.address(id).map(str::to_string))
     }
 
     /// Durable Raft log.
@@ -252,10 +275,10 @@ impl RaftConsensus {
                 ));
             }
             if st.role != Role::Leader {
-                return Err(TakyonicError::Raft(format!(
-                    "not leader (role={:?}, leader={:?})",
-                    st.role, st.leader_id
-                )));
+                let leader_address = st
+                    .leader_id
+                    .and_then(|id| st.membership.address(id).map(str::to_string));
+                return Err(TakyonicError::NotLeader { leader_address });
             }
             st.pending.push(PendingPropose { encoded, tx });
         }
@@ -671,6 +694,7 @@ impl RaftConsensus {
         st.voted_for = Some(self.id);
         st.leader_id = None;
         st.last_heartbeat = Instant::now();
+        st.election_started_at = Some(st.last_heartbeat);
         st.election_timeout = randomized_election_timeout(self.id ^ st.current_term);
         for w in st.waiters.drain(..) {
             let _ = w.tx.send(Err(TakyonicError::Raft(
@@ -711,6 +735,13 @@ impl RaftConsensus {
         let mut st = self.state.lock();
         if st.current_term != term || st.role != Role::Candidate {
             return;
+        }
+        if let Some(started) = st.election_started_at.take() {
+            self.engine.metrics().record_raft_election(started.elapsed());
+        } else {
+            self.engine
+                .metrics()
+                .record_raft_election(Duration::from_micros(0));
         }
         st.role = Role::Leader;
         st.leader_id = Some(self.id);
@@ -956,6 +987,7 @@ impl RaftConsensus {
         st.voted_for = None;
         st.leader_id = leader;
         st.last_heartbeat = Instant::now();
+        st.election_started_at = None;
         st.election_timeout = randomized_election_timeout(self.id ^ term);
         for w in st.waiters.drain(..) {
             let _ = w.tx.send(Err(TakyonicError::Raft(
@@ -1156,6 +1188,36 @@ mod tests {
         let (term, granted) = raft.handle_request_vote(3, 2, 1, 2);
         assert!(granted);
         assert_eq!(term, 3);
+        assert_eq!(raft.voted_for(), Some(2));
+        raft.log.shutdown().unwrap();
+        raft.engine.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Mock (no network): Follower → Candidate → Leader on a single-voter node.
+    #[test]
+    fn mock_election_follower_candidate_leader() {
+        let (engine, root) = temp_engine("elect");
+        let log = RaftLog::open(root.join("raft")).unwrap();
+        let membership =
+            ClusterMembership::from_endpoints([(1, "127.0.0.1:1".into())]);
+        let raft: Arc<RaftNode> = RaftConsensus::new(1, membership, log, engine);
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 0);
+        assert!(raft.voted_for().is_none());
+
+        let (term, last_idx, last_term) = raft.start_election();
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(term, 1);
+        assert_eq!(raft.voted_for(), Some(1));
+        assert_eq!(last_idx, 0);
+        assert_eq!(last_term, 0);
+
+        raft.become_leader(term);
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.leader_id(), Some(1));
+        assert_eq!(raft.term(), 1);
+
         raft.log.shutdown().unwrap();
         raft.engine.close().unwrap();
         let _ = std::fs::remove_dir_all(root);

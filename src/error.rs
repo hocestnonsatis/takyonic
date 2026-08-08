@@ -52,6 +52,10 @@ pub enum TakyonicError {
     #[error("SQL error: {0}")]
     Sql(String),
 
+    /// Authorization failure (`GRANT` / role check).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     /// Catch-all for unexpected failures wrapped via [`anyhow`].
     #[error(transparent)]
     Other(#[from] anyhow::Error),

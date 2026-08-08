@@ -5,6 +5,21 @@
 //! re-executes [`TakyonicClient::execute_txn`] closures on OCC conflicts with
 //! exponential backoff + jitter.
 //!
+//! # SQL surface (F4 boundary)
+//!
+//! Rich relational SQL (JOIN, aggregates, `ORDER BY`/`LIMIT`, session
+//! `BEGIN`/`COMMIT`, DDL, CTE/subquery plans, `UNION`, …) runs on the **local
+//! Volcano path** via pgwire [`crate::pg::SessionState`]. That is intentional:
+//! the Smart Client is a thin Raft/OCC RPC façade, not a second SQL engine.
+//!
+//! | API | Supported |
+//! |-----|-----------|
+//! | [`TakyonicClient::execute_sql`] | `INSERT`; single-table `SELECT` with CBO filters; `UPDATE`/`DELETE` with `pk = literal` |
+//! | [`TakyonicClient::execute_session_sql`] | Full Volcano SQL on the leader via ephemeral `SessionState` |
+//! | [`TakyonicClient::execute_txn`] | Arbitrary KV / record ops with OCC retry |
+//! | [`TakyonicClient::execute_dist_txn`] | Cross-shard 2PC |
+//! | Narrow `execute_sql` JOIN / agg / … | **pgwire only** — errors include [`PGWIRE_ONLY_HINT`]; use [`Self::execute_session_sql`] or psql |
+//!
 //! Step 18 adds [`TakyonicClient::execute_sql`]: parse → CBO plan / MVCC
 //! `put_record` → leader execution with the same OCC / NotLeader retries.
 
@@ -21,13 +36,16 @@ use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 use crate::client_service::status_to_error;
+use crate::dtxn::{
+    DistTxnOutcome, DistTxnRequest, ShardParticipant, TransactionCoordinator,
+};
 use crate::error::{Result, TakyonicError};
 use crate::executor::{self, ExecutionContext, value_to_field};
 use crate::network::proto::client_service_client::ClientServiceClient;
 use crate::network::proto::{
-    BeginTxnRequest, ExecuteQueryRequest, FilterPred, IndexDefMsg, KvGetRequest, KvPutRequest,
-    PingRequest, RegisterTableRequest, TxnAbortRequest, TxnCommitRequest, TxnDeleteRecordRequest,
-    TxnGetRequest, TxnPutRecordRequest, TxnPutRequest,
+    BeginTxnRequest, ExecuteQueryRequest, ExecuteSessionSqlRequest, FilterPred, IndexDefMsg,
+    KvGetRequest, KvPutRequest, PingRequest, RegisterTableRequest, TxnAbortRequest,
+    TxnCommitRequest, TxnDeleteRecordRequest, TxnGetRequest, TxnPutRecordRequest, TxnPutRequest,
 };
 use crate::query::FilterOp;
 use crate::schema::{IndexDef, Record, TableSchema, data_key};
@@ -38,6 +56,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TXN_ATTEMPTS: u32 = 64;
 const MAX_ROUTE_ATTEMPTS: u32 = 16;
+
+/// Substring present in every Smart Client error that directs callers to pgwire.
+///
+/// Stable for tests and docs: rich SQL is **pgwire only**.
+pub const PGWIRE_ONLY_HINT: &str = "pgwire only";
+
+/// Build a [`TakyonicError::Sql`] that marks `feature` as outside the Smart Client surface.
+pub fn pgwire_only_sql(feature: &str) -> TakyonicError {
+    TakyonicError::Sql(format!(
+        "{feature} is {PGWIRE_ONLY_HINT} — use SessionState / psql \
+         (Smart Client: INSERT, single-table SELECT, UPDATE/DELETE with pk=literal; \
+         or execute_txn / execute_dist_txn)"
+    ))
+}
 
 #[derive(Clone)]
 struct LeaderConn {
@@ -51,6 +83,19 @@ struct Inner {
     rng: AtomicU64,
     /// Schemas known via [`TakyonicClient::register_table`] (for PK UPDATE/DELETE).
     schemas: SyncRwLock<HashMap<String, TableSchema>>,
+}
+
+/// Result of [`TakyonicClient::execute_session_sql`] (leader SessionState / Volcano).
+#[derive(Clone, Debug)]
+pub struct SessionSqlResult {
+    /// PostgreSQL-style command tag (`SELECT`, `INSERT`, `CREATE TABLE`, …).
+    pub tag: String,
+    /// Result rows (empty for many DDL / DML tags without `RETURNING`).
+    pub rows: Vec<Record>,
+    /// Column order for projection (may be empty).
+    pub column_order: Vec<String>,
+    /// Affected-row count when the statement reported one.
+    pub affected: Option<u64>,
 }
 
 /// Topology-aware Takyonic client.
@@ -166,11 +211,50 @@ impl TakyonicClient {
         if last_ok { Ok(()) } else { Err(last_err) }
     }
 
+    /// Cross-shard 2PC via TwopcService endpoints (`shard_id` → `host:port`).
+    ///
+    /// Each endpoint must expose Engine-backed [`crate::twopc_service::TwopcGrpcService`]
+    /// (production `serve_node` path). The coordinator runs in-process; participants
+    /// are [`crate::twopc_service::RemoteShard`] clients.
+    pub async fn execute_dist_txn(
+        &self,
+        shards: impl IntoIterator<Item = (u64, String)>,
+        req: DistTxnRequest,
+    ) -> Result<DistTxnOutcome> {
+        use crate::twopc_service::RemoteShard;
+        use std::net::SocketAddr;
+
+        let mut remotes = Vec::new();
+        for (id, addr) in shards {
+            let sock: SocketAddr = addr.parse().map_err(|e| {
+                TakyonicError::Config(format!("bad twopc shard addr `{addr}`: {e}"))
+            })?;
+            remotes.push(RemoteShard::connect(id, sock).await?);
+        }
+        if remotes.is_empty() {
+            return Err(TakyonicError::Config(
+                "execute_dist_txn requires at least one shard endpoint".into(),
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            let tc = TransactionCoordinator::new(None);
+            for r in &remotes {
+                tc.register_shard(Arc::clone(r) as Arc<dyn ShardParticipant>);
+            }
+            tc.execute(req)
+        })
+        .await
+        .map_err(|e| TakyonicError::Network(format!("dist txn join: {e}")))?
+    }
+
     /// Parse `sql`, translate to a logical plan, and execute on the Raft leader.
     ///
     /// * `INSERT` → evaluate VALUES → [`Self::execute_txn`] + [`ClientTxn::put_record`]
     /// * `SELECT` → CBO on the leader (`engine.query(...).filter(...)`)
     /// * `UPDATE` / `DELETE` → PK-equality WHERE via `put_record` / [`ClientTxn::delete_record`]
+    ///
+    /// JOIN, aggregates, session transactions, DDL, and other Volcano plans are
+    /// **pgwire only** (see module docs / [`PGWIRE_ONLY_HINT`]).
     ///
     /// OCC conflicts and NotLeader redirects are retried by the SDK.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<Record>> {
@@ -179,7 +263,14 @@ impl TakyonicClient {
                 table,
                 columns,
                 values,
+                query,
+                ..
             } => {
+                if query.is_some() {
+                    return Err(TakyonicError::Sql(format!(
+                        "INSERT … SELECT is pgwire-only ({PGWIRE_ONLY_HINT})"
+                    )));
+                }
                 let records = executor::materialize_insert_records(
                     &columns,
                     &values,
@@ -206,6 +297,7 @@ impl TakyonicClient {
                 table,
                 assignments,
                 selection,
+                ..
             } => {
                 let pk = extract_pk_equality(&table, selection.as_ref(), &self.inner.schemas)?;
                 self.execute_txn(|txn| {
@@ -230,7 +322,7 @@ impl TakyonicClient {
                 .await?;
                 Ok(Vec::new())
             }
-            LogicalPlan::Delete { table, selection } => {
+            LogicalPlan::Delete { table, selection, .. } => {
                 let pk = extract_pk_equality(&table, selection.as_ref(), &self.inner.schemas)?;
                 self.execute_txn(|txn| {
                     let table = table.clone();
@@ -243,35 +335,98 @@ impl TakyonicClient {
                 .await?;
                 Ok(Vec::new())
             }
-            LogicalPlan::Join { .. }
-            | LogicalPlan::DistributedJoin { .. }
-            | LogicalPlan::Aggregate { .. }
-            | LogicalPlan::DistributedAggregate { .. }
-            | LogicalPlan::Sort { .. }
-            | LogicalPlan::Limit { .. } => Err(TakyonicError::Sql(
-                "JOIN/Aggregate/Sort/Limit require the local Volcano path (SessionState)".into(),
-            )),
+            LogicalPlan::Truncate { .. } => Err(pgwire_only_sql("TRUNCATE")),
+            LogicalPlan::Copy { .. } => Err(pgwire_only_sql("COPY")),
+            LogicalPlan::Join { .. } | LogicalPlan::DistributedJoin { .. } => {
+                Err(pgwire_only_sql("JOIN"))
+            }
+            LogicalPlan::Aggregate { .. } | LogicalPlan::DistributedAggregate { .. } => {
+                Err(pgwire_only_sql("Aggregate / GROUP BY"))
+            }
+            LogicalPlan::Sort { .. } => Err(pgwire_only_sql("ORDER BY")),
+            LogicalPlan::Limit { .. } => Err(pgwire_only_sql("LIMIT / OFFSET")),
+            LogicalPlan::Project { .. } => Err(pgwire_only_sql("column projection")),
+            LogicalPlan::Window { .. } => Err(pgwire_only_sql("window functions")),
+            LogicalPlan::Union { .. } => Err(pgwire_only_sql("UNION/INTERSECT/EXCEPT")),
+            LogicalPlan::Distinct { .. } => Err(pgwire_only_sql("DISTINCT")),
+            LogicalPlan::DistinctOn { .. } => Err(pgwire_only_sql("DISTINCT ON")),
+            LogicalPlan::GenerateSeries { .. } => Err(pgwire_only_sql("GENERATE_SERIES")),
+            LogicalPlan::Values { .. } => Err(pgwire_only_sql("VALUES")),
+            LogicalPlan::Unnest { .. } => Err(pgwire_only_sql("UNNEST")),
+            LogicalPlan::JsonArrayElements { .. } => Err(pgwire_only_sql("JSONB_ARRAY_ELEMENTS")),
+            LogicalPlan::JsonEach { .. } => Err(pgwire_only_sql("JSON_EACH")),
+            LogicalPlan::JsonObjectKeys { .. } => Err(pgwire_only_sql("JSONB_OBJECT_KEYS")),
+            LogicalPlan::RegexpSplitToTable { .. } => Err(pgwire_only_sql("REGEXP_SPLIT_TO_TABLE")),
+            LogicalPlan::RegexpMatches { .. } => Err(pgwire_only_sql("REGEXP_MATCHES")),
             LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback => {
-                Err(TakyonicError::Sql(
-                    "BEGIN/COMMIT/ROLLBACK require SessionState (local pgwire session)".into(),
-                ))
+                Err(pgwire_only_sql("BEGIN/COMMIT/ROLLBACK"))
             }
             LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateTableAs { .. }
+            | LogicalPlan::AlterTable { .. }
+            | LogicalPlan::DropTable { .. }
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::DropRole { .. }
             | LogicalPlan::Grant { .. }
             | LogicalPlan::Revoke { .. }
-            | LogicalPlan::GrantRole { .. }
-            | LogicalPlan::Explain { .. }
-            | LogicalPlan::Analyze { .. }
-            | LogicalPlan::Vacuum { .. }
-            | LogicalPlan::Filter { .. }
-            | LogicalPlan::SubqueryAlias { .. } => Err(TakyonicError::Sql(
-                "CREATE/DROP INDEX, ROLE/GRANT, ANALYZE, VACUUM, EXPLAIN, Filter, and CTE views require the local Volcano path (SessionState)"
-                    .into(),
-            )),
+            | LogicalPlan::GrantSchema { .. }
+            | LogicalPlan::RevokeSchema { .. }
+            | LogicalPlan::GrantColumn { .. }
+            | LogicalPlan::RevokeColumn { .. }
+            | LogicalPlan::GrantRole { .. } => Err(pgwire_only_sql("DDL / ROLE / GRANT")),
+            LogicalPlan::Explain { .. } => Err(pgwire_only_sql("EXPLAIN")),
+            LogicalPlan::Analyze { .. } => Err(pgwire_only_sql("ANALYZE")),
+            LogicalPlan::Vacuum { .. } => Err(pgwire_only_sql("VACUUM")),
+            LogicalPlan::Rebalance { .. } => Err(pgwire_only_sql("REBALANCE")),
+            LogicalPlan::Set { .. } | LogicalPlan::Show { .. } | LogicalPlan::Comment { .. } => {
+                Err(pgwire_only_sql("SET / SHOW / COMMENT"))
+            }
+            LogicalPlan::Listen { .. }
+            | LogicalPlan::Unlisten { .. }
+            | LogicalPlan::Notify { .. }
+            | LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::DropSequence { .. }
+            | LogicalPlan::AlterSequence { .. } => {
+                Err(pgwire_only_sql("LISTEN / UNLISTEN / NOTIFY / SEQUENCE"))
+            }
+            LogicalPlan::Filter { .. } | LogicalPlan::SubqueryAlias { .. } => {
+                Err(pgwire_only_sql("Filter / CTE / subquery view"))
+            }
         }
+    }
+
+    /// Run arbitrary SQL on the Raft leader through an ephemeral [`crate::pg::SessionState`].
+    ///
+    /// This is the Smart Client path for rich Volcano SQL (JOIN, aggregates, DDL, …).
+    /// Each call uses a fresh session (auto-commit); multi-statement `BEGIN`/`COMMIT`
+    /// across RPCs is not supported yet — use pgwire for interactive sessions.
+    ///
+    /// The narrow [`Self::execute_sql`] façade is unchanged (`pgwire only` for JOIN/…).
+    pub async fn execute_session_sql(&self, sql: &str) -> Result<SessionSqlResult> {
+        let sql = sql.to_string();
+        self.with_leader(|mut client| {
+            let sql = sql.clone();
+            async move {
+                let resp = client
+                    .execute_session_sql(Request::new(ExecuteSessionSqlRequest { sql }))
+                    .await
+                    .map_err(status_to_error)?
+                    .into_inner();
+                let mut rows = Vec::with_capacity(resp.records.len());
+                for bytes in resp.records {
+                    rows.push(Record::decode(&Value::new(bytes))?);
+                }
+                Ok(SessionSqlResult {
+                    tag: resp.tag,
+                    rows,
+                    column_order: resp.column_order,
+                    affected: resp.affected.map(|n| n as u64),
+                })
+            }
+        })
+        .await
     }
 
     /// Like [`Self::execute_sql`] for SELECT, but also returns the CBO EXPLAIN text.
@@ -792,4 +947,63 @@ fn next_u64(rng: &AtomicU64) -> u64 {
     x ^= x >> 27;
     rng.store(x, Ordering::Relaxed);
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_pgwire_only(err: TakyonicError) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(PGWIRE_ONLY_HINT),
+            "expected `{PGWIRE_ONLY_HINT}` in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_join_is_pgwire_only() {
+        let client = TakyonicClient::new(vec!["127.0.0.1:9"]);
+        let err = client
+            .execute_sql(
+                "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id",
+            )
+            .await
+            .unwrap_err();
+        assert_pgwire_only(err);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_aggregate_is_pgwire_only() {
+        let client = TakyonicClient::new(vec!["127.0.0.1:9"]);
+        let err = client
+            .execute_sql("SELECT department, COUNT(*) FROM employees GROUP BY department")
+            .await
+            .unwrap_err();
+        assert_pgwire_only(err);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_begin_is_pgwire_only() {
+        let client = TakyonicClient::new(vec!["127.0.0.1:9"]);
+        let err = client.execute_sql("BEGIN").await.unwrap_err();
+        assert_pgwire_only(err);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_create_table_is_pgwire_only() {
+        let client = TakyonicClient::new(vec!["127.0.0.1:9"]);
+        let err = client
+            .execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .await
+            .unwrap_err();
+        assert_pgwire_only(err);
+    }
+
+    #[test]
+    fn pgwire_only_helper_includes_stable_hint() {
+        let msg = pgwire_only_sql("JOIN").to_string();
+        assert!(msg.contains(PGWIRE_ONLY_HINT));
+        assert!(msg.contains("JOIN"));
+    }
 }

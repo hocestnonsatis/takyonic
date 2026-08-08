@@ -16,13 +16,14 @@ use crate::engine::TakyonicEngine;
 use crate::error::TakyonicError;
 use crate::network::proto::client_service_server::ClientService;
 use crate::network::proto::{
-    BeginTxnRequest, BeginTxnResponse, ExecuteQueryRequest, ExecuteQueryResponse, FilterPred,
-    IndexDefMsg, KvGetRequest, KvGetResponse, KvPutRequest, KvPutResponse, PingRequest,
-    PingResponse, RegisterTableRequest, RegisterTableResponse, TxnAbortRequest, TxnAbortResponse,
-    TxnCommitRequest, TxnCommitResponse, TxnDeleteRecordRequest, TxnDeleteRecordResponse,
-    TxnGetRequest, TxnGetResponse, TxnPutRecordRequest, TxnPutRecordResponse, TxnPutRequest,
-    TxnPutResponse,
+    BeginTxnRequest, BeginTxnResponse, ExecuteQueryRequest, ExecuteQueryResponse,
+    ExecuteSessionSqlRequest, ExecuteSessionSqlResponse, FilterPred, IndexDefMsg, KvGetRequest,
+    KvGetResponse, KvPutRequest, KvPutResponse, PingRequest, PingResponse, RegisterTableRequest,
+    RegisterTableResponse, TxnAbortRequest, TxnAbortResponse, TxnCommitRequest, TxnCommitResponse,
+    TxnDeleteRecordRequest, TxnDeleteRecordResponse, TxnGetRequest, TxnGetResponse,
+    TxnPutRecordRequest, TxnPutRecordResponse, TxnPutRequest, TxnPutResponse,
 };
+use crate::pg::SessionState;
 use crate::raft::RaftCommand;
 use crate::schema::{IndexDef, Record, TableSchema, data_key, index_key};
 use crate::txn::{StatsEdit, WriteOp, index_store_value};
@@ -478,8 +479,8 @@ impl ClientService for ClientGrpcService {
         &self,
         request: Request<RegisterTableRequest>,
     ) -> std::result::Result<Response<RegisterTableResponse>, Status> {
-        // Schema is local metadata — allow on any node so followers stay ready
-        // for leadership. Stats catalog still lives per-node.
+        // Catalog DDL is Raft-replicated; only the leader may propose.
+        self.require_leader()?;
         let req = request.into_inner();
         let indexes = req
             .indexes
@@ -510,6 +511,33 @@ impl ClientService for ClientGrpcService {
                 .map(|r| r.encode().as_bytes().to_vec())
                 .collect(),
             explain,
+        }))
+    }
+
+    async fn execute_session_sql(
+        &self,
+        request: Request<ExecuteSessionSqlRequest>,
+    ) -> std::result::Result<Response<ExecuteSessionSqlResponse>, Status> {
+        self.require_leader()?;
+        let sql = request.into_inner().sql;
+        let engine = Arc::clone(&self.engine);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut session = SessionState::new(engine);
+            session.execute_sql(&sql)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("session sql join: {e}")))?
+        .map_err(Self::map_err)?;
+
+        Ok(Response::new(ExecuteSessionSqlResponse {
+            tag: result.tag.to_string(),
+            records: result
+                .rows
+                .into_iter()
+                .map(|r| r.encode().as_bytes().to_vec())
+                .collect(),
+            column_order: result.column_order.unwrap_or_default(),
+            affected: result.affected.map(|n| n as i64),
         }))
     }
 }

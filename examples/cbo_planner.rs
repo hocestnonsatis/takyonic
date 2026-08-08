@@ -9,6 +9,7 @@
 //! Usage:
 //!   cargo run --release --example cbo_planner
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use takyonic::{Config, IndexDef, Record, TableSchema, TakyonicEngine};
@@ -46,21 +47,23 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    let engine = TakyonicEngine::open(
-        Config::default()
-            .data_dir(root.join("data"))
-            .wal_dir(root.join("wal"))
-            .memtable_size_bytes(4 * 1024 * 1024)
-            .l0_soft_limit(32)
-            .l0_hard_limit(64)
-            .l0_rapid_pool_threads(1)
-            .ln_haul_pool_threads(1)
-            .compaction_write_bytes_per_sec(128 * 1024 * 1024)
-            .write_admission_ops_per_sec(500_000)
-            .write_admission_min_ops_per_sec(10_000)
-            .write_admission_burst(50_000),
-    )
-    .expect("open engine");
+    let engine = Arc::new(
+        TakyonicEngine::open(
+            Config::default()
+                .data_dir(root.join("data"))
+                .wal_dir(root.join("wal"))
+                .memtable_size_bytes(4 * 1024 * 1024)
+                .l0_soft_limit(32)
+                .l0_hard_limit(64)
+                .l0_rapid_pool_threads(1)
+                .ln_haul_pool_threads(1)
+                .compaction_write_bytes_per_sec(128 * 1024 * 1024)
+                .write_admission_ops_per_sec(500_000)
+                .write_admission_min_ops_per_sec(10_000)
+                .write_admission_burst(50_000),
+        )
+        .expect("open engine"),
+    );
 
     engine
         .register_table(TableSchema::new(

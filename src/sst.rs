@@ -1,5 +1,10 @@
 //! Immutable SST files, mmap readers, and reader pinning.
 //!
+//! When a [`crate::bpm::BufferPoolManager`] is attached to the registry, data
+//! block payloads are served through the BPM (Direct I/O page cache) instead of
+//! slicing the mmap — giving the storage engine control over caching and
+//! eviction for sequential vs random access patterns.
+//!
 //! SST files are created through a temporary file and atomically renamed. Once
 //! registered, they are immutable. [`SstRegistry`] is the only deletion path:
 //! retirement first prevents new pins, then unlink is deferred until every
@@ -18,6 +23,7 @@ use parking_lot::Mutex;
 use tracing::{debug, trace};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::bpm::BufferPoolManager;
 use crate::error::{Result, TakyonicError};
 use crate::types::{Entry, Key, Value};
 
@@ -326,13 +332,17 @@ fn encode_filter(entries: &[Entry]) -> BytesMut {
     out
 }
 
-/// mmap-backed immutable SST reader.
+/// mmap-backed immutable SST reader (optionally BPM-backed for data blocks).
 pub struct SstReader {
     mmap: Mmap,
     index: Vec<BlockMeta>,
     filter_offset: usize,
     filter_len: usize,
     entry_count: u64,
+    /// Optional buffer pool for data-block page cache.
+    bpm: Option<Arc<BufferPoolManager>>,
+    /// DiskManager file id when `bpm` is set.
+    bpm_file_id: Option<u32>,
 }
 
 impl SstReader {
@@ -384,7 +394,14 @@ impl SstReader {
             filter_offset,
             filter_len,
             entry_count,
+            bpm: None,
+            bpm_file_id: None,
         })
+    }
+
+    fn attach_bpm(&mut self, bpm: Arc<BufferPoolManager>, file_id: u32) {
+        self.bpm = Some(bpm);
+        self.bpm_file_id = Some(file_id);
     }
 
     /// Number of entries declared in the SST footer.
@@ -452,14 +469,15 @@ impl SstReader {
                 break;
             }
             let start = meta.offset as usize;
-            let block = &self.mmap[start..start + meta.len as usize];
-            let payload = checked_payload(block, "data")?;
+            let block = self.data_block_bytes(meta)?;
+            let payload = checked_payload(&block, "data")?;
             if let Some(entry) = decode_data_lookup_at(payload, key, read_ts)? {
                 match &best {
                     Some(b) if b.seq >= entry.seq => {}
                     _ => best = Some(entry),
                 }
             }
+            let _ = start;
         }
         Ok(best)
     }
@@ -495,12 +513,39 @@ impl SstReader {
             .index
             .get(block)
             .ok_or_else(|| TakyonicError::Integrity("SST block index out of range".into()))?;
-        let start = meta.offset as usize;
-        let bytes = &self.mmap[start..start + meta.len as usize];
-        let payload = checked_payload(bytes, "data")?;
+        let bytes = self.data_block_bytes(meta)?;
+        let payload = checked_payload(&bytes, "data")?;
         let mut entries = Vec::new();
         decode_data_entries(payload, &mut entries)?;
         Ok(entries)
+    }
+
+    /// Load a data block either from the BPM page cache or the mmap.
+    fn data_block_bytes(&self, meta: &BlockMeta) -> Result<Vec<u8>> {
+        let start = meta.offset as usize;
+        let len = meta.len as usize;
+        if let (Some(bpm), Some(file_id)) = (&self.bpm, self.bpm_file_id) {
+            let page_size = bpm.disk().page_size();
+            let end = start + len;
+            let first = start / page_size;
+            let last = (end - 1) / page_size;
+            let mut buf = vec![0u8; len];
+            for pi in first..=last {
+                let guard = bpm.fetch_file_page(file_id, pi as u32)?;
+                guard.read(|page| {
+                    let page_off = pi * page_size;
+                    let copy_start = start.max(page_off);
+                    let copy_end = end.min(page_off + page_size);
+                    let n = copy_end - copy_start;
+                    let dst = copy_start - start;
+                    let src = copy_start - page_off;
+                    buf[dst..dst + n].copy_from_slice(&page[src..src + n]);
+                });
+            }
+            Ok(buf)
+        } else {
+            Ok(self.mmap[start..start + len].to_vec())
+        }
     }
 }
 
@@ -746,17 +791,38 @@ pub enum DeleteStatus {
 }
 
 /// Concurrent SST registry enforcing Pin/Unpin before file deletion.
-#[derive(Default)]
 pub struct SstRegistry {
     active: DashMap<SstId, Arc<SstHandle>>,
     retired: DashMap<SstId, Arc<SstHandle>>,
     lifecycle: Mutex<()>,
+    /// Optional buffer pool — when set, SST data blocks are cached via Direct I/O.
+    bpm: Mutex<Option<Arc<BufferPoolManager>>>,
+}
+
+impl Default for SstRegistry {
+    fn default() -> Self {
+        Self {
+            active: DashMap::new(),
+            retired: DashMap::new(),
+            lifecycle: Mutex::new(()),
+            bpm: Mutex::new(None),
+        }
+    }
 }
 
 impl SstRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a buffer pool used for subsequent [`Self::register`] calls.
+    pub fn set_buffer_pool(&self, bpm: Arc<BufferPoolManager>) {
+        *self.bpm.lock() = Some(bpm);
+    }
+
+    fn bpm_handle(&self) -> Option<Arc<BufferPoolManager>> {
+        self.bpm.lock().clone()
     }
 
     /// mmap and register an immutable SST for reads.
@@ -768,7 +834,11 @@ impl SstRegistry {
             )));
         }
         let path = path.into();
-        let reader = SstReader::open(&path)?;
+        let mut reader = SstReader::open(&path)?;
+        if let Some(bpm) = self.bpm_handle() {
+            let file_id = bpm.disk().register_file(&path);
+            reader.attach_bpm(bpm, file_id);
+        }
         let handle = Arc::new(SstHandle { id, path, reader });
         self.active.insert(id, handle);
         Ok(())

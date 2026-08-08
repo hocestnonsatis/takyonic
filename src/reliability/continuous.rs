@@ -66,6 +66,9 @@ pub fn append_heartbeat(path: &Path, line: &str) -> std::io::Result<()> {
 }
 
 /// Spawn `program` with `args`; kill on `timeout`. Captures stderr on failure.
+///
+/// stdout/stderr are drained on background threads so a chatty child (e.g.
+/// `raft_chaos` with tracing) cannot deadlock on a full OS pipe buffer.
 pub fn run_command_round(
     name: &'static str,
     program: &str,
@@ -73,6 +76,9 @@ pub fn run_command_round(
     env: &[(&str, String)],
     timeout: Duration,
 ) -> RoundResult {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
     let started = Instant::now();
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -90,36 +96,32 @@ pub fn run_command_round(
             };
         }
     };
-    loop {
+
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let so = Arc::clone(&stdout_buf);
+    let se = Arc::clone(&stderr_buf);
+    let t_out = thread::spawn(move || {
+        if let Some(mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut *so.lock().unwrap());
+        }
+    });
+    let t_err = thread::spawn(move || {
+        if let Some(mut r) = stderr_pipe {
+            let _ = r.read_to_end(&mut *se.lock().unwrap());
+        }
+    });
+
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr);
-                }
-                let mut stdout = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                let ok = status.success();
-                let detail = if ok {
-                    stdout.chars().take(500).collect()
-                } else {
-                    format!(
-                        "exit={status}; stderr={}",
-                        stderr.chars().take(800).collect::<String>()
-                    )
-                };
-                return RoundResult {
-                    name,
-                    ok,
-                    detail,
-                    elapsed: started.elapsed(),
-                };
-            }
+            Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = t_out.join();
+                let _ = t_err.join();
                 return RoundResult {
                     name,
                     ok: false,
@@ -129,6 +131,9 @@ pub fn run_command_round(
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => {
+                let _ = child.kill();
+                let _ = t_out.join();
+                let _ = t_err.join();
                 return RoundResult {
                     name,
                     ok: false,
@@ -137,16 +142,56 @@ pub fn run_command_round(
                 };
             }
         }
+    };
+
+    let _ = t_out.join();
+    let _ = t_err.join();
+    let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+    let ok = status.success();
+    let detail = if ok {
+        stdout.chars().take(500).collect()
+    } else {
+        format!(
+            "exit={status}; stderr={}",
+            stderr.chars().take(800).collect::<String>()
+        )
+    };
+    RoundResult {
+        name,
+        ok,
+        detail,
+        elapsed: started.elapsed(),
     }
 }
 
 fn cargo_bin_example(example: &str) -> String {
-    // Prefer CARGO_BIN_EXE_* when available; else `cargo run --example`.
-    std::env::var(format!(
+    // Prefer CARGO_BIN_EXE_* when available (integration tests / harnesses).
+    if let Ok(path) = std::env::var(format!(
         "CARGO_BIN_EXE_{}",
         example.replace('-', "_")
-    ))
-    .unwrap_or_else(|_| "cargo".into())
+    )) {
+        return path;
+    }
+    // Next: already-built release example next to this process / under CARGO_TARGET_DIR.
+    let candidates = [
+        format!("target/release/examples/{example}"),
+        format!(
+            "{}/examples/{example}",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        ),
+    ];
+    for c in candidates {
+        let p = std::path::Path::new(&c);
+        if p.is_file() {
+            if let Ok(abs) = std::fs::canonicalize(p) {
+                return abs.display().to_string();
+            }
+            return c;
+        }
+    }
+    // Last resort: `cargo run --example` (slow; can contend on the package lock).
+    "cargo".into()
 }
 
 /// Run `crash_recovery` parent for `cfg.crash_iters_per_round` iterations.
@@ -270,6 +315,11 @@ pub fn run_continuous_chaos(
     while Instant::now() < deadline {
         round_idx += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
+        // Don't start a real schedule if leftover budget cannot finish crash_recovery.
+        // Dry-run rounds are instantaneous, so allow any positive remaining there.
+        if !dry && remaining < Duration::from_secs(45) {
+            break;
+        }
         if remaining.is_zero() {
             break;
         }
@@ -332,9 +382,13 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn from_env_defaults_are_sane() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         // SAFETY: unique keys, test-only, serialized via ENV_LOCK.
         unsafe {
             std::env::remove_var("TAKYONIC_CONTINUOUS_SECS");
@@ -371,7 +425,7 @@ mod tests {
 
     #[test]
     fn continuous_chaos_smoke_completes_tiny_budget() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         // SAFETY: test-only env isolation, serialized via ENV_LOCK.
         unsafe {
             std::env::set_var("TAKYONIC_CONTINUOUS_DRY_RUN", "1");

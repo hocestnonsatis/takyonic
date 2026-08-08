@@ -23,8 +23,59 @@ use tracing::{debug, info_span};
 
 use crate::config::Config;
 use crate::error::{Result, TakyonicError};
+use crate::object_store::ObjectStorage;
 use crate::sst::{DeleteStatus, SstId, SstInfo, SstPin, SstRegistry, SstWriter};
 use crate::types::{Entry, Key};
+
+/// Default max SST size (1 GiB) when not overridden by config.
+pub const DEFAULT_MAX_SST_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Object-store key for an SST at `level` with id `id`.
+pub fn sst_object_key(level: usize, id: SstId) -> String {
+    format!("sst/L{level}/{id:020}.sst")
+}
+
+/// Rough encoded size used when splitting flush/compaction runs.
+pub fn estimate_entry_bytes(entry: &Entry) -> u64 {
+    48 + entry.key.as_bytes().len() as u64
+        + entry
+            .value
+            .as_ref()
+            .map(|v| v.as_bytes().len() as u64)
+            .unwrap_or(0)
+}
+
+/// Split a sorted entry run so each slice stays under `max_bytes` (estimated).
+///
+/// Never splits versions of the same user key across slices. Reserves ~4 KiB
+/// headroom for SST index / Bloom / footer so the physical file stays near the
+/// configured cap.
+pub fn split_entries_by_max_bytes(entries: &[Entry], max_bytes: u64) -> Vec<&[Entry]> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    if max_bytes == 0 {
+        return vec![entries];
+    }
+    let budget = max_bytes.saturating_sub(4096).max(max_bytes / 2).max(1);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for i in 0..entries.len() {
+        let sz = estimate_entry_bytes(&entries[i]);
+        let would = acc.saturating_add(sz);
+        let same_user = i > start && entries[i].key == entries[i - 1].key;
+        if i > start && !same_user && would > budget {
+            out.push(&entries[start..i]);
+            start = i;
+            acc = sz;
+        } else {
+            acc = would;
+        }
+    }
+    out.push(&entries[start..]);
+    out
+}
 
 /// Catalog metadata for one immutable SST.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +149,10 @@ pub struct SstManager {
     /// Oldest active transaction read_ts — compaction may drop shadowed
     /// versions strictly older than this watermark.
     mvcc_watermark: AtomicU64,
+    /// Soft cap on a single SST file; flush/compaction split above this.
+    max_sst_bytes: AtomicU64,
+    /// Optional Tier-2 object store for SST upload/download.
+    remote: Mutex<Option<Arc<dyn ObjectStorage>>>,
 }
 
 impl SstManager {
@@ -131,7 +186,83 @@ impl SstManager {
             l0_generation: Mutex::new(0),
             l0_changed: Condvar::new(),
             mvcc_watermark: AtomicU64::new(0),
+            max_sst_bytes: AtomicU64::new(DEFAULT_MAX_SST_BYTES),
+            remote: Mutex::new(None),
         })
+    }
+
+    /// Apply flush/compaction SST size cap from engine config.
+    pub fn set_max_sst_bytes(&self, max_bytes: u64) {
+        if max_bytes > 0 {
+            self.max_sst_bytes
+                .store(max_bytes, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Current SST size cap.
+    pub fn max_sst_bytes(&self) -> u64 {
+        self.max_sst_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Attach Tier-2 object storage for SST publish / hydrate.
+    pub fn attach_remote(&self, store: Arc<dyn ObjectStorage>) {
+        *self.remote.lock() = Some(store);
+    }
+
+    /// Whether a remote object store is attached.
+    pub fn has_remote(&self) -> bool {
+        self.remote.lock().is_some()
+    }
+
+    /// Upload a local SST to object storage (no-op without remote).
+    ///
+    /// Refuses objects at or above [`crate::object_store::AWS_S3_PUT_OBJECT_MAX_BYTES`]
+    /// (multipart is not implemented). Oversized-but-under-limit files relative to
+    /// [`Self::max_sst_bytes`] still upload with a warning (unsplittable key chain).
+    pub fn upload_sst(&self, meta: &SstMeta) -> Result<()> {
+        let Some(store) = self.remote.lock().clone() else {
+            return Ok(());
+        };
+        let key = sst_object_key(meta.level, meta.id);
+        let bytes = std::fs::read(&meta.path)?;
+        crate::object_store::assert_put_object_size(bytes.len() as u64)?;
+        if bytes.len() as u64 > self.max_sst_bytes() {
+            debug!(
+                id = meta.id,
+                size = bytes.len(),
+                cap = self.max_sst_bytes(),
+                "SST exceeds max_sst_bytes (unsplittable key chain); uploading under AWS PutObject limit"
+            );
+        }
+        store.write(&key, &bytes)?;
+        debug!(
+            id = meta.id,
+            level = meta.level,
+            bytes = bytes.len(),
+            %key,
+            "uploaded SST to object store"
+        );
+        Ok(())
+    }
+
+    /// Download `key` into `local_path` when the local file is missing.
+    pub fn download_sst(&self, key: &str, local_path: &std::path::Path) -> Result<()> {
+        if local_path.exists() {
+            return Ok(());
+        }
+        let Some(store) = self.remote.lock().clone() else {
+            return Err(TakyonicError::Engine(format!(
+                "cannot hydrate SST {key}: no remote object store"
+            )));
+        };
+        let bytes = store.read_all(key)?;
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = local_path.with_extension("sst.download");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, local_path)?;
+        Ok(())
     }
 
     /// Publish the MVCC GC watermark (oldest active transaction `read_ts`).
@@ -147,6 +278,9 @@ impl SstManager {
 
     /// Register an existing immutable SST and add it to the level catalog.
     pub fn add_sst(&self, meta: SstMeta) -> Result<()> {
+        // Publish to Tier-2 before local catalog install (no-op without remote).
+        self.upload_sst(&meta)?;
+
         let mut state = self.state.lock();
         if meta.level >= state.levels.len() {
             return Err(TakyonicError::Compaction(format!(
@@ -421,7 +555,12 @@ impl SstManager {
         }
     }
 
-    fn install(&self, plan: &CompactionPlan, output: SstMeta) -> Result<()> {
+    fn install_outputs(&self, plan: &CompactionPlan, outputs: Vec<SstMeta>) -> Result<()> {
+        if outputs.is_empty() {
+            return Err(TakyonicError::Compaction(
+                "compaction install requires at least one output".into(),
+            ));
+        }
         let mut state = self.state.lock();
         if !plan.reserved.iter().all(|id| state.reserved.contains(id)) {
             return Err(TakyonicError::Compaction(
@@ -440,24 +579,41 @@ impl SstManager {
                 "compaction inputs changed before install".into(),
             ));
         }
-        if output.level != plan.output_level {
-            return Err(TakyonicError::Compaction(
-                "compaction output level does not match plan".into(),
-            ));
+        for output in &outputs {
+            if output.level != plan.output_level {
+                return Err(TakyonicError::Compaction(
+                    "compaction output level does not match plan".into(),
+                ));
+            }
+            if state.levels[output.level].iter().any(|file| {
+                !plan.reserved.contains(&file.id)
+                    && file.overlaps(&output.smallest, &output.largest)
+            }) {
+                return Err(TakyonicError::Compaction(
+                    "compaction output overlaps an unreserved target file".into(),
+                ));
+            }
         }
-        if state.levels[output.level].iter().any(|file| {
-            !plan.reserved.contains(&file.id) && file.overlaps(&output.smallest, &output.largest)
-        }) {
-            return Err(TakyonicError::Compaction(
-                "compaction output overlaps an unreserved target file".into(),
-            ));
+        // Outputs must not overlap each other at L>0.
+        if plan.output_level > 0 {
+            for i in 0..outputs.len() {
+                for j in (i + 1)..outputs.len() {
+                    if outputs[i].overlaps(&outputs[j].smallest, &outputs[j].largest) {
+                        return Err(TakyonicError::Compaction(
+                            "compaction split outputs overlap each other".into(),
+                        ));
+                    }
+                }
+            }
         }
 
         for level in &mut state.levels {
             level.retain(|file| !plan.reserved.contains(&file.id));
         }
-        let output_level = output.level;
-        state.levels[output_level].push(output);
+        let output_level = plan.output_level;
+        for output in outputs {
+            state.levels[output_level].push(output);
+        }
         sort_level(&mut state.levels[output_level], output_level);
         for id in &plan.reserved {
             state.reserved.remove(id);
@@ -525,8 +681,19 @@ impl PartialOrd for HeapItem {
     }
 }
 
-trait EntrySource {
+/// Pulls the next [`Entry`] from a sorted run (memtable drain, SST block, …).
+pub trait EntrySource {
+    /// Next entry in user-key / timestamp order, or `None` at end-of-run.
     fn next_entry(&mut self) -> Result<Option<Entry>>;
+}
+
+/// In-memory sorted run used by [`KWayMergeIterator::from_sorted_runs`].
+pub struct VecSource(pub(crate) std::vec::IntoIter<Entry>);
+
+impl EntrySource for VecSource {
+    fn next_entry(&mut self) -> Result<Option<Entry>> {
+        Ok(self.0.next())
+    }
 }
 
 struct SstCursor {
@@ -561,16 +728,6 @@ impl EntrySource for SstCursor {
     }
 }
 
-#[cfg(test)]
-struct VecSource(std::vec::IntoIter<Entry>);
-
-#[cfg(test)]
-impl EntrySource for VecSource {
-    fn next_entry(&mut self) -> Result<Option<Entry>> {
-        Ok(self.0.next())
-    }
-}
-
 /// K-way merge over block-at-a-time pinned SST streams.
 ///
 /// Emits every version that must remain visible given `watermark`:
@@ -578,7 +735,7 @@ impl EntrySource for VecSource {
 /// - plus the newest version with `commit_ts < watermark` (snapshot floor)
 ///
 /// Shadowed versions older than the watermark are dropped (MVCC GC).
-struct MergeIterator<S> {
+pub struct KWayMergeIterator<S> {
     sources: Vec<S>,
     heap: BinaryHeap<HeapItem>,
     watermark: u64,
@@ -586,8 +743,9 @@ struct MergeIterator<S> {
     pending: Vec<Entry>,
 }
 
-impl<S: EntrySource> MergeIterator<S> {
-    fn new(sources: Vec<S>, watermark: u64) -> Result<Self> {
+impl<S: EntrySource> KWayMergeIterator<S> {
+    /// Create a merge iterator over `sources` with MVCC GC at `watermark`.
+    pub fn new(sources: Vec<S>, watermark: u64) -> Result<Self> {
         let mut this = Self {
             sources,
             heap: BinaryHeap::new(),
@@ -607,7 +765,8 @@ impl<S: EntrySource> MergeIterator<S> {
         Ok(())
     }
 
-    fn next_entry(&mut self) -> Result<Option<Entry>> {
+    /// Next merged entry (user-key ascending; newest-first within a key before emit order).
+    pub fn next_entry(&mut self) -> Result<Option<Entry>> {
         if let Some(entry) = self.pending.pop() {
             return Ok(Some(entry));
         }
@@ -644,6 +803,18 @@ impl<S: EntrySource> MergeIterator<S> {
         kept.reverse();
         self.pending = kept;
         Ok(self.pending.pop())
+    }
+}
+
+/// Convenience: merge pre-sorted in-memory runs (tests / LSMReader).
+impl KWayMergeIterator<VecSource> {
+    /// Each `run` must be sorted by user-key ascending, commit-ts descending.
+    pub fn from_sorted_runs(runs: Vec<Vec<Entry>>, watermark: u64) -> Result<Self> {
+        let sources = runs
+            .into_iter()
+            .map(|r| VecSource(r.into_iter()))
+            .collect();
+        Self::new(sources, watermark)
     }
 }
 
@@ -689,12 +860,19 @@ pub enum CompactionPool {
 pub struct CompactionResult {
     /// Pool that executed the work.
     pub pool: CompactionPool,
-    /// Installed output metadata.
-    pub output: SstMeta,
+    /// Installed output metadata (one or more when split by `max_sst_bytes`).
+    pub outputs: Vec<SstMeta>,
     /// Input files removed from the level catalog.
     pub input_ids: Vec<SstId>,
     /// Input files whose unlink remains deferred by external read pins.
     pub deferred_deletes: Vec<SstId>,
+}
+
+impl CompactionResult {
+    /// First (or only) output SST.
+    pub fn output(&self) -> &SstMeta {
+        &self.outputs[0]
+    }
 }
 
 /// Completion handle for one scheduled compaction.
@@ -745,6 +923,7 @@ impl CompactionEngine {
     /// Start physically separate L0 Rapid and Ln Haul worker pools.
     pub fn new(manager: Arc<SstManager>, config: &Config) -> Result<Self> {
         config.validate()?;
+        manager.set_max_sst_bytes(config.max_sst_bytes);
         let pacer = Arc::new(IoPacer::new(config.compaction_write_bytes_per_sec));
         let (rapid_tx, rapid_rx) = crossbeam_channel::bounded(config.compaction_queue_depth);
         let (haul_tx, haul_rx) = crossbeam_channel::bounded(config.compaction_queue_depth);
@@ -901,36 +1080,57 @@ fn execute_plan(
         sources.push(SstCursor::new(pin));
     }
 
-    let mut merge = MergeIterator::new(sources, manager.mvcc_watermark())?;
+    let mut merge = KWayMergeIterator::new(sources, manager.mvcc_watermark())?;
     let mut merged = Vec::new();
     while let Some(entry) = merge.next_entry()? {
         merged.push(entry);
     }
-    let first = merged
-        .first()
-        .ok_or_else(|| TakyonicError::Compaction("compaction produced an empty output".into()))?;
-    let smallest = first.key.clone();
-    let largest = merged
-        .last()
-        .expect("non-empty compaction output")
-        .key
-        .clone();
-    let output_path = manager.output_path(plan.output_level, plan.output_id);
-    let info = SstWriter::write_paced(
-        plan.output_id,
-        &output_path,
-        &merged,
-        manager.block_size,
-        |bytes| pacer.pace(bytes),
-    )?;
-    let output = SstMeta::from_info(plan.output_level, info, smallest, largest)?;
-
-    if let Err(register_error) = manager.registry.register(output.id, &output.path) {
-        let _ = std::fs::remove_file(&output.path);
-        return Err(register_error);
+    if merged.is_empty() {
+        return Err(TakyonicError::Compaction(
+            "compaction produced an empty output".into(),
+        ));
     }
-    if let Err(install_error) = manager.install(&plan, output.clone()) {
-        let _ = manager.registry.retire(output.id);
+
+    let slices = split_entries_by_max_bytes(&merged, manager.max_sst_bytes());
+    let mut outputs: Vec<SstMeta> = Vec::with_capacity(slices.len());
+    for (i, slice) in slices.iter().enumerate() {
+        let id = if i == 0 {
+            plan.output_id
+        } else {
+            manager.allocate_sst_id()
+        };
+        let smallest = slice.first().expect("non-empty slice").key.clone();
+        let largest = slice.last().expect("non-empty slice").key.clone();
+        let output_path = manager.output_path(plan.output_level, id);
+        let info = SstWriter::write_paced(
+            id,
+            &output_path,
+            slice,
+            manager.block_size,
+            |bytes| pacer.pace(bytes),
+        )?;
+        let output = SstMeta::from_info(plan.output_level, info, smallest, largest)?;
+        if let Err(register_error) = manager.registry.register(output.id, &output.path) {
+            let _ = std::fs::remove_file(&output.path);
+            for prior in &outputs {
+                let _ = manager.registry.retire(prior.id);
+            }
+            return Err(register_error);
+        }
+        if let Err(up) = manager.upload_sst(&output) {
+            let _ = manager.registry.retire(output.id);
+            for prior in &outputs {
+                let _ = manager.registry.retire(prior.id);
+            }
+            return Err(up);
+        }
+        outputs.push(output);
+    }
+
+    if let Err(install_error) = manager.install_outputs(&plan, outputs.clone()) {
+        for output in &outputs {
+            let _ = manager.registry.retire(output.id);
+        }
         return Err(install_error);
     }
 
@@ -947,13 +1147,13 @@ fn execute_plan(
     let input_ids = plan.inputs.iter().map(|input| input.id).collect();
     debug!(
         ?pool,
-        output_id = output.id,
+        outputs = outputs.len(),
         inputs = plan.inputs.len(),
         "compaction installed"
     );
     Ok(CompactionResult {
         pool,
-        output,
+        outputs,
         input_ids,
         deferred_deletes,
     })
@@ -962,6 +1162,7 @@ fn execute_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Entry, Key, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1008,7 +1209,7 @@ mod tests {
             .map(|source| VecSource(source.into_iter()))
             .collect();
         // Watermark 100: only the newest version below watermark is kept per key.
-        let mut merge = MergeIterator::new(sources, 100).unwrap();
+        let mut merge = KWayMergeIterator::new(sources, 100).unwrap();
         let mut merged = Vec::new();
         while let Some(entry) = merge.next_entry().unwrap() {
             merged.push(entry);
@@ -1033,7 +1234,7 @@ mod tests {
             .into_iter(),
         )];
         // Watermark 8: keep v3 (10>=8) and newest below (v2@5); drop v1.
-        let mut merge = MergeIterator::new(sources, 8).unwrap();
+        let mut merge = KWayMergeIterator::new(sources, 8).unwrap();
         let mut merged = Vec::new();
         while let Some(entry) = merge.next_entry().unwrap() {
             merged.push(entry);
@@ -1111,7 +1312,7 @@ mod tests {
         assert_eq!(manager.registry.reap(10).unwrap(), DeleteStatus::Deleted);
         assert!(!pinned_input_path.exists());
 
-        let rapid_pin = manager.registry.pin(rapid.output.id).unwrap();
+        let rapid_pin = manager.registry.pin(rapid.output().id).unwrap();
         assert_eq!(
             rapid_pin
                 .reader()
@@ -1131,5 +1332,150 @@ mod tests {
         drop(engine);
         drop(manager);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_entries_respects_max_bytes_and_keeps_user_key_together() {
+        let mut entries = Vec::new();
+        for i in 0..20u8 {
+            let key = format!("k{i:02}");
+            entries.push(Entry::put(
+                Key::new(key.into_bytes()),
+                Value::new(&b"payload-xxxxxxxx"[..]),
+                1,
+            ));
+        }
+        // Force many versions of one key in the middle.
+        entries.insert(
+            10,
+            Entry::put(
+                Key::new(&b"k09"[..]),
+                Value::new(&b"payload-yyyyyyyy"[..]),
+                2,
+            ),
+        );
+        entries.sort_by(|a, b| a.key.cmp(&b.key).then(b.seq.cmp(&a.seq)));
+
+        let slices = split_entries_by_max_bytes(&entries, 120);
+        assert!(slices.len() >= 2, "expected split, got {}", slices.len());
+        for slice in &slices {
+            let est: u64 = slice.iter().map(estimate_entry_bytes).sum();
+            if slice.len() > 1 {
+                assert!(
+                    est <= 200,
+                    "slice est {est} too large for max 120 (len={})",
+                    slice.len()
+                );
+            }
+            for w in slice.windows(2) {
+                if w[0].key == w[1].key {
+                    assert!(w[0].seq >= w[1].seq);
+                }
+            }
+        }
+        let k09_slices: Vec<_> = slices
+            .iter()
+            .filter(|s| s.iter().any(|e| e.key.as_bytes() == b"k09"))
+            .collect();
+        assert_eq!(k09_slices.len(), 1);
+    }
+
+    #[test]
+    fn compaction_splits_output_under_max_sst_bytes() {
+        let dir = temp_dir("split-compact");
+        let manager = manager(&dir);
+        const CAP: u64 = 16 * 1024;
+        manager.set_max_sst_bytes(CAP);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for i in 0..80u16 {
+            // Overlapping key ranges so L0 pick merges both files in one plan.
+            left.push(Entry::put(
+                Key::new(format!("k{i:03}").into_bytes()),
+                Value::new(vec![b'x'; 128]),
+                1,
+            ));
+            right.push(Entry::put(
+                Key::new(format!("k{i:03}").into_bytes()),
+                Value::new(vec![b'y'; 128]),
+                2,
+            ));
+        }
+        write_add(&manager, 0, 10, &left);
+        write_add(&manager, 0, 11, &right);
+
+        let config = Config::default()
+            .data_dir(&dir)
+            .wal_dir(dir.join("wal"))
+            .l0_rapid_pool_threads(1)
+            .ln_haul_pool_threads(1)
+            .max_sst_bytes(CAP)
+            .compaction_write_bytes_per_sec(1024 * 1024 * 1024);
+        let engine = CompactionEngine::new(Arc::clone(&manager), &config).unwrap();
+        let rapid = engine.submit_l0().unwrap().unwrap().wait().unwrap();
+        assert!(
+            rapid.outputs.len() >= 2,
+            "expected split outputs, got {} (sizes {:?})",
+            rapid.outputs.len(),
+            rapid.outputs.iter().map(|o| o.file_size).collect::<Vec<_>>()
+        );
+        for out in &rapid.outputs {
+            assert!(
+                out.file_size <= CAP,
+                "output {} size {} exceeds cap {CAP}",
+                out.id,
+                out.file_size
+            );
+        }
+        assert!(manager.level_files(0).is_empty());
+        assert_eq!(manager.level_files(1).len(), rapid.outputs.len());
+
+        drop(engine);
+        drop(manager);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sst_uploads_to_object_store_and_cold_node_hydrates() {
+        use crate::object_store::{InMemoryObjectStore, ObjectStorage};
+
+        let store = InMemoryObjectStore::new();
+        let remote: Arc<dyn ObjectStorage> = Arc::clone(&store) as Arc<dyn ObjectStorage>;
+        let dir = temp_dir("sst-upload");
+        let mgr = manager(&dir);
+        mgr.attach_remote(Arc::clone(&remote));
+        mgr.set_max_sst_bytes(1024 * 1024);
+
+        write_add(
+            &mgr,
+            0,
+            42,
+            &[Entry::put(&b"hello"[..], &b"world"[..], 1)],
+        );
+        let key = sst_object_key(0, 42);
+        let bytes = store.read_all(&key).expect("SST must be uploaded");
+        assert!(!bytes.is_empty());
+
+        // Cold node: wipe local SST, hydrate via download + recover.
+        let cold = temp_dir("sst-cold");
+        let mgr2 = manager(&cold);
+        mgr2.attach_remote(remote);
+        let local = cold.join("L0").join(format!("{:020}.sst", 42));
+        mgr2.download_sst(&key, &local).unwrap();
+        mgr2.recover_sst_file(0, 42, local).unwrap();
+        let pin = mgr2.registry.pin(42).unwrap();
+        assert_eq!(
+            pin.reader()
+                .get(&Key::new(&b"hello"[..]))
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            b"world"
+        );
+
+        drop(mgr);
+        drop(mgr2);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(cold).unwrap();
     }
 }

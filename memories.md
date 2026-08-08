@@ -1,9 +1,61 @@
 # Takyonic — Persistent Context
 
-Güncelleme: 2026-07-19
+Güncelleme: 2026-08-08 (Faz 4D Smart Client Session SQL DONE)
+
+## Geliştirme döngüsü (loop)
+- **Öncelik:** Faz 4E+ (multi-DB / loom) ürün önceliğine göre; PG niche varsayılan değil
+- Prompt: TDD; `cargo test --lib` yeşil; memories/ROADMAP güncelle; commit yok
+- OOM notu: tick başına tek suite; büyük paralel cargo spawn etme
+
+## Roadmap ilerleme
+- **Faz A–HV1 / W–AA:** DONE
+- **Faz 1A–1C:** DONE — S3 coalesce, W–AA chaos, docs
+- **Faz 2:** DONE — ORM tip/COPY
+- **Faz 3:** DONE — MPP MIN/MAX/AVG + DistributedJoin; REBALANCE; 2PC+MPP L0 chaos
+- **Faz 4A:** DONE — S3 multipart
+- **Faz 4B:** DONE — Minimal SSI (`serializable` + write-skew doom)
+- **Faz 4C:** DONE — IANA TZ (`tzdb`/`tz-rs`) + `SET TimeZone` + LOCALTIMESTAMP
+- **Faz 4D:** DONE — `ExecuteSessionSql` + `execute_session_sql` (leader SessionState)
+- **Sıradaki:** Faz 4E+ (multi-DB, loom/TSan)
+
+## Faz 4D — Smart Client Session SQL (2026-08-08)
+- Proto `ExecuteSessionSql`; leader ephemeral `SessionState::execute_sql`
+- `TakyonicClient::execute_session_sql` → `SessionSqlResult`
+- Narrow `execute_sql` JOIN still `pgwire only`
+- Test: `three_node_smart_client_session_sql_join`
+- Spec: `docs/superpowers/specs/2026-08-08-smart-client-session-sql-design.md`
+
+## Faz 4C — IANA time zones (2026-08-08)
+- Deps: `tzdb` 0.7 + `tz-rs` 0.7 (`std`)
+- `zone_offset_secs_at` / `local_wall_to_unix` / DST-aware `at_time_zone`
+- Session GUC `TimeZone` (default UTC); `SHOW` / `current_setting` / `set_config`
+- `LOCALTIMESTAMP` → session TZ wall clock; `NOW`/`CURRENT_TIMESTAMP` remain timestamptz UTC strings
+- Tests: `parses_at_time_zone`, `session_at_time_zone_e2e`, `session_timezone_guc_e2e`
+
+## Değerlendirme — DB readiness (2026-08-08)
+- Yeni: `session_ssi_write_skew_aborts_second_committer`, `session_accepts_serializable_rejects_read_uncommitted`, `session_repeatable_read_write_skew_aborts_via_occ_not_ssi`
+- Spec: `docs/superpowers/specs/2026-08-08-ssi-minimal-design.md`
+
+## Faz 4B — Minimal SSI (2026-08-08)
+- `IsolationLevel::{Snapshot,Serializable}`; `SsiRegistry` doom concurrent readers of write keys
+- `SET serializable` accepted; `read uncommitted` still rejected
+- Session BEGIN / auto-commit honor GUC; RR behavior unchanged
+
+## Faz 4A — S3 multipart (2026-08-08)
+- `prefer_multipart` / `multipart_part_ranges` / `DEFAULT_MULTIPART_PART_BYTES` (8 MiB)
+- `InMemoryObjectStore::{set_multipart_threshold,multipart_uploads,multipart_parts}`
+- `AwsS3Client::write_multipart` (abort on part/complete failure)
+- SST/chunk caps unchanged; multipart = safety net for ≥5 GiB
+
+## Faz 3 — Dağıtık ürün derinliği (2026-08-07)
+- `DistAggKind::{Count,Sum,Min,Max,Avg}` wire + partial/final merge; session EXPLAIN/exec e2e
+- Equi `DistributedJoin`: remote scan + local HashJoin; Project/Filter peel for EXPLAIN=exec
+- `LogicalPlan::Rebalance` / `REBALANCE TABLE` → `Engine::rebalance_table` (hot→cold PMAP + catalog)
+- Chaos: `waa_twopc_three_shard_then_mpp_aggregate`; `waa_mixed_mpp_twopc_under_l0_pressure` (L0 hard-limit, no deadlock)
 
 ## Proje Durumu
 - Public GitHub repository: `https://github.com/hocestnonsatis/takyonic` (`main`)
+- **Lib tests (doğrulandı 2026-08-02 C1):** `cargo test --lib` → **251 passed** (1 ignored)
 - MPP scaffolding: `LogicalPlan::{DistributedAggregate,DistributedJoin}` + `src/shuffle.rs` (`Distribution`); optimizer lowers both to local Aggregate / HashJoin|NestedLoopJoin (2026-07-19)
 - Step 1 (Foundation & Types): completed 2026-07-17 — types, Config, errors, tracing-init
 - Step 2 (WAL & Memtable): completed 2026-07-17 — WalWriter/WalReader (xxh3 + sync_data), Memtable (RwLock+BTreeMap)
@@ -47,15 +99,15 @@ Güncelleme: 2026-07-19
 - Step 40 (JIT Query Compiler / Cranelift): completed 2026-07-19 — `JitCompiler`, expression codegen + Volcano fallback, HyPer-style `JitExec` push pipeline, CBO attach; arith/`Value::Float`; E2E + bench; **132** lib tests PASS
 - Step 41 (Vector Search + HNSW): completed 2026-07-19 — `VectorValue`/SIMD distance, HNSW graph + durable `HNSW_<name>`, `CREATE VECTOR INDEX`, `VectorIndexScanExec`, CBO VectorIndexSelectionRule, VACUUM prune; **139** lib tests PASS
 - Step 42 (RBAC / Security): completed 2026-07-19 — AUTH catalog, Argon2id + SCRAM, `CREATE USER/ROLE`, `GRANT`/`REVOKE`, `AuthorizationManager`, SessionState `current_user`; **145** lib tests PASS
-- Step 43 (Telemetry / Observability): completed 2026-07-19 — `MetricsManager`, Prometheus `/metrics`, BPM/JIT/Raft/Txn instrumentation, `metrics_enabled`; **191** lib tests PASS
-- Step 44 (MPP Distributed Query): completed 2026-07-19 — Exchange/Shuffle, Fragmenter, Coordinator/Worker, DistributedAggregate/Join, 3-node agg+shuffle tests; **156** lib tests PASS
-- Step 45 (Multi-Engine LSM + B-Tree): completed 2026-07-19 — `LSMStorage`/`LSMReader`/`BTreeStorage`/`StorageManager`, per-table engine, K-way merge, VACUUM/ANALYZE + throughput bench; **164** lib tests PASS
-- Step 46 (Partitioning + Partition Pruning): completed 2026-07-19 — Hash/Range strategy, catalog PMAP, Router, PartitionPruningRule, Coordinator::execute_insert, Rebalancer; **170** lib tests PASS
-- Step 47 (Storage–Compute Decoupling): completed 2026-07-19 — ObjectStorage, LocalFile/S3-mock/optional aws-sdk-s3, ManifestManager, DiskManager+BPM two-tier cache; Engine::open loads shared manifest; **190** lib tests PASS
-- Step 48 (SIMD JIT Vectorization): completed 2026-07-19 — VectorBatch, AVX2/AVX-512 kernels, Cranelift `F64X2` batch JIT, VectorizedExec, JITVectorizationRule; **191** lib tests PASS
-- Step 49 (Distributed 2PC Coordinator): completed 2026-07-19 — `TransactionCoordinator`, Raft `TxnPrepare`/`TxnCommit`/`TxnAbort`, global SI clock, recovery; **191** lib tests PASS
+- Step 43 (Telemetry / Observability): completed 2026-07-19 — `MetricsManager`, Prometheus `/metrics`, BPM/JIT/Raft/Txn instrumentation, `metrics_enabled`
+- Step 44 (MPP Distributed Query): completed 2026-07-19 — Exchange/Shuffle, Fragmenter, Coordinator/Worker, DistributedAggregate/Join, 3-node agg+shuffle tests
+- Step 45 (Multi-Engine LSM + B-Tree): completed 2026-07-19 — `LSMStorage`/`LSMReader`/`BTreeStorage`/`StorageManager`, per-table engine, K-way merge, VACUUM/ANALYZE + throughput bench
+- Step 46 (Partitioning + Partition Pruning): completed 2026-07-19 — Hash/Range strategy, catalog PMAP, Router, PartitionPruningRule, Coordinator::execute_insert, Rebalancer
+- Step 47 (Storage–Compute Decoupling): completed 2026-07-19 — ObjectStorage, LocalFile/S3-mock/optional aws-sdk-s3, ManifestManager, DiskManager+BPM two-tier cache; Engine::open loads shared manifest
+- Step 48 (SIMD JIT Vectorization): completed 2026-07-19 — VectorBatch, AVX2/AVX-512 kernels, Cranelift `F64X2` batch JIT, VectorizedExec, JITVectorizationRule
+- Step 49 (Distributed 2PC Coordinator): library+wire — **B1–B4 DONE 2026-08-02** (`serve_node` TwopcService, EngineShard, Client `execute_dist_txn`, Raft PREPARED recover / presumed abort)
 - GitHub Community Standards completed 2026-07-17 — Code of Conduct, issue forms, PR template, security and support policies; Discussions and private vulnerability reporting enabled
-- Package metadata is v1.0.2 with MSRV 1.85; Steps 7–49 complete (Merge join + Smart Client UPDATE/DELETE RPC still pending)
+- Package metadata is v1.0.2 with MSRV 1.85; Steps 7–49 + not-yet-wired gap close-out complete
 
 ## Step 49 — Distributed Transaction Coordinator / 2PC (2026-07-19)
 - `src/dtxn.rs`: `TransactionCoordinator` + `TwopcState::{Preparing,Prepared,Committed,Aborted}`; `LocalShard` participants with exclusive prepare locks + OCC
@@ -73,11 +125,15 @@ Güncelleme: 2026-07-19
 - Tests: scalar vs SIMD mul/sum, masked BETWEEN, TPC-H Q6-style 100k-row throughput, Cranelift F64X2 batch, CBO rule; **191** lib tests PASS
 
 ## Step 47 — Storage–Compute Decoupling (2026-07-19)
-- `src/object_store.rs`: `ObjectStorage` trait (`read`/`write`/`list`/`delete`); `LocalFileBackend`; `InMemoryObjectStore` (shared S3/MinIO mock); `S3Backend` (+ `--features s3` → aws-sdk-s3)
-- `src/manifest.rs`: versioned JSON `StorageManifest` + `ManifestManager` (`manifest/CURRENT.json`) for SST/B-Tree/pages source of truth
-- `DiskManager::open_with_remote`: Tier-1 local PAGES cache, Tier-2 remote hydrate/write-through; `BufferPoolManager` tracks `remote_fetches`
-- Engine: `Config::object_store_root`, `open_with_object_storage`, loads manifest on open, `publish_storage_manifest` on close/checkpoint
-- Tests: S3-mock cross-node, cold-start hydrate, 3-node restart integrity, engine manifest open + concurrent readers; **190** lib tests PASS
+- `src/object_store.rs`: `ObjectStorage` trait; `S3Backend` (+ `--features s3`)
+- **Faz 2A — chunked pages:** `pages/v2/chunk-*` RMW; V1 migrate; `PagesLayout`
+- **Faz 2B — SST cap + upload:** `max_sst_bytes` (1 GiB); split; `upload_sst`/`download_sst`/`hydrate_ssts_from_manifest`
+- **Faz 2C (2026-07-20) — MinIO kanıt:**
+  - `minio_chunked_pages_cycle_and_v1_v2_upload_math` (varsayılan 64 MiB; `TAKYONIC_PHASE2C_MIB` ile büyütülür): **V2=160 MiB / 64 PutObject** vs **V1 lower-bound≈4.00 GiB** → **~25.6×** daha az upload
+  - `minio_v2_survives_past_5gib_heap_offset`: page_id≈1.31M (offset≈5.00 GiB); uploaded **176 KiB** (≪5 GiB); cold read OK
+  - `extend_file` sparse `set_len` (yüksek page_id’de O(n) sıfır yazma yok)
+- Multipart hâlâ yok; 1 GiB SST + chunk cap ile PutObject 5 GiB tavanı hedeflenir
+- Spec/plan: `docs/superpowers/specs/2026-07-20-s3-chunked-pages-design.md`, `docs/superpowers/plans/2026-07-20-s3-chunked-pages.md`
 
 ## Step 46 — Partitioning & Partition Pruning (2026-07-19)
 - `src/partition.rs`: `PartitioningStrategy::{Hash,Range}`, `PartitionMap`, `PartitionRouter`, `PartitionPruningRule`, `Rebalancer`
@@ -197,28 +253,81 @@ Güncelleme: 2026-07-19
   - Tests: epoch watermark unit tests; `vacuum_respects_long_running_snapshot`; `session_vacuum_reclaims_dead_versions_after_updates` (10k)
 - Buffer Pool Manager (Step 38):
   - `Page` / `DiskManager` (`src/page.rs`, `src/disk.rs`): fixed-size aligned frames; Linux `O_DIRECT` with buffered fallback; primary `data_dir/PAGES`
-  - `BufferPoolManager` (`src/bpm.rs`): pre-allocated pool, pin/unpin, dirty flush on eviction + `flush_all` checkpoint; **LRU-K** (K=2) scan-resistant
+  - `BufferPoolManager` (`src/bpm.rs`): pre-allocated pool, pin/unpin, dirty flush on eviction + `flush_all` checkpoint; **LRU-K** (K=2) scan-resistant; **concurrent fetch/evict race fixed 2026-07-19** (page_table↔pin TOCTOU)
   - Config: `bpm_pool_size` / `bpm_page_size` / `bpm_lru_k` (default 1024×4KiB, K=2; `0` disables)
   - SST integration: registry attaches BPM; data blocks read via page-aligned Direct I/O cache (`fetch_file_page`); mmap kept for index/Bloom
   - Engine: owns BPM, `checkpoint_buffer_pool` after memtable→L0 flush; txn mutations mark pages dirty via `PageGuard::write`
   - Tests: eviction+dirty flush, pin protection, LRU-K scan resistance, `session_bpm_caches_sst_reads_after_flush`
-- Not yet wired: (none — backlog from 2026-07-19 cleared)
-- Done: per-connection SessionState (pid-keyed DashMap + SCRAM user bind) — 2026-07-19
-- Done: persistent role catalog reopen e2e (`create_user_grant_survives_engine_reopen`) — 2026-07-19
-- Done: TxnDeleteRecord RPC + Smart Client UPDATE/DELETE (PK equality) — 2026-07-19
-- Done: HAVING clause (Filter over Aggregate) — 2026-07-19
-- Done: MergeJoin for sorted equi-join inputs — 2026-07-19
-- Done: correlated OuterRef Apply (per-row EXISTS/IN/scalar) — 2026-07-19
-- Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (complete)
+- Not yet wired backlog (2026-07-19) — **kod doğrulaması:**
+  - MergeJoin: **Tamamlandı** — `PhysicalPlan::MergeJoin` / `MergeJoinExec` (`src/executor.rs`); tests `merge_join_exec_matches_sorted_inputs`, `equi_join_prefers_merge_when_both_sides_sorted`
+  - TxnDeleteRecord RPC: **Tamamlandı** — proto + `client_service`/`ClientTxn::delete_record`; test `smart_client_update_and_delete_record_via_txn_rpc` (PK equality only)
+  - per-connection SessionState: **Tamamlandı** — `TakyonicPgBackend.sessions: DashMap<i32,…>`; tests `two_pids_on_same_backend_do_not_share_active_txn`, `backend_binds_authenticated_user_not_bootstrap`
+  - persistent role catalog: **Tamamlandı** — `AuthCatalog` load/save + `create_user_grant_survives_engine_reopen`
+  - HAVING: **Tamamlandı** — Filter over Aggregate; `group_by_having_filters_groups_via_sql`, `parses_group_by_having_count`
+  - correlated OuterRef Apply: **DONE 2026-08-03** — equi EXISTS/IN → `HashSemiJoin` unnest; residual scalar → streaming `ApplyExec`; 2k-row unnest bench PASS
+- Implementation plan: `docs/superpowers/plans/2026-07-19-not-yet-wired-gaps.md` (feature close-out)
 
-## Sonraki büyüme aşaması (2026-07-19)
-- Spec approved: `docs/superpowers/specs/2026-07-19-reliability-suite-design.md`
-- Plan: `docs/superpowers/plans/2026-07-19-reliability-suite.md`
-- Done: Reliability Suite (`src/reliability/`, examples `reliability_soak`/`ha_soak`, `docs/RELIABILITY.md`, `workflow_dispatch` CI) — 2026-07-19
-- Done: Continuous Hardening (multi-day chaos soak + proptest MVCC/OCC/2PC + unsafe/SIMD/JIT audit) — 2026-07-19
-  - Plan: `docs/superpowers/plans/2026-07-19-continuous-hardening.md`
-  - `examples/continuous_chaos`, `src/reliability/props/*`, `docs/UNSAFE_AUDIT.md`
-- Next: remaining SQL completeness (window, UPSERT/MERGE, deeper correlate) → backup/PITR → production guide/Grafana → TPC karşılaştırması
+## Bilinen kritik regresyon (doğrulandı 2026-07-19) — DÜZELTİLDİ
+- Belirti: `crash_recovery` → `SST data checksum mismatch` **veya** `buffer pool page table desync` (aynı kök nedenin iki yüzü; 5 koşuda 4 desync / 1 checksum)
+- Hipotez: `bpm_pool_size(0)` ile 3/3 PASS → regresyon **Step 38 BPM** (mmap-only SST yolu sağlam)
+- Kök neden (`src/bpm.rs`):
+  1. Hit path: page_table lookup ile pin arasında TOCTOU (frame recycle → desync)
+  2. `evict_victim`: frame reset sonrası table remove (stale index)
+  3. `allocate_frame`: free-list pop ile claim arasında çift sahiplik → yanlış sayfa baytları → SST checksum
+- Fix: kilit sırası `page_table`→`frames`; eviction’da önce table remove; allocate’te anında `pin_count=1`; miss publish double-check
+- Regresyon testi: `concurrent_fetch_with_eviction_preserves_page_identity` (RED→GREEN)
+- Yan düzeltmeler (`continuous.rs`): pipe drain (raft_chaos stdout deadlock); `target/release/examples` binary fallback; min 45s round budget (dry-run muaf)
+- Doğrulama turu 2026-07-19/20:
+  - `crash_recovery -- 4 4` **10/10**
+  - `continuous_chaos` (crash+raft) **10/10**
+  - `crash_recovery -- 4 12` (3× writer) **50/50 PASS**; log’da 0 checksum/desync (`/tmp/crash-recovery-50x12.log`)
+  - Microbench `examples/bpm_bench.rs` (16 thr): fixed hit ~633k ops/s 0 err; racey hit ~510k 0 err; fixed evict ~521k 0 err; racey evict ~1.0M ops/s ama **214k data errors** (hızlı ama yanlış)
+  - Lock kapsamı hit’te genişledi (`page_table`+`frames` birlikte); hit-heavy’de fixed ≥ racey (contention regresyonu görülmedi). Evict’te racey “daha hızlı” görünür çünkü bozuk okumalar ucuz — kullanılabilir değil
+  - **loom:** mümkün değil pratikte — BPM `parking_lot` kullanıyor (loom desteklemez); miss path disk I/O loom’da modellenebilir değil; ayrı `cfg(loom)` harness gerekir
+  - **TSan:** `RUSTFLAGS=-Zsanitizer=thread` + `-Zbuild-std` hello-world OK; full crate derlemesi `tower 0.4` / `indexmap` generic uyumsuzluğunda kırıldı — BPM birim testine TSan uygulanamadı (toolchain/dep, kod hatası değil)
+  - **SST `SstPin` audit:** aynı hata sınıfı yok. Pin = `DashMap` get + `Arc::clone` (indeks yok); `retire`/`reap` `lifecycle` mutex altında; unlink yalnızca `Arc::strong_count == 1`. “lock bırak → frame index kullan” anti-pattern’i yok. SST data BPM üzerinden okununca BPM fix’ine bağımlı (mmap yolu zaten race’siz)
+  - **Lock-order audit (2026-07-20, kod tarama):** `page_table` + `frames` birlikte alındığında **her zaman** `page_table` → `frames` (hit, miss publish, `new_page`, `unpin`, `mark_dirty`, `flush_page`, `pin_count`, `evict_victim`). Ters sıra yok. `free_list` yalnızca `allocate_frame` free path’te `free_list` → `frames`; `page_table` ile asla birlikte tutulmaz; miss-race free path önce `frames` bırakır sonra `free_list` push. Hiyerarşi `BufferPoolManager` doc-comment’te sabitlendi.
+  - **Hang/deadlock testi:** `high_concurrency_hit_evict_allocate_completes_within_timeout` — 12 thr / pool 16 / 64 page / 8k iter; arka plan thread + `recv_timeout(60s)`; süre dolarsa FAIL (harness hang’ine güvenilmez). PASS ~0.2s debug.
+
+## Crucible / chaos (yeniden çalıştırıldı 2026-07-19/20)
+- `raft_chaos`: **PASS**
+- `mvcc_bank`: **PASS**
+- `cbo_planner`: **PASS**
+- `crash_recovery`: **PASS** 10/10 (4w) + **50/50** (12w)
+- `continuous_chaos`: **PASS** 10/10
+
+## Sonraki büyüme aşaması (2026-07-20)
+- Spec/plan: reliability suite + continuous hardening landed (`src/reliability/`, `docs/UNSAFE_AUDIT.md`)
+- BPM crash path + continuous harness + yüksek-eşzamanlılık stres doğrulandı
+- **2PC wire:** Client + Engine + serve_node + crash recover **DONE** (B1–B4); Session SQL multi-shard COMMIT **DONE** (B5, 2026-08-03, `session_multi_shard_commit_uses_2pc`)
+- **S3 pages+SST:** Faz **2A+2B+2C tamam** (chunked, max_sst, upload/hydrate, MinIO sayısal kanıt)
+- **Correlated IN/EXISTS:** equi → HashSemiJoin; scalar → streaming Apply — **DONE 2026-08-03**
+- **Öncelik (aktif):** Faz C MPP Session→Coordinator / deferred PG niche
+- İsteğe bağlı: BPM loom/TSan CI; `TAKYONIC_PHASE2C_MIB=2048` ağır MinIO koşusu
+
+## Üretim kullanılabilirliği — dürüst cevaplar (2026-07-20; güncelleme 2026-08-03)
+
+### 1) 2PC — Client/Engine + Session SQL multi-shard
+- **Cevap:** `execute_dist_txn` + Engine Raft prepare/commit + crash presumed-abort **var**. Session `COMMIT` → `partition_txn_branches` → TC when ≥2 shards and participants attached (`attach_dist_shards` or SocketAddr `mpp_workers`).
+- **Kalan:** (2026-08-07) durable TC decision log **DONE** (`TC_DECISIONS`); Session shared TC.
+
+### 2) S3 — Faz 2A–2C sonrası pages+SST yolu kullanılabilir (multipart yok)
+- **Pages V2 + sparse local extend:** BPM → chunk PutObject. MinIO: 64 MiB cycle’da V2≪V1 (~25×); >5 GiB offset’te tek chunk PutObject.
+- **SST:** upload/hydrate + 1 GiB split.
+- **Kalan sınır:** chunk içi RMW hâlâ sayfa başına chunk yeniden yükleyebilir (O(chunk)×pages_in_chunk/2, heap değil); true multi-GiB CI varsayılan değil (`TAKYONIC_PHASE2C_MIB`).
+
+### 3) Correlated subquery — equi unnest + streaming Apply
+- Equi correlated EXISTS/IN → `HashSemiJoin` (EXPLAIN). Scalar residual → streaming `ApplyExec`. Nested/non-equi still Apply O(N×subquery).
+
+## 2PC / S3 / Subquery durum özeti (2026-08-03)
+| Alan | Statü |
+|------|--------|
+| 2PC wire + Engine + Client | **DONE** (B1–B4) |
+| 2PC Session SQL COMMIT | **DONE** (B5, `session_multi_shard_commit_uses_2pc`) |
+| S3 pages chunk V2 | **2A PASS** |
+| S3 SST upload + max size | **2B PASS** |
+| S3 MinIO cycle + >5 GiB sim | **2C PASS** (64 MiB default; 25.6× vs V1) |
+| Correlated equi unnest + Apply | **DONE** (HashSemiJoin / streaming Apply) |
 
 ## Ingestion Path (Step 2)
 - WAL record: `[u32 len][body][u64 xxh3]`; body = flags|seq|key|value
@@ -391,11 +500,16 @@ Güncelleme: 2026-07-19
 - Dual-pool compaction: L0 Rapid (L0→L1) + Ln Haul (L1→L2+) via crossbeam-channel
 - OCC compaction: pick under lock, merge unlocked, install under lock; HashSet<SstId> reservations
 - No RocksDB / Sled / existing DB engines
+- **Güncelleme (Steps 38–49, kısıtı bozmaz):** SST data blocks ayrıca BPM+O_DIRECT üzerinden okunabilir; object-store hydrate/write-through; per-table LSM|BTree; MPP shuffle; Cranelift JIT; 2PC LocalShard — hepsi custom stack üzerinde
 
 ## Tech Stack
-- parking_lot, crossbeam-channel, dashmap
-- bytes, memmap2, xxhash-rust (xxh3/xxh64)
-- tracing, thiserror, anyhow
+- parking_lot, crossbeam-channel, dashmap, bytes, memmap2, xxhash-rust (xxh3/xxh64)
+- tracing, thiserror, anyhow, serde/serde_json, libc
+- tokio, tonic/prost, pgwire (=0.36.3 server-api-ring), sqlparser, argon2
+- cranelift / cranelift-jit / cranelift-module / cranelift-codegen / cranelift-native 0.133
+- optional: aws-config + aws-sdk-s3 (`--features s3`)
+- tzdb 0.7 + tz-rs 0.7 (IANA Time Zone Database)
+- dev: proptest
 
 ## Tercihler
 - Step-by-step roadmap; do not scaffold the entire engine at once

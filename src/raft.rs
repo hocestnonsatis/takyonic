@@ -30,6 +30,14 @@ const COMMAND_ADD_NODE: u8 = 3;
 const COMMAND_REMOVE_NODE: u8 = 4;
 const COMMAND_NOOP: u8 = 5;
 const COMMAND_TXN_BATCH: u8 = 6;
+const COMMAND_TXN_PREPARE: u8 = 7;
+const COMMAND_TXN_COMMIT: u8 = 8;
+const COMMAND_TXN_ABORT: u8 = 9;
+const COMMAND_CATALOG_UPSERT: u8 = 10;
+const COMMAND_CATALOG_DROP: u8 = 11;
+const COMMAND_AUTH_REPLACE: u8 = 12;
+const COMMAND_STATS_REPLACE: u8 = 13;
+const COMMAND_COMMENTS_REPLACE: u8 = 14;
 
 /// Replicated command stored in the Raft log.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +74,56 @@ pub enum RaftCommand {
     TxnBatch {
         /// Ordered write operations.
         ops: Vec<(Key, Option<Value>)>,
+    },
+    /// 2PC prepare: durable write-set on this shard (not yet applied to LSM).
+    TxnPrepare {
+        /// Distributed transaction id.
+        txn_id: u64,
+        /// Global snapshot / read timestamp from the coordinator.
+        read_ts: u64,
+        /// Locked write-set (applied only on [`Self::TxnCommit`]).
+        ops: Vec<(Key, Option<Value>)>,
+    },
+    /// 2PC commit: apply a previously prepared write-set at `commit_ts`.
+    TxnCommit {
+        /// Distributed transaction id.
+        txn_id: u64,
+        /// Global commit timestamp.
+        commit_ts: u64,
+        /// Write-set to apply (must match the prepare).
+        ops: Vec<(Key, Option<Value>)>,
+    },
+    /// 2PC abort: discard a prepared write-set.
+    TxnAbort {
+        /// Distributed transaction id.
+        txn_id: u64,
+    },
+    /// Replicated catalog upsert: install/replace one table schema (no LSM).
+    CatalogUpsert {
+        /// Table name.
+        table: String,
+        /// UTF-8 catalog block ([`crate::catalog::encode_table_block`]).
+        schema: Bytes,
+    },
+    /// Replicated catalog drop: remove one table schema (no LSM).
+    CatalogDrop {
+        /// Table name.
+        table: String,
+    },
+    /// Replace the entire AUTH catalog (RBAC) blob.
+    AuthReplace {
+        /// UTF-8 AUTH file text ([`crate::rbac::AuthCatalog::encode`]).
+        blob: Bytes,
+    },
+    /// Replace the entire STATS catalog blob.
+    StatsReplace {
+        /// UTF-8 STATS file text ([`crate::stats::encode_stats`]).
+        blob: Bytes,
+    },
+    /// Replace the entire COMMENTS catalog blob.
+    CommentsReplace {
+        /// UTF-8 COMMENTS file text ([`crate::engine::encode_comments`]).
+        blob: Bytes,
     },
 }
 
@@ -106,14 +164,79 @@ impl RaftCommand {
         Self::TxnBatch { ops }
     }
 
+    /// Construct a 2PC prepare record (Raft-durable, not LSM-applied).
+    pub fn txn_prepare(txn_id: u64, read_ts: u64, ops: Vec<(Key, Option<Value>)>) -> Self {
+        Self::TxnPrepare {
+            txn_id,
+            read_ts,
+            ops,
+        }
+    }
+
+    /// Construct a 2PC commit that applies `ops` at `commit_ts`.
+    pub fn txn_commit(txn_id: u64, commit_ts: u64, ops: Vec<(Key, Option<Value>)>) -> Self {
+        Self::TxnCommit {
+            txn_id,
+            commit_ts,
+            ops,
+        }
+    }
+
+    /// Construct a 2PC abort for `txn_id`.
+    pub fn txn_abort(txn_id: u64) -> Self {
+        Self::TxnAbort { txn_id }
+    }
+
+    /// Construct a catalog upsert from a [`crate::schema::TableSchema`].
+    pub fn catalog_upsert(schema: &crate::schema::TableSchema) -> Self {
+        let block = crate::catalog::encode_table_block(schema);
+        Self::CatalogUpsert {
+            table: schema.name.clone(),
+            schema: Bytes::from(block.into_bytes()),
+        }
+    }
+
+    /// Construct a catalog drop for `table`.
+    pub fn catalog_drop(table: impl Into<String>) -> Self {
+        Self::CatalogDrop {
+            table: table.into(),
+        }
+    }
+
+    /// Construct an AUTH catalog replace from encoded text.
+    pub fn auth_replace(blob: impl Into<Bytes>) -> Self {
+        Self::AuthReplace { blob: blob.into() }
+    }
+
+    /// Construct a STATS catalog replace from encoded text.
+    pub fn stats_replace(blob: impl Into<Bytes>) -> Self {
+        Self::StatsReplace { blob: blob.into() }
+    }
+
+    /// Construct a COMMENTS catalog replace from encoded text.
+    pub fn comments_replace(blob: impl Into<Bytes>) -> Self {
+        Self::CommentsReplace { blob: blob.into() }
+    }
+
     /// True for membership-change entries (not applied to the KV memtable).
     pub fn is_config_change(&self) -> bool {
         matches!(self, Self::AddNode { .. } | Self::RemoveNode { .. })
     }
 
-    /// True when the command has no memtable effect (config or noop).
+    /// True when the command has no memtable effect (config, noop, 2PC prepare/abort, catalog).
     pub fn is_meta(&self) -> bool {
-        self.is_config_change() || matches!(self, Self::Noop)
+        self.is_config_change()
+            || matches!(
+                self,
+                Self::Noop
+                    | Self::TxnPrepare { .. }
+                    | Self::TxnAbort { .. }
+                    | Self::CatalogUpsert { .. }
+                    | Self::CatalogDrop { .. }
+                    | Self::AuthReplace { .. }
+                    | Self::StatsReplace { .. }
+                    | Self::CommentsReplace { .. }
+            )
     }
 
     /// Expand into one or more LSM entries at `commit_ts`.
@@ -121,20 +244,88 @@ impl RaftCommand {
         match self {
             Self::Put { key, value } => Ok(vec![Entry::put(key.clone(), value.clone(), commit_ts)]),
             Self::Delete { key } => Ok(vec![Entry::delete(key.clone(), commit_ts)]),
-            Self::TxnBatch { ops } => {
+            Self::TxnBatch { ops } | Self::TxnCommit { ops, .. } => {
+                let ts = match self {
+                    Self::TxnCommit { commit_ts: cts, .. } => *cts,
+                    _ => commit_ts,
+                };
                 let mut out = Vec::with_capacity(ops.len());
                 for (key, value) in ops {
                     match value {
-                        Some(v) => out.push(Entry::put(key.clone(), v.clone(), commit_ts)),
-                        None => out.push(Entry::delete(key.clone(), commit_ts)),
+                        Some(v) => out.push(Entry::put(key.clone(), v.clone(), ts)),
+                        None => out.push(Entry::delete(key.clone(), ts)),
                     }
                 }
                 Ok(out)
             }
-            Self::AddNode { .. } | Self::RemoveNode { .. } | Self::Noop => Err(
-                TakyonicError::Raft("meta command cannot become LSM entries".into()),
-            ),
+            Self::AddNode { .. }
+            | Self::RemoveNode { .. }
+            | Self::Noop
+            | Self::TxnPrepare { .. }
+            | Self::TxnAbort { .. }
+            | Self::CatalogUpsert { .. }
+            | Self::CatalogDrop { .. }
+            | Self::AuthReplace { .. }
+            | Self::StatsReplace { .. }
+            | Self::CommentsReplace { .. } => Err(TakyonicError::Raft(
+                "meta command cannot become LSM entries".into(),
+            )),
         }
+    }
+
+    fn encode_ops_body(ops: &[(Key, Option<Value>)]) -> BytesMut {
+        let mut body = BytesMut::new();
+        body.put_u32_le(ops.len() as u32);
+        for (key, value) in ops {
+            match value {
+                Some(v) => {
+                    body.put_u8(1);
+                    body.put_u32_le(key.as_bytes().len() as u32);
+                    body.put_u32_le(v.as_bytes().len() as u32);
+                    body.put_slice(key.as_bytes());
+                    body.put_slice(v.as_bytes());
+                }
+                None => {
+                    body.put_u8(2);
+                    body.put_u32_le(key.as_bytes().len() as u32);
+                    body.put_u32_le(0);
+                    body.put_slice(key.as_bytes());
+                }
+            }
+        }
+        body
+    }
+
+    fn decode_ops_body(mut body: Bytes) -> Result<Vec<(Key, Option<Value>)>> {
+        if body.len() < 4 {
+            return Err(TakyonicError::Raft("ops body truncated".into()));
+        }
+        let n = u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
+        let mut ops = Vec::with_capacity(n);
+        for _ in 0..n {
+            if body.is_empty() {
+                return Err(TakyonicError::Raft("ops body op truncated".into()));
+            }
+            let kind = body.split_to(1)[0];
+            if body.len() < 8 {
+                return Err(TakyonicError::Raft("ops body lengths truncated".into()));
+            }
+            let klen = u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
+            let vlen = u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
+            if body.len() < klen + vlen {
+                return Err(TakyonicError::Raft("ops body payload truncated".into()));
+            }
+            let key = Key::new(body.split_to(klen));
+            let val_bytes = body.split_to(vlen);
+            match kind {
+                1 => ops.push((key, Some(Value::new(val_bytes)))),
+                2 if vlen == 0 => ops.push((key, None)),
+                _ => {
+                    return Err(TakyonicError::Raft(format!("unknown op kind {kind}")));
+                }
+            }
+        }
+        Ok(ops)
     }
 
     /// Encode for a zero-copy-friendly Raft/network boundary.
@@ -156,26 +347,50 @@ impl RaftCommand {
             }
             Self::Noop => Self::encode_kv(COMMAND_NOOP, &[], &[]),
             Self::TxnBatch { ops } => {
-                let mut body = BytesMut::new();
-                body.put_u32_le(ops.len() as u32);
-                for (key, value) in ops {
-                    match value {
-                        Some(v) => {
-                            body.put_u8(1);
-                            body.put_u32_le(key.as_bytes().len() as u32);
-                            body.put_u32_le(v.as_bytes().len() as u32);
-                            body.put_slice(key.as_bytes());
-                            body.put_slice(v.as_bytes());
-                        }
-                        None => {
-                            body.put_u8(2);
-                            body.put_u32_le(key.as_bytes().len() as u32);
-                            body.put_u32_le(0);
-                            body.put_slice(key.as_bytes());
-                        }
-                    }
-                }
+                let body = Self::encode_ops_body(ops);
                 Self::encode_kv(COMMAND_TXN_BATCH, &[], &body)
+            }
+            Self::TxnPrepare {
+                txn_id,
+                read_ts,
+                ops,
+            } => {
+                let mut key = BytesMut::with_capacity(16);
+                key.put_u64_le(*txn_id);
+                key.put_u64_le(*read_ts);
+                let body = Self::encode_ops_body(ops);
+                Self::encode_kv(COMMAND_TXN_PREPARE, &key, &body)
+            }
+            Self::TxnCommit {
+                txn_id,
+                commit_ts,
+                ops,
+            } => {
+                let mut key = BytesMut::with_capacity(16);
+                key.put_u64_le(*txn_id);
+                key.put_u64_le(*commit_ts);
+                let body = Self::encode_ops_body(ops);
+                Self::encode_kv(COMMAND_TXN_COMMIT, &key, &body)
+            }
+            Self::TxnAbort { txn_id } => {
+                let mut key = [0u8; 8];
+                key.copy_from_slice(&txn_id.to_le_bytes());
+                Self::encode_kv(COMMAND_TXN_ABORT, &key, &[])
+            }
+            Self::CatalogUpsert { table, schema } => {
+                Self::encode_kv(COMMAND_CATALOG_UPSERT, table.as_bytes(), schema.as_ref())
+            }
+            Self::CatalogDrop { table } => {
+                Self::encode_kv(COMMAND_CATALOG_DROP, table.as_bytes(), &[])
+            }
+            Self::AuthReplace { blob } => {
+                Self::encode_kv(COMMAND_AUTH_REPLACE, b"AUTH", blob.as_ref())
+            }
+            Self::StatsReplace { blob } => {
+                Self::encode_kv(COMMAND_STATS_REPLACE, b"STATS", blob.as_ref())
+            }
+            Self::CommentsReplace { blob } => {
+                Self::encode_kv(COMMAND_COMMENTS_REPLACE, b"COMMENTS", blob.as_ref())
             }
         }
     }
@@ -256,44 +471,65 @@ impl RaftCommand {
                 "Noop command must have empty key and value".into(),
             )),
             COMMAND_TXN_BATCH if key_len == 0 => {
-                let mut body = value;
-                if body.len() < 4 {
-                    return Err(TakyonicError::Raft("TxnBatch truncated".into()));
-                }
-                let n = u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
-                let mut ops = Vec::with_capacity(n);
-                for _ in 0..n {
-                    if body.is_empty() {
-                        return Err(TakyonicError::Raft("TxnBatch op truncated".into()));
-                    }
-                    let kind = body.split_to(1)[0];
-                    if body.len() < 8 {
-                        return Err(TakyonicError::Raft("TxnBatch lengths truncated".into()));
-                    }
-                    let klen =
-                        u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
-                    let vlen =
-                        u32::from_le_bytes(body.split_to(4).as_ref().try_into().unwrap()) as usize;
-                    if body.len() < klen + vlen {
-                        return Err(TakyonicError::Raft("TxnBatch payload truncated".into()));
-                    }
-                    let key = Key::new(body.split_to(klen));
-                    let val_bytes = body.split_to(vlen);
-                    match kind {
-                        1 => ops.push((key, Some(Value::new(val_bytes)))),
-                        2 if vlen == 0 => ops.push((key, None)),
-                        _ => {
-                            return Err(TakyonicError::Raft(format!(
-                                "unknown TxnBatch op kind {kind}"
-                            )));
-                        }
-                    }
-                }
-                Ok(Self::TxnBatch { ops })
+                Ok(Self::TxnBatch {
+                    ops: Self::decode_ops_body(value)?,
+                })
             }
             COMMAND_TXN_BATCH => Err(TakyonicError::Raft(
                 "TxnBatch must have empty key framing".into(),
             )),
+            COMMAND_TXN_PREPARE if key_len == 16 => {
+                let txn_id = u64::from_le_bytes(key_bytes[0..8].try_into().unwrap());
+                let read_ts = u64::from_le_bytes(key_bytes[8..16].try_into().unwrap());
+                Ok(Self::TxnPrepare {
+                    txn_id,
+                    read_ts,
+                    ops: Self::decode_ops_body(value)?,
+                })
+            }
+            COMMAND_TXN_PREPARE => Err(TakyonicError::Raft(
+                "TxnPrepare requires 16-byte txn_id+read_ts key".into(),
+            )),
+            COMMAND_TXN_COMMIT if key_len == 16 => {
+                let txn_id = u64::from_le_bytes(key_bytes[0..8].try_into().unwrap());
+                let commit_ts = u64::from_le_bytes(key_bytes[8..16].try_into().unwrap());
+                Ok(Self::TxnCommit {
+                    txn_id,
+                    commit_ts,
+                    ops: Self::decode_ops_body(value)?,
+                })
+            }
+            COMMAND_TXN_COMMIT => Err(TakyonicError::Raft(
+                "TxnCommit requires 16-byte txn_id+commit_ts key".into(),
+            )),
+            COMMAND_TXN_ABORT if key_len == 8 && value_len == 0 => {
+                let txn_id = u64::from_le_bytes(key_bytes.as_ref().try_into().unwrap());
+                Ok(Self::TxnAbort { txn_id })
+            }
+            COMMAND_TXN_ABORT => Err(TakyonicError::Raft(
+                "TxnAbort requires 8-byte txn_id and empty value".into(),
+            )),
+            COMMAND_CATALOG_UPSERT => {
+                let table = String::from_utf8(key_bytes.to_vec()).map_err(|e| {
+                    TakyonicError::Raft(format!("CatalogUpsert table utf8: {e}"))
+                })?;
+                Ok(Self::CatalogUpsert {
+                    table,
+                    schema: value,
+                })
+            }
+            COMMAND_CATALOG_DROP if value_len == 0 => {
+                let table = String::from_utf8(key_bytes.to_vec()).map_err(|e| {
+                    TakyonicError::Raft(format!("CatalogDrop table utf8: {e}"))
+                })?;
+                Ok(Self::CatalogDrop { table })
+            }
+            COMMAND_CATALOG_DROP => Err(TakyonicError::Raft(
+                "CatalogDrop must have empty value".into(),
+            )),
+            COMMAND_AUTH_REPLACE => Ok(Self::AuthReplace { blob: value }),
+            COMMAND_STATS_REPLACE => Ok(Self::StatsReplace { blob: value }),
+            COMMAND_COMMENTS_REPLACE => Ok(Self::CommentsReplace { blob: value }),
             _ => Err(TakyonicError::Raft(format!(
                 "unknown Raft command opcode {opcode}"
             ))),
@@ -304,11 +540,20 @@ impl RaftCommand {
         match self {
             Self::Put { key, value } => Ok(Entry::put(key, value, index)),
             Self::Delete { key } => Ok(Entry::delete(key, index)),
-            Self::AddNode { .. } | Self::RemoveNode { .. } | Self::Noop | Self::TxnBatch { .. } => {
-                Err(TakyonicError::Raft(
-                    "command cannot become a single LSM entry; use to_entries".into(),
-                ))
-            }
+            Self::AddNode { .. }
+            | Self::RemoveNode { .. }
+            | Self::Noop
+            | Self::TxnBatch { .. }
+            | Self::TxnPrepare { .. }
+            | Self::TxnCommit { .. }
+            | Self::TxnAbort { .. }
+            | Self::CatalogUpsert { .. }
+            | Self::CatalogDrop { .. }
+            | Self::AuthReplace { .. }
+            | Self::StatsReplace { .. }
+            | Self::CommentsReplace { .. } => Err(TakyonicError::Raft(
+                "command cannot become a single LSM entry; use to_entries".into(),
+            )),
         }
     }
 
@@ -629,8 +874,17 @@ impl LocalRaftNode {
     ///
     /// Returns the assigned Raft log index. Returns only after durability **and**
     /// memtable publish for this entry's batch.
+    ///
+    /// Meta commands ([`RaftCommand::is_meta`]) advance `last_applied` without
+    /// producing LSM entries (2PC prepare/abort, catalog, …). Callers such as
+    /// [`crate::engine::TakyonicEngine::twopc_prepare`] apply side effects after
+    /// a successful propose.
     pub fn propose(&self, command: RaftCommand) -> Result<u64> {
         let index = self.next_index.fetch_add(1, Ordering::Relaxed);
+        if command.is_meta() {
+            self.last_applied.fetch_max(index, Ordering::Release);
+            return Ok(index);
+        }
         let entries = command.to_entries(index)?;
         if entries.len() == 1 {
             self.group_wal.submit(entries.into_iter().next().unwrap())?;
@@ -790,12 +1044,41 @@ mod tests {
             RaftCommand::add_node(4, "127.0.0.1:19004"),
             RaftCommand::remove_node(4),
             RaftCommand::noop(),
+            RaftCommand::txn_batch(vec![
+                (Key::new(&b"a"[..]), Some(Value::new(&b"1"[..]))),
+                (Key::new(&b"b"[..]), None),
+            ]),
+            RaftCommand::txn_prepare(
+                9,
+                3,
+                vec![(Key::new(&b"a"[..]), Some(Value::new(&b"1"[..])))],
+            ),
+            RaftCommand::txn_commit(
+                9,
+                4,
+                vec![(Key::new(&b"a"[..]), Some(Value::new(&b"1"[..])))],
+            ),
+            RaftCommand::txn_abort(9),
+            RaftCommand::catalog_upsert(&crate::schema::TableSchema::new(
+                "t",
+                "id",
+                vec![],
+            )),
+            RaftCommand::catalog_drop("t"),
+            RaftCommand::auth_replace(b"# AUTH\n".as_slice()),
+            RaftCommand::stats_replace(b"# STATS\n".as_slice()),
+            RaftCommand::comments_replace(b"# Takyonic COMMENTS\n".as_slice()),
         ];
         for command in commands {
             let encoded = command.encode().unwrap();
             assert_eq!(RaftCommand::decode(encoded).unwrap(), command);
         }
         assert!(RaftCommand::decode(Bytes::from_static(b"short")).is_err());
+        assert!(RaftCommand::txn_prepare(1, 1, vec![]).is_meta());
+        assert!(RaftCommand::catalog_drop("x").is_meta());
+        assert!(RaftCommand::auth_replace(Bytes::new()).is_meta());
+        assert!(RaftCommand::comments_replace(Bytes::new()).is_meta());
+        assert!(!RaftCommand::txn_commit(1, 2, vec![]).is_meta());
     }
 
     #[test]

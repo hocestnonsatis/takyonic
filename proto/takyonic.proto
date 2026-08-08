@@ -90,6 +90,8 @@ service ClientService {
   // Schema + cost-based query (SQL logical plan executed on the leader).
   rpc RegisterTable (RegisterTableRequest) returns (RegisterTableResponse);
   rpc ExecuteQuery (ExecuteQueryRequest) returns (ExecuteQueryResponse);
+  // Full Volcano SQL via ephemeral SessionState on the leader (Faz 4D).
+  rpc ExecuteSessionSql (ExecuteSessionSqlRequest) returns (ExecuteSessionSqlResponse);
 }
 
 message PingRequest {}
@@ -210,6 +212,21 @@ message ExecuteQueryResponse {
   string explain = 2;
 }
 
+message ExecuteSessionSqlRequest {
+  string sql = 1;
+}
+
+message ExecuteSessionSqlResponse {
+  // PostgreSQL-style command tag (`SELECT`, `INSERT`, `CREATE TABLE`, …).
+  string tag = 1;
+  // Encoded [`Record`] payloads (same encoding as ExecuteQuery).
+  repeated bytes records = 2;
+  // Column order for result projection (empty for non-row commands).
+  repeated string column_order = 3;
+  // Optional row-count / affected for DML (`INSERT 0 N`, etc.).
+  optional int64 affected = 4;
+}
+
 // ---------------------------------------------------------------------------
 // MPP shuffle / fragment execution (coordinator ↔ workers).
 // ---------------------------------------------------------------------------
@@ -269,3 +286,73 @@ message CloseShuffleRequest {
 }
 
 message CloseShuffleResponse {}
+
+// ---------------------------------------------------------------------------
+// Distributed 2PC participant wire (coordinator ↔ shard processes).
+// ---------------------------------------------------------------------------
+service TwopcService {
+  rpc Prepare (TwopcPrepareRequest) returns (TwopcAck);
+  rpc Commit (TwopcCommitRequest) returns (TwopcAck);
+  rpc Abort (TwopcAbortRequest) returns (TwopcAck);
+  rpc OrphanedPrepared (TwopcOrphanedRequest) returns (TwopcOrphanedResponse);
+  rpc GetAt (TwopcGetAtRequest) returns (TwopcGetAtResponse);
+  // Test / chaos helpers (production clients may omit).
+  rpc InjectPrepareFailure (TwopcInjectRequest) returns (TwopcAck);
+  rpc InjectCrashAfterPrepare (TwopcInjectRequest) returns (TwopcAck);
+  rpc RecoverFromRaftLog (TwopcRecoverRequest) returns (TwopcAck);
+}
+
+message TwopcWriteOp {
+  bytes key = 1;
+  // When has_value is false, this is a delete (tombstone).
+  bool has_value = 2;
+  bytes value = 3;
+}
+
+message TwopcReadCheck {
+  bytes key = 1;
+  uint64 observed_ts = 2;
+}
+
+message TwopcPrepareRequest {
+  uint64 txn_id = 1;
+  uint64 read_ts = 2;
+  repeated TwopcWriteOp writes = 3;
+  repeated TwopcReadCheck reads = 4;
+}
+
+message TwopcCommitRequest {
+  uint64 txn_id = 1;
+  uint64 commit_ts = 2;
+}
+
+message TwopcAbortRequest {
+  uint64 txn_id = 1;
+}
+
+message TwopcOrphanedRequest {}
+
+message TwopcOrphanedResponse {
+  repeated uint64 txn_ids = 1;
+}
+
+message TwopcGetAtRequest {
+  bytes key = 1;
+  uint64 read_ts = 2;
+}
+
+message TwopcGetAtResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message TwopcInjectRequest {
+  bool enabled = 1;
+}
+
+message TwopcRecoverRequest {}
+
+message TwopcAck {
+  bool ok = 1;
+  string error = 2;
+}

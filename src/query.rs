@@ -355,12 +355,7 @@ fn collect_pks_from_index(
 }
 
 fn collect_all_pks(engine: &TakyonicEngine, table: &str, read_ts: CommitTs) -> Result<Vec<String>> {
-    let prefix = {
-        let mut p = Vec::from(b"Data_".as_slice());
-        p.extend_from_slice(table.as_bytes());
-        p.push(b'_');
-        bytes::Bytes::from(p)
-    };
+    let prefix = crate::schema::data_table_prefix(table);
     let keys = engine.scan_prefix_keys(&prefix, read_ts)?;
     Ok(keys
         .into_iter()
@@ -403,7 +398,7 @@ fn range_match_encoded(
     }
 }
 
-fn matches_filter(record: &Record, filter: &Filter) -> bool {
+pub(crate) fn matches_filter(record: &Record, filter: &Filter) -> bool {
     let Some(actual) = record.get(&filter.column) else {
         return false;
     };
@@ -450,7 +445,9 @@ mod tests {
         distinct.insert("city".into(), 200);
         let stats = TableStats {
             row_count: 10_000,
+            page_count: 100,
             distinct,
+            columns: BTreeMap::new(),
         };
         let filters = vec![
             Filter {

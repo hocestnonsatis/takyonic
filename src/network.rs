@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::RwLock;
@@ -19,6 +19,7 @@ use crate::consensus::RaftConsensus;
 use crate::engine::TakyonicEngine;
 use crate::error::{Result, TakyonicError};
 use crate::raft_log::RaftLogEntry;
+use crate::twopc_service::TwopcGrpcService;
 
 /// Generated prost/tonic bindings for `takyonic.raft.v1`.
 pub mod proto {
@@ -29,6 +30,8 @@ pub mod proto {
 use proto::client_service_server::ClientServiceServer;
 use proto::raft_service_client::RaftServiceClient;
 use proto::raft_service_server::{RaftService, RaftServiceServer};
+use proto::shuffle_service_server::ShuffleServiceServer;
+use proto::twopc_service_server::TwopcServiceServer;
 use proto::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     LogEntry, RequestVoteRequest, RequestVoteResponse,
@@ -348,7 +351,10 @@ pub async fn serve_raft(addr: SocketAddr, raft: Arc<RaftConsensus>) -> Result<()
         .map_err(|e| TakyonicError::Network(format!("serve {addr}: {e}")))
 }
 
-/// Serve Raft + ClientService on `addr` until the process exits.
+/// Serve Raft + ClientService + ShuffleService + TwopcService on `addr`.
+///
+/// TwopcService is Engine-backed ([`TwopcGrpcService::from_engine`]): prepare is
+/// a Raft meta command; commit applies through the LSM state machine.
 pub async fn serve_node(
     addr: SocketAddr,
     id: u64,
@@ -356,8 +362,19 @@ pub async fn serve_node(
     raft: Arc<RaftConsensus>,
 ) -> Result<()> {
     let raft_svc = RaftGrpcService::new(Arc::clone(&raft));
-    let client_svc = ClientGrpcService::new(id, addr, engine, raft);
-    debug!(%addr, "starting Raft + Client gRPC server");
+    let client_svc = ClientGrpcService::new(id, addr, Arc::clone(&engine), raft);
+    let shuffle = Arc::new(crate::shuffle::ShuffleManager::new(
+        crate::shuffle::DEFAULT_SHUFFLE_BUFFER,
+        Some(Arc::clone(engine.metrics())),
+    ));
+    let worker = Arc::new(crate::mpp::Worker::new(
+        Arc::clone(&engine),
+        shuffle,
+        Arc::clone(engine.metrics()),
+    ));
+    let shuffle_svc = crate::shuffle_service::ShuffleGrpcService::new(worker);
+    let twopc_svc = TwopcGrpcService::from_engine(Arc::clone(&engine), id);
+    debug!(%addr, "starting Raft + Client + Shuffle + Twopc gRPC server");
     tonic::transport::Server::builder()
         .max_frame_size(Some(1024 * 1024))
         .add_service(
@@ -367,6 +384,16 @@ pub async fn serve_node(
         )
         .add_service(
             ClientServiceServer::new(client_svc)
+                .max_decoding_message_size(32 * 1024 * 1024)
+                .max_encoding_message_size(32 * 1024 * 1024),
+        )
+        .add_service(
+            ShuffleServiceServer::new(shuffle_svc)
+                .max_decoding_message_size(32 * 1024 * 1024)
+                .max_encoding_message_size(32 * 1024 * 1024),
+        )
+        .add_service(
+            TwopcServiceServer::new(twopc_svc)
                 .max_decoding_message_size(32 * 1024 * 1024)
                 .max_encoding_message_size(32 * 1024 * 1024),
         )
@@ -474,11 +501,17 @@ pub async fn replicate_to_all(raft: &Arc<RaftConsensus>, peers: &Arc<PeerClients
             else {
                 return;
             };
+            let is_heartbeat = entries.is_empty();
+            let t0 = Instant::now();
             match peers
                 .append_entries(peer, term, leader_id, prev_idx, prev_term, entries, commit)
                 .await
             {
                 Ok(resp) => {
+                    raft.engine().metrics().record_raft_append(t0.elapsed());
+                    if is_heartbeat {
+                        raft.engine().metrics().record_raft_heartbeat();
+                    }
                     raft.maybe_step_down(resp.term);
                     if resp.success {
                         raft.on_append_success(peer, resp.match_index);

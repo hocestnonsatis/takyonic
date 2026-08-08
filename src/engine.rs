@@ -21,7 +21,7 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -31,10 +31,12 @@ use tracing::{debug, info, warn};
 
 use crate::admission::{AdmissionController, AdmissionOutcome};
 use crate::bpm::{BufferPoolManager, DEFAULT_LRU_K};
-use crate::compaction::{CompactionEngine, SstManager, SstMeta};
+use crate::compaction::{
+    CompactionEngine, SstManager, SstMeta, split_entries_by_max_bytes, sst_object_key,
+};
 use crate::config::Config;
 use crate::consensus::{RaftConsensus, Role};
-use crate::disk::{DiskManager, REMOTE_PAGES_KEY};
+use crate::disk::{DiskManager, PAGES_V2_PREFIX, REMOTE_PAGES_KEY};
 use crate::error::{Result, TakyonicError};
 use crate::manifest::{ManifestManager, ManifestSst, StorageManifest};
 use crate::memtable::Memtable;
@@ -43,14 +45,17 @@ use crate::query::Query;
 use crate::raft::{BatchApplyResult, CommittedEntry, LocalRaftNode, RaftCommand};
 use crate::hnsw::HnswIndex;
 use crate::rbac::{AuthCatalog, SharedAuthCatalog};
-use crate::schema::{IndexDef, Record, TableSchema, data_table_prefix, index_table_prefix};
+use crate::schema::{
+    ColumnSpec, IndexDef, Record, TableSchema, data_table_prefix, index_table_prefix,
+};
 use crate::vacuum::VacuumStats;
 use crate::snapshot::{SnapshotPayload, snapshot_sst_path};
 use crate::sst::{SstRegistry, SstWriter};
 use crate::stats::{self, StatsCatalog, TableStats};
 use crate::telemetry::{EngineMetrics, MetricsManager};
-use crate::txn::{StatsEdit, Transaction, TxnTracker, WriteOp};
+use crate::txn::{IsolationLevel, SsiRegistry, StatsEdit, Transaction, TxnTracker, WriteOp};
 use crate::txn_wal::{WalManager, WalRecord, records_from_writes};
+use crate::dtxn::TransactionCoordinator;
 use crate::types::{CommitTs, Entry, Key, Value};
 use crate::vector::{VectorIndexSpec, VectorValue};
 use crate::wal::{WalReader, WalWriter, segment_path};
@@ -84,12 +89,16 @@ pub struct TakyonicEngine {
     metrics_manager: Mutex<Option<MetricsManager>>,
     /// Active snapshot transactions (watermark = min read_ts).
     txn_tracker: TxnTracker,
+    /// SERIALIZABLE SSI doom registry (rw-antidependency first-cut).
+    ssi: Mutex<SsiRegistry>,
     /// Serializes OCC validation + commit assignment.
     txn_commit_mu: Mutex<()>,
     /// Latest committed timestamp per user key (OCC index).
     last_commit: Mutex<BTreeMap<Key, CommitTs>>,
     /// Registered table schemas for secondary-index projection.
     schemas: RwLock<BTreeMap<String, TableSchema>>,
+    /// In-memory object comments (`COMMENT ON` / `obj_description` / `col_description`).
+    comments: Arc<parking_lot::RwLock<BTreeMap<String, String>>>,
     /// In-memory HNSW graphs keyed by index name (snapshotted under `HNSW_<name>`).
     hnsw: RwLock<HashMap<String, Arc<HnswIndex>>>,
     /// RBAC / user catalog (`data_dir/AUTH`).
@@ -112,6 +121,22 @@ pub struct TakyonicEngine {
     /// Uses [`Weak`] to avoid an `Engine ↔ RaftConsensus` reference cycle.
     /// When set, local proposes are gated / proxied through quorum Raft.
     distributed_raft: Mutex<Option<Weak<RaftConsensus>>>,
+    /// Prepared 2PC write-sets (durable via [`RaftCommand::TxnPrepare`]).
+    prepared_2pc: Mutex<std::collections::HashMap<u64, Vec<(Key, Option<Value>)>>>,
+    /// Exclusive prepare locks for cross-shard 2PC.
+    locks_2pc: Mutex<std::collections::HashMap<Key, u64>>,
+    /// Chaos: next 2PC prepare fails.
+    twopc_fail_prepare: AtomicBool,
+    /// Chaos: after durable PREPARE, fail ACK / subsequent commit/abort.
+    twopc_crash_after_prepare: AtomicBool,
+    /// Logical shard id for [`crate::dtxn::EngineShard`] (defaults to 0).
+    shard_id: AtomicU64,
+    /// MPP worker directory (local slots or cluster endpoints) when `mpp_enabled`.
+    mpp_workers: Mutex<Vec<crate::mpp::WorkerEndpoint>>,
+    /// Optional test / cluster [`FragmentDispatcher`] attached to new coordinators.
+    mpp_dispatcher: Mutex<Option<Arc<dyn crate::mpp::FragmentDispatcher>>>,
+    /// Shared 2PC coordinator with durable decision log under `data_dir`.
+    txn_coordinator: Arc<TransactionCoordinator>,
 }
 
 impl TakyonicEngine {
@@ -145,35 +170,53 @@ impl TakyonicEngine {
         fs::create_dir_all(&config.data_dir)?;
         fs::create_dir_all(&config.wal_dir)?;
 
-        let (manifest, pages_key) = if let Some(store) = &remote {
+        let (manifest, pages_key, pages_prefix, chunk_size) = if let Some(store) = &remote {
             let mgr = Arc::new(ManifestManager::open(Arc::clone(store))?);
-            let key = {
-                let cur = mgr.current();
-                if cur.pages_key.is_empty() {
-                    REMOTE_PAGES_KEY.to_string()
-                } else {
-                    cur.pages_key.clone()
+            let cur = mgr.current();
+            let key = if cur.pages_key.is_empty() {
+                REMOTE_PAGES_KEY.to_string()
+            } else {
+                cur.pages_key.clone()
+            };
+            let prefix = if cur.pages_prefix.is_empty() {
+                PAGES_V2_PREFIX.to_string()
+            } else {
+                cur.pages_prefix.clone()
+            };
+            let chunk = match cur.pages_layout {
+                crate::manifest::PagesLayout::ChunkV2 { chunk_size } if chunk_size > 0 => {
+                    chunk_size as usize
                 }
+                _ => config.object_pages_chunk_bytes,
             };
             info!(
-                version = mgr.current().version,
-                sst = mgr.current().sstables.len(),
+                version = cur.version,
+                sst = cur.sstables.len(),
                 pages = %key,
+                pages_prefix = %prefix,
+                chunk_size = chunk,
                 "engine open: loaded remote storage manifest"
             );
-            (Some(mgr), key)
+            (Some(mgr), key, prefix, chunk)
         } else {
-            (None, REMOTE_PAGES_KEY.to_string())
+            (
+                None,
+                REMOTE_PAGES_KEY.to_string(),
+                PAGES_V2_PREFIX.to_string(),
+                config.object_pages_chunk_bytes,
+            )
         };
 
         let registry = Arc::new(SstRegistry::new());
         let metrics = Arc::new(EngineMetrics::new());
         let buffer_pool = if config.bpm_pool_size > 0 {
-            let disk = Arc::new(DiskManager::open_with_remote(
+            let disk = Arc::new(DiskManager::open_with_remote_layout(
                 &config.data_dir,
                 config.bpm_page_size,
                 remote.clone(),
                 pages_key,
+                pages_prefix,
+                chunk_size,
             )?);
             let bpm = BufferPoolManager::new_with_metrics(
                 disk,
@@ -197,10 +240,17 @@ impl TakyonicEngine {
             DEFAULT_LEVEL_COUNT,
             1,
         )?);
+        manager.set_max_sst_bytes(config.max_sst_bytes);
+        if let Some(store) = &remote {
+            manager.attach_remote(Arc::clone(store));
+        }
         let admission = Arc::new(AdmissionController::new(Arc::clone(&manager), &config)?);
         let compaction = CompactionEngine::new(Arc::clone(&manager), &config)?;
 
         recover_existing_ssts(&manager)?;
+        if let Some(mgr) = &manifest {
+            hydrate_ssts_from_manifest(&manager, &mgr.current())?;
+        }
         let (wal, memtable, mut next_seq, wal_segment) = recover_wal(&config.wal_dir)?;
         // WAL segments are pruned after flush/close, so replay alone can
         // under-estimate the sequence domain. The durable SEQNO marker keeps
@@ -267,6 +317,11 @@ impl TakyonicEngine {
             None
         };
 
+        let txn_coordinator = TransactionCoordinator::open(
+            &config.data_dir,
+            Some(Arc::clone(&metrics)),
+        )?;
+
         let engine = Self {
             config,
             raft: Mutex::new(Some(raft)),
@@ -281,9 +336,11 @@ impl TakyonicEngine {
             metrics,
             metrics_manager: Mutex::new(metrics_manager),
             txn_tracker: TxnTracker::new(),
+            ssi: Mutex::new(SsiRegistry::default()),
             txn_commit_mu: Mutex::new(()),
             last_commit: Mutex::new(BTreeMap::new()),
             schemas: RwLock::new(BTreeMap::new()),
+            comments: Arc::new(RwLock::new(BTreeMap::new())),
             hnsw: RwLock::new(HashMap::new()),
             auth: Arc::new(RwLock::new(AuthCatalog::new())),
             stats: StatsCatalog::new(),
@@ -292,7 +349,20 @@ impl TakyonicEngine {
             buffer_pool,
             manifest,
             distributed_raft: Mutex::new(None),
+            prepared_2pc: Mutex::new(std::collections::HashMap::new()),
+            locks_2pc: Mutex::new(std::collections::HashMap::new()),
+            twopc_fail_prepare: AtomicBool::new(false),
+            twopc_crash_after_prepare: AtomicBool::new(false),
+            shard_id: AtomicU64::new(0),
+            mpp_workers: Mutex::new(Vec::new()),
+            mpp_dispatcher: Mutex::new(None),
+            txn_coordinator,
         };
+
+        if engine.config.mpp_enabled {
+            // Default: 3 in-process partition slots (single-node MPP simulation).
+            engine.set_mpp_workers(default_local_mpp_workers(3));
+        }
 
         // Seed an empty remote manifest on first attach; otherwise keep the
         // cluster's CURRENT.json as the source of truth (do not bump on open).
@@ -310,6 +380,24 @@ impl TakyonicEngine {
             for schema in schemas.values() {
                 let _ = engine.storage.register_table(schema);
                 engine.stats.register_table(schema);
+            }
+        }
+        // Durable sequences / SERIAL (survive reopen).
+        crate::sql::load_sequences(&engine.config.data_dir)?;
+        // B-Tree mirrors are process-local; rebuild them from durable LSM so
+        // cold reopen sees the same rows (LSM = source of truth).
+        {
+            let btree_tables: Vec<String> = engine
+                .schemas
+                .read()
+                .values()
+                .filter(|s| s.storage_engine == crate::storage::StorageEngineKind::BTree)
+                .map(|s| s.name.clone())
+                .collect();
+            for name in btree_tables {
+                if let Err(e) = engine.hydrate_btree_from_lsm(&name) {
+                    warn!(table = %name, error = %e, "B-Tree hydrate from LSM failed");
+                }
             }
         }
         // Load HNSW snapshots for every vector index.
@@ -334,6 +422,11 @@ impl TakyonicEngine {
         {
             let auth = AuthCatalog::load(&engine.config.data_dir)?;
             *engine.auth.write() = auth;
+        }
+        // Overlay persisted COMMENT ON descriptions.
+        {
+            let comments = load_comments(&engine.config.data_dir)?;
+            *engine.comments.write() = comments;
         }
         // Overlay persisted ANALYZE statistics (row counts, NDV, MCV, histograms).
         let persisted = stats::load_stats(&engine.config.data_dir)?;
@@ -365,6 +458,90 @@ impl TakyonicEngine {
         );
     }
 
+    /// Set the logical 2PC shard id (typically the Raft node id).
+    pub fn set_shard_id(&self, id: u64) {
+        self.shard_id.store(id, Ordering::Relaxed);
+    }
+
+    /// Shared 2PC coordinator (durable decision log under this engine's `data_dir`).
+    pub fn txn_coordinator(&self) -> Arc<TransactionCoordinator> {
+        Arc::clone(&self.txn_coordinator)
+    }
+
+    /// Logical 2PC shard id.
+    pub fn shard_id(&self) -> u64 {
+        self.shard_id.load(Ordering::Relaxed)
+    }
+
+    /// Chaos: next distributed prepare fails.
+    pub fn inject_twopc_prepare_failure(&self, on: bool) {
+        self.twopc_fail_prepare.store(on, Ordering::SeqCst);
+    }
+
+    /// Chaos: durable PREPARE then fail ACK / phase-2 RPCs.
+    pub fn inject_twopc_crash_after_prepare(&self, on: bool) {
+        self.twopc_crash_after_prepare.store(on, Ordering::SeqCst);
+    }
+
+    /// Replace the MPP worker directory (cluster membership or local sim slots).
+    pub fn set_mpp_workers(&self, workers: Vec<crate::mpp::WorkerEndpoint>) {
+        *self.mpp_workers.lock() = workers;
+    }
+
+    /// Current MPP / partition worker directory (empty when unset).
+    pub fn mpp_workers(&self) -> Vec<crate::mpp::WorkerEndpoint> {
+        self.mpp_workers.lock().clone()
+    }
+
+    /// Attach a pluggable fragment dispatcher used by [`Self::mpp_coordinator`].
+    ///
+    /// When set, this overrides the auto-wired gRPC dispatcher (tests / custom
+    /// cluster wiring). Pass `None` to clear.
+    pub fn set_mpp_dispatcher(
+        &self,
+        dispatcher: Option<Arc<dyn crate::mpp::FragmentDispatcher>>,
+    ) {
+        *self.mpp_dispatcher.lock() = dispatcher;
+    }
+
+    /// Number of MPP workers / partitions (0 when MPP disabled / empty).
+    pub fn mpp_worker_count(&self) -> usize {
+        if !self.config.mpp_enabled {
+            return 0;
+        }
+        self.mpp_workers.lock().len()
+    }
+
+    /// Build an in-process [`crate::mpp::Coordinator`] when `mpp_enabled`.
+    pub fn mpp_coordinator(self: &Arc<Self>) -> Result<crate::mpp::Coordinator> {
+        if !self.config.mpp_enabled {
+            return Err(TakyonicError::Config(
+                "MPP is disabled (set Config::mpp_enabled)".into(),
+            ));
+        }
+        let workers = self.mpp_workers.lock().clone();
+        if workers.is_empty() {
+            return Err(TakyonicError::Config(
+                "MPP enabled but no workers configured".into(),
+            ));
+        }
+        let shuffle = Arc::new(crate::shuffle::ShuffleManager::new(
+            crate::shuffle::DEFAULT_SHUFFLE_BUFFER,
+            Some(Arc::clone(&self.metrics)),
+        ));
+        let coord = crate::mpp::Coordinator::local(
+            Arc::clone(self),
+            shuffle,
+            workers,
+        );
+        if let Some(d) = self.mpp_dispatcher.lock().clone() {
+            coord.set_dispatcher(d);
+        } else {
+            coord.attach_grpc_dispatcher(Some(self.shard_id()));
+        }
+        Ok(coord)
+    }
+
     /// Insert or overwrite `key`.
     ///
     /// Submits a Raft proposal; visibility requires group-commit durability.
@@ -387,6 +564,14 @@ impl TakyonicEngine {
     /// Takes `&Arc<Self>` so the returned [`Transaction`] can outlive a single
     /// stack borrow and be stored in session state.
     pub fn begin(self: &Arc<Self>) -> Result<Transaction> {
+        self.begin_with_isolation(IsolationLevel::Snapshot)
+    }
+
+    /// Begin a transaction at the given isolation level.
+    pub fn begin_with_isolation(
+        self: &Arc<Self>,
+        isolation: IsolationLevel,
+    ) -> Result<Transaction> {
         self.ensure_open()?;
         let read_ts = self
             .raft_node()?
@@ -395,7 +580,20 @@ impl TakyonicEngine {
         let txn_id = self.txn_tracker.begin(read_ts);
         self.metrics.txn_begin();
         self.publish_watermark();
-        Ok(Transaction::new(Arc::clone(self), txn_id, read_ts))
+        Ok(Transaction::new_with_isolation(
+            Arc::clone(self),
+            txn_id,
+            read_ts,
+            isolation,
+        ))
+    }
+
+    pub(crate) fn ssi_register(&self, txn_id: u64) {
+        self.ssi.lock().register(txn_id);
+    }
+
+    pub(crate) fn ssi_note_read(&self, txn_id: u64, key: &Key) {
+        self.ssi.lock().note_read(txn_id, key);
     }
 
     /// Snapshot read: highest version with `commit_ts <= read_ts`.
@@ -458,6 +656,7 @@ impl TakyonicEngine {
     }
 
     pub(crate) fn end_transaction(&self, txn_id: u64) {
+        self.ssi.lock().unregister(txn_id);
         self.txn_tracker.end(txn_id);
         self.metrics.txn_end();
         self.publish_watermark();
@@ -480,6 +679,7 @@ impl TakyonicEngine {
         &self,
         txn_id: u64,
         read_ts: CommitTs,
+        isolation: IsolationLevel,
         reads: &BTreeMap<Key, CommitTs>,
         writes: &BTreeMap<Key, WriteOp>,
         stats_edits: &[StatsEdit],
@@ -494,7 +694,19 @@ impl TakyonicEngine {
         // Serialize OCC validate with propose so two overlapping SI
         // transactions cannot both pass validation before either commits.
         let _occ = self.txn_commit_mu.lock();
+        if isolation.is_serializable() && self.ssi.lock().is_doomed(txn_id) {
+            self.end_transaction(txn_id);
+            return Err(TakyonicError::Conflict(
+                "SSI conflict: concurrent write to a key this transaction read \
+                 (write-skew / rw-antidependency)"
+                    .into(),
+            ));
+        }
         let ops = self.prepare_txn_commit_unlocked(txn_id, read_ts, reads, writes)?;
+        if isolation.is_serializable() {
+            let wk = crate::txn::write_keys(writes);
+            self.ssi.lock().doom_concurrent_readers(txn_id, &wk);
+        }
         // WAL-before-data: durable Commit must hit disk before memtable apply.
         self.log_txn_wal(txn_id, writes)?;
 
@@ -634,6 +846,9 @@ impl TakyonicEngine {
     }
 
     /// Mirror committed keys belonging to B-Tree tables into [`StorageManager`].
+    ///
+    /// Durable bytes already live in LSM via the Raft apply path; this keeps
+    /// the process-local B-Tree cache coherent for subsequent SI reads.
     fn mirror_btree_writes(&self, writes: &BTreeMap<Key, WriteOp>, commit_ts: CommitTs) {
         for (key, op) in writes {
             let Some(table) = crate::schema::table_from_user_key(key) else {
@@ -674,6 +889,13 @@ impl TakyonicEngine {
             StatsEdit::VectorDelete { index, pk } => {
                 self.hnsw_delete(index, pk);
             }
+        }
+    }
+
+    /// Apply deferred transaction stats / vector edits after a successful commit.
+    pub fn apply_txn_stats_edits(&self, edits: &[StatsEdit]) {
+        for edit in edits {
+            self.apply_stats_edit(edit);
         }
     }
 
@@ -730,19 +952,584 @@ impl TakyonicEngine {
         }
     }
 
-    /// Register a table schema (enables `put_record` / CBO queries).
-    ///
-    /// Persists the catalog to `data_dir/CATALOG`.
-    pub fn register_table(&self, schema: TableSchema) -> Result<()> {
+    /// Phase-1 2PC prepare: OCC + locks + durable [`RaftCommand::TxnPrepare`].
+    pub fn twopc_prepare(
+        &self,
+        txn_id: u64,
+        read_ts: CommitTs,
+        writes: &[(Key, Option<Value>)],
+        reads: &[(Key, CommitTs)],
+    ) -> Result<()> {
         self.ensure_open()?;
-        self.stats.register_table(&schema);
-        self.storage.register_table(&schema)?;
+        if self.twopc_fail_prepare.load(Ordering::SeqCst) {
+            return Err(TakyonicError::Network(format!(
+                "shard {}: injected prepare failure",
+                self.shard_id()
+            )));
+        }
+
+        let _occ = self.txn_commit_mu.lock();
         {
-            let mut schemas = self.schemas.write();
-            schemas.insert(schema.name.clone(), schema);
-            crate::catalog::save_catalog(&self.config.data_dir, &schemas)?;
+            let last = self.last_commit.lock();
+            for (key, _) in reads {
+                if let Some(&ts) = last.get(key) {
+                    if ts > read_ts {
+                        return Err(TakyonicError::Conflict(format!(
+                            "shard {}: key {:?} committed at {ts} > read_ts {read_ts}",
+                            self.shard_id(),
+                            String::from_utf8_lossy(key.as_bytes())
+                        )));
+                    }
+                }
+            }
+            for (key, _) in writes {
+                if let Some(&ts) = last.get(key) {
+                    if ts > read_ts {
+                        return Err(TakyonicError::Conflict(format!(
+                            "shard {}: write key {:?} committed at {ts} > read_ts {read_ts}",
+                            self.shard_id(),
+                            String::from_utf8_lossy(key.as_bytes())
+                        )));
+                    }
+                }
+            }
+        }
+
+        {
+            let mut locks = self.locks_2pc.lock();
+            for (k, _) in writes {
+                if let Some(owner) = locks.get(k) {
+                    if *owner != txn_id {
+                        return Err(TakyonicError::Conflict(format!(
+                            "shard {}: key locked by txn {owner}",
+                            self.shard_id()
+                        )));
+                    }
+                }
+            }
+            for (k, _) in writes {
+                locks.insert(k.clone(), txn_id);
+            }
+        }
+
+        let cmd = RaftCommand::txn_prepare(txn_id, read_ts, writes.to_vec());
+        if let Err(e) = self.propose_twopc(cmd) {
+            let mut locks = self.locks_2pc.lock();
+            for (k, _) in writes {
+                if locks.get(k) == Some(&txn_id) {
+                    locks.remove(k);
+                }
+            }
+            return Err(e);
+        }
+
+        if self.twopc_crash_after_prepare.load(Ordering::SeqCst) {
+            return Err(TakyonicError::Network(format!(
+                "shard {}: crashed after PREPARED",
+                self.shard_id()
+            )));
         }
         Ok(())
+    }
+
+    /// Phase-2 2PC commit: durable [`RaftCommand::TxnCommit`] + LSM apply.
+    pub fn twopc_commit(&self, txn_id: u64, commit_ts: CommitTs) -> Result<()> {
+        self.ensure_open()?;
+        if self.twopc_crash_after_prepare.load(Ordering::SeqCst) {
+            return Err(TakyonicError::Network(format!(
+                "shard {}: down (cannot commit)",
+                self.shard_id()
+            )));
+        }
+        let writes = self
+            .prepared_2pc
+            .lock()
+            .get(&txn_id)
+            .cloned()
+            .ok_or_else(|| {
+                TakyonicError::Engine(format!(
+                    "shard {}: commit for unknown prepared txn {txn_id}",
+                    self.shard_id()
+                ))
+            })?;
+        self.propose_twopc(RaftCommand::txn_commit(txn_id, commit_ts, writes))
+    }
+
+    /// Phase-2 2PC abort: durable [`RaftCommand::TxnAbort`].
+    pub fn twopc_abort(&self, txn_id: u64) -> Result<()> {
+        self.ensure_open()?;
+        if self.twopc_crash_after_prepare.load(Ordering::SeqCst) {
+            return Err(TakyonicError::Network(format!(
+                "shard {}: down (cannot abort)",
+                self.shard_id()
+            )));
+        }
+        self.propose_twopc(RaftCommand::txn_abort(txn_id))
+    }
+
+    /// Txn ids still in `Prepared` (recovery / coordinator query).
+    pub fn twopc_orphaned_prepared(&self) -> Vec<u64> {
+        self.prepared_2pc.lock().keys().copied().collect()
+    }
+
+    /// Rebuild in-memory prepared/locks from the durable Raft log (crash recovery).
+    ///
+    /// Committed writes are assumed already applied to the LSM; this only
+    /// restores orphaned `PREPARED` records so the coordinator can abort/commit.
+    pub fn twopc_recover_from_raft_log(&self) -> Result<()> {
+        self.ensure_open()?;
+        let Some(raft) = self.upgrade_distributed_raft() else {
+            // Embedded stand-in has no durable 2PC command log to scan.
+            return Ok(());
+        };
+        let log = raft.log();
+        let start = log.snapshot_meta().last_included_index.saturating_add(1);
+        let last = log.last_index();
+
+        let mut prepared = std::collections::HashMap::new();
+        let mut locks = std::collections::HashMap::new();
+        for idx in start..=last {
+            let Some(entry) = log.entry(idx) else {
+                continue;
+            };
+            let Ok(cmd) = RaftCommand::decode(entry.command.clone()) else {
+                continue;
+            };
+            match cmd {
+                RaftCommand::TxnPrepare { txn_id, ops, .. } => {
+                    for (k, _) in &ops {
+                        locks.insert(k.clone(), txn_id);
+                    }
+                    prepared.insert(txn_id, ops);
+                }
+                RaftCommand::TxnCommit { txn_id, ops, .. } => {
+                    prepared.remove(&txn_id);
+                    for (k, _) in &ops {
+                        locks.remove(k);
+                    }
+                }
+                RaftCommand::TxnAbort { txn_id } => {
+                    if let Some(ops) = prepared.remove(&txn_id) {
+                        for (k, _) in &ops {
+                            locks.remove(k);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        *self.prepared_2pc.lock() = prepared;
+        *self.locks_2pc.lock() = locks;
+        Ok(())
+    }
+
+    /// Propose a 2PC command; local stand-in also applies prepared/abort side effects.
+    fn propose_twopc(&self, command: RaftCommand) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let _ = self.block_on_propose(&raft, command)?;
+            return Ok(());
+        }
+        let node = self.raft_node()?;
+        let _ = node.propose(command.clone())?;
+        self.apply_twopc_side_effect(&command)?;
+        Ok(())
+    }
+
+    fn apply_twopc_side_effect(&self, command: &RaftCommand) -> Result<()> {
+        match command {
+            RaftCommand::TxnPrepare { txn_id, ops, .. } => {
+                {
+                    let mut locks = self.locks_2pc.lock();
+                    for (k, _) in ops {
+                        locks.insert(k.clone(), *txn_id);
+                    }
+                }
+                self.prepared_2pc.lock().insert(*txn_id, ops.clone());
+                Ok(())
+            }
+            RaftCommand::TxnAbort { txn_id } => {
+                if let Some(writes) = self.prepared_2pc.lock().remove(txn_id) {
+                    let mut locks = self.locks_2pc.lock();
+                    for (k, _) in &writes {
+                        locks.remove(k);
+                    }
+                }
+                Ok(())
+            }
+            RaftCommand::TxnCommit {
+                txn_id,
+                commit_ts,
+                ops,
+            } => {
+                self.prepared_2pc.lock().remove(txn_id);
+                {
+                    let mut locks = self.locks_2pc.lock();
+                    for (k, _) in ops {
+                        locks.remove(k);
+                    }
+                }
+                self.note_committed_keys(ops.iter().map(|(k, _)| k.clone()), *commit_ts);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Register a table schema (enables `put_record` / CBO queries).
+    ///
+    /// Persists the catalog to `data_dir/CATALOG`. With distributed Raft attached,
+    /// proposes [`RaftCommand::CatalogUpsert`] and installs on apply (all replicas).
+    pub fn register_table(&self, schema: TableSchema) -> Result<()> {
+        self.ensure_open()?;
+        self.replicate_or_install_schema(schema)
+    }
+
+    /// Install one table into the local catalog (stats, storage router, `CATALOG` file).
+    fn install_catalog_schema(&self, schema: TableSchema) -> Result<()> {
+        self.stats.register_table(&schema);
+        self.storage.register_table(&schema)?;
+        let name = schema.name.clone();
+        let is_btree = schema.storage_engine == crate::storage::StorageEngineKind::BTree;
+        let mut schemas = self.schemas.write();
+        schemas.insert(schema.name.clone(), schema);
+        crate::catalog::save_catalog(&self.config.data_dir, &schemas)?;
+        drop(schemas);
+        // New tables usually have no LSM rows yet; hydrate is a no-op then.
+        // Replica apply / late register may already have durable keys.
+        if is_btree {
+            let _ = self.hydrate_btree_from_lsm(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the in-memory B-Tree mirror for `table` from durable LSM versions.
+    ///
+    /// Durability contract: Raft/WAL → LSM is the source of truth for `BTREE`
+    /// tables. The B-Tree is a read-optimized cache kept in sync by
+    /// [`Self::mirror_btree_writes`] and rebuilt here on open / register.
+    fn hydrate_btree_from_lsm(&self, table: &str) -> Result<u64> {
+        if self.storage.engine_kind(table) != crate::storage::StorageEngineKind::BTree {
+            return Ok(0);
+        }
+        let store = self.storage.btree(table)?;
+        let mut applied = 0u64;
+        for prefix in [data_table_prefix(table), index_table_prefix(table)] {
+            for entry in self.collect_versions_prefix(prefix.as_ref())? {
+                store.apply(entry);
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            debug!(table = %table, versions = applied, "hydrated B-Tree mirror from LSM");
+        }
+        Ok(applied)
+    }
+
+    /// Remove one table from the local catalog file (does not tombstone rows).
+    fn remove_catalog_schema(&self, name: &str) -> Result<()> {
+        let mut schemas = self.schemas.write();
+        schemas.remove(name);
+        crate::catalog::save_catalog(&self.config.data_dir, &schemas)?;
+        Ok(())
+    }
+
+    /// Leader proposes catalog upsert when distributed Raft is attached; else local install.
+    fn replicate_or_install_schema(&self, schema: TableSchema) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let _ = self.block_on_propose(&raft, RaftCommand::catalog_upsert(&schema))?;
+            return Ok(());
+        }
+        self.install_catalog_schema(schema)
+    }
+
+    /// Leader proposes catalog drop when distributed Raft is attached; else local remove.
+    fn replicate_or_remove_schema(&self, name: &str) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let _ = self.block_on_propose(&raft, RaftCommand::catalog_drop(name))?;
+            return Ok(());
+        }
+        self.remove_catalog_schema(name)
+    }
+
+    /// Create a table from SQL DDL (`CREATE TABLE`), persist catalog columns.
+    pub fn create_table(
+        &self,
+        name: &str,
+        primary_key: &str,
+        columns: Vec<ColumnSpec>,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if self.schemas.read().contains_key(name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(TakyonicError::Engine(format!(
+                "table `{name}` already exists"
+            )));
+        }
+        if columns.is_empty() {
+            return Err(TakyonicError::Sql(
+                "CREATE TABLE requires at least one column".into(),
+            ));
+        }
+        if !columns.iter().any(|c| c.name == primary_key) {
+            return Err(TakyonicError::Sql(format!(
+                "PRIMARY KEY column `{primary_key}` is not in the column list"
+            )));
+        }
+        let schema = TableSchema::new(name, primary_key, Vec::new()).with_columns(columns);
+        self.register_table(schema)
+    }
+
+    /// Drop a table from the catalog and tombstone its `Data_` / `Idx_` keys.
+    pub fn drop_table(self: &Arc<Self>, name: &str, if_exists: bool) -> Result<()> {
+        self.ensure_open()?;
+        let schema = match self.table_schema(name) {
+            Ok(s) => s,
+            Err(_) if if_exists => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        // Drop secondary / vector indexes first (catalog + keys / HNSW).
+        let index_names: Vec<String> = schema.indexes.iter().map(|i| i.name.clone()).collect();
+        for idx_name in index_names {
+            self.drop_index(&idx_name, true)?;
+        }
+
+        // Tombstone heap rows under Data_<table>_.
+        let prefix = data_table_prefix(name);
+        let read_ts = self.last_applied();
+        let keys = self.scan_prefix_keys(&prefix, read_ts)?;
+        if !keys.is_empty() {
+            let mut txn = self.begin()?;
+            for key in keys {
+                txn.delete(key)?;
+            }
+            txn.commit()?;
+        }
+
+        self.replicate_or_remove_schema(name)?;
+        crate::sql::drop_sequences_owned_by_table(name);
+        Ok(())
+    }
+
+    /// Apply `ALTER TABLE` ADD/DROP/RENAME operations and persist the catalog.
+    pub fn alter_table(
+        self: &Arc<Self>,
+        name: &str,
+        operations: &[crate::sql::AlterTableOp],
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut current = name.to_string();
+        for op in operations {
+            match op {
+                crate::sql::AlterTableOp::AddColumn {
+                    column,
+                    if_not_exists,
+                    ..
+                } => self.add_column(&current, column, *if_not_exists)?,
+                crate::sql::AlterTableOp::DropColumn {
+                    name: col,
+                    if_exists,
+                } => self.drop_column(&current, col, *if_exists)?,
+                crate::sql::AlterTableOp::RenameColumn { old_name, new_name } => {
+                    self.rename_column(&current, old_name, new_name)?
+                }
+                crate::sql::AlterTableOp::RenameTable { new_name } => {
+                    self.rename_table(&current, new_name)?;
+                    current = new_name.clone();
+                }
+                crate::sql::AlterTableOp::SetDataType { name: col, data_type } => {
+                    self.set_column_type(&current, col, data_type)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_column(&self, table: &str, column: &ColumnSpec, if_not_exists: bool) -> Result<()> {
+        let mut schema = self.table_schema(table)?;
+        if schema.columns.iter().any(|c| c.name == column.name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(TakyonicError::Sql(format!(
+                "column `{}` already exists on table `{table}`",
+                column.name
+            )));
+        }
+        // Legacy tables with empty columns: seed PK so catalog stays coherent.
+        if schema.columns.is_empty() {
+            schema.columns.push(ColumnSpec::new(
+                schema.primary_key.clone(),
+                "TEXT",
+            ));
+        }
+        schema.columns.push(column.clone());
+        self.replicate_or_install_schema(schema)
+    }
+
+    fn drop_column(
+        self: &Arc<Self>,
+        table: &str,
+        column: &str,
+        if_exists: bool,
+    ) -> Result<()> {
+        let schema = self.table_schema(table)?;
+        if column == schema.primary_key {
+            return Err(TakyonicError::Sql(format!(
+                "cannot DROP primary key column `{column}`"
+            )));
+        }
+        let has_col = schema.columns.iter().any(|c| c.name == column);
+        if !has_col {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(TakyonicError::Sql(format!(
+                "column `{column}` does not exist on table `{table}`"
+            )));
+        }
+
+        // Drop secondary / vector indexes that reference this column.
+        let index_names: Vec<String> = schema
+            .indexes
+            .iter()
+            .filter(|i| i.column == column)
+            .map(|i| i.name.clone())
+            .collect();
+        for idx_name in index_names {
+            self.drop_index(&idx_name, true)?;
+        }
+
+        let mut schema = self.table_schema(table)?;
+        schema.columns.retain(|c| c.name != column);
+        self.replicate_or_install_schema(schema)?;
+        crate::sql::drop_sequence_owned_by_column(table, column);
+        Ok(())
+    }
+
+    fn rename_column(self: &Arc<Self>, table: &str, old_name: &str, new_name: &str) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        let schema = self.table_schema(table)?;
+        let has_old = schema.columns.iter().any(|c| c.name == old_name)
+            || schema.primary_key == old_name;
+        if !has_old {
+            return Err(TakyonicError::Sql(format!(
+                "column `{old_name}` does not exist on table `{table}`"
+            )));
+        }
+        if schema.columns.iter().any(|c| c.name == new_name) || schema.primary_key == new_name {
+            return Err(TakyonicError::Sql(format!(
+                "column `{new_name}` already exists on table `{table}`"
+            )));
+        }
+
+        // Rewrite rows under the old catalog so index deletes see old field names.
+        let mut txn = self.begin()?;
+        let rows = txn.scan_table_records(table)?;
+        let old_pk_field = schema.primary_key.clone();
+        for row in &rows {
+            let pk = row.get(&old_pk_field).ok_or_else(|| {
+                TakyonicError::Sql(format!(
+                    "row missing primary key `{old_pk_field}` during RENAME COLUMN"
+                ))
+            })?;
+            txn.delete_record(table, pk)?;
+        }
+        txn.commit()?;
+
+        let mut schema = self.table_schema(table)?;
+        for col in &mut schema.columns {
+            if col.name == old_name {
+                col.name = new_name.to_string();
+            }
+        }
+        if schema.primary_key == old_name {
+            schema.primary_key = new_name.to_string();
+        }
+        for idx in &mut schema.indexes {
+            if idx.column == old_name {
+                idx.column = new_name.to_string();
+            }
+        }
+        self.replicate_or_install_schema(schema)?;
+
+        if !rows.is_empty() {
+            let mut txn = self.begin()?;
+            for mut row in rows {
+                if let Some(val) = row.fields.remove(old_name) {
+                    row.fields.insert(new_name.to_string(), val);
+                }
+                txn.put_record(table, row)?;
+            }
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    fn rename_table(self: &Arc<Self>, old_name: &str, new_name: &str) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        if self.schemas.read().contains_key(new_name) {
+            return Err(TakyonicError::Sql(format!(
+                "table `{new_name}` already exists"
+            )));
+        }
+        let schema = self.table_schema(old_name)?;
+        let mut txn = self.begin()?;
+        let rows = txn.scan_table_records(old_name)?;
+        let pk_field = schema.primary_key.clone();
+        for row in &rows {
+            let pk = row.get(&pk_field).ok_or_else(|| {
+                TakyonicError::Sql(format!(
+                    "row missing primary key `{pk_field}` during RENAME TABLE"
+                ))
+            })?;
+            txn.delete_record(old_name, pk)?;
+        }
+        txn.commit()?;
+
+        // Move catalog entry (indexes stay on the schema object).
+        let mut new_schema = schema;
+        new_schema.name = new_name.to_string();
+        self.replicate_or_remove_schema(old_name)?;
+        self.replicate_or_install_schema(new_schema)?;
+
+        if !rows.is_empty() {
+            let mut txn = self.begin()?;
+            for row in rows {
+                txn.put_record(new_name, row)?;
+            }
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    fn set_column_type(&self, table: &str, column: &str, data_type: &str) -> Result<()> {
+        let mut schema = self.table_schema(table)?;
+        let Some(col) = schema.columns.iter_mut().find(|c| c.name == column) else {
+            // Legacy empty column list: seed PK then fail if not that column.
+            if schema.columns.is_empty() && schema.primary_key == column {
+                schema.columns.push(ColumnSpec::new(
+                    schema.primary_key.clone(),
+                    data_type,
+                ));
+                return self.replicate_or_install_schema(schema);
+            }
+            return Err(TakyonicError::Sql(format!(
+                "column `{column}` does not exist on table `{table}`"
+            )));
+        };
+        col.data_type = data_type.to_string();
+        self.replicate_or_install_schema(schema)
     }
 
     /// Multi-engine storage router (B-Tree tables + optional sidecar LSM).
@@ -757,6 +1544,192 @@ impl TakyonicEngine {
             .get(table)
             .cloned()
             .ok_or_else(|| TakyonicError::Engine(format!("unknown table `{table}`")))
+    }
+
+    /// One hot→cold partition move for a partitioned table; persists `PMAP` in catalog.
+    ///
+    /// Measures approximate per-node row load via a snapshot scan, then applies
+    /// [`crate::partition::Rebalancer::tick`]. Returns `None` when already balanced.
+    pub fn rebalance_table(
+        self: &Arc<Self>,
+        table: &str,
+    ) -> Result<Option<crate::partition::RebalanceMove>> {
+        self.ensure_open()?;
+        let schema = self.table_schema(table)?;
+        if matches!(
+            schema.partitioning,
+            crate::partition::PartitioningStrategy::None
+        ) {
+            return Err(TakyonicError::Sql(format!(
+                "REBALANCE requires a partitioned table; `{table}` has no partitioning"
+            )));
+        }
+        if schema.partition_map.assignments.is_empty() {
+            return Err(TakyonicError::Sql(format!(
+                "REBALANCE: table `{table}` has an empty partition map"
+            )));
+        }
+        let col = schema
+            .partitioning
+            .column()
+            .unwrap_or(schema.primary_key.as_str())
+            .to_string();
+        let rb = crate::partition::Rebalancer::new(schema.partition_map.clone());
+        let mut txn = self.begin()?;
+        let rows = txn.scan_table_records(table)?;
+        drop(txn);
+        for row in &rows {
+            let key = row.get(&col).unwrap_or("");
+            let pid = schema.partitioning.partition_id(key);
+            let node = schema.partition_map.node_for(pid);
+            rb.observe_load(node, 1);
+        }
+        let Some(mv) = rb.tick()? else {
+            return Ok(None);
+        };
+        let mut next = schema;
+        next.partition_map = rb.partition_map();
+        self.register_table(next)?;
+        Ok(Some(mv))
+    }
+
+    /// Snapshot of all registered table schemas (sorted by name via [`BTreeMap`]).
+    pub fn list_table_schemas(&self) -> Vec<TableSchema> {
+        self.schemas.read().values().cloned().collect()
+    }
+
+    /// Shared comment map for session scalar helpers (`obj_description` / `col_description`).
+    pub fn comments(&self) -> Arc<parking_lot::RwLock<BTreeMap<String, String>>> {
+        Arc::clone(&self.comments)
+    }
+
+    /// `COMMENT ON TABLE` / clear (`None`); persisted under `data_dir/COMMENTS`.
+    pub fn set_table_comment(&self, table: &str, comment: Option<&str>) -> Result<()> {
+        self.ensure_open()?;
+        let key = format!("t:{}", table.trim().to_ascii_lowercase());
+        let mut next = self.comments.read().clone();
+        match comment {
+            Some(c) => {
+                next.insert(key, c.to_string());
+            }
+            None => {
+                next.remove(&key);
+            }
+        }
+        self.replicate_or_install_comments(next)
+    }
+
+    /// `COMMENT ON COLUMN table.col` / clear (`None`); persisted under `data_dir/COMMENTS`.
+    pub fn set_column_comment(&self, table: &str, column: &str, comment: Option<&str>) -> Result<()> {
+        self.ensure_open()?;
+        let key = format!(
+            "c:{}.{}",
+            table.trim().to_ascii_lowercase(),
+            column.trim().to_ascii_lowercase()
+        );
+        let mut next = self.comments.read().clone();
+        match comment {
+            Some(c) => {
+                next.insert(key, c.to_string());
+            }
+            None => {
+                next.remove(&key);
+            }
+        }
+        self.replicate_or_install_comments(next)
+    }
+
+    /// `COMMENT ON ROLE` / `COMMENT ON DATABASE` (shared objects); keys `r:` / `d:`.
+    pub fn set_shared_comment(
+        &self,
+        kind: &str,
+        name: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let prefix = match kind {
+            "role" | "r" => "r",
+            "database" | "d" => "d",
+            other => {
+                return Err(TakyonicError::Sql(format!(
+                    "unsupported shared comment kind `{other}`"
+                )));
+            }
+        };
+        if prefix == "d" && !crate::rbac::database_exists(name) {
+            return Err(TakyonicError::Sql(format!(
+                "database \"{}\" does not exist",
+                crate::rbac::database_name_leaf(name)
+            )));
+        }
+        let key = format!("{prefix}:{}", name.trim().to_ascii_lowercase());
+        let mut next = self.comments.read().clone();
+        match comment {
+            Some(c) => {
+                next.insert(key, c.to_string());
+            }
+            None => {
+                next.remove(&key);
+            }
+        }
+        self.replicate_or_install_comments(next)
+    }
+
+    fn install_comments_catalog(&self, map: BTreeMap<String, String>) -> Result<()> {
+        save_comments(&self.config.data_dir, &map)?;
+        *self.comments.write() = map;
+        Ok(())
+    }
+
+    fn replicate_or_install_comments(&self, map: BTreeMap<String, String>) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let blob = bytes::Bytes::from(encode_comments(&map).into_bytes());
+            let _ = self.block_on_propose(&raft, RaftCommand::comments_replace(blob))?;
+            return Ok(());
+        }
+        self.install_comments_catalog(map)
+    }
+
+    /// Shared-object comment for `shobj_description(name, catalog)`.
+    pub fn shared_comment(&self, kind: &str, name: &str) -> Option<String> {
+        let prefix = match kind {
+            "role" | "r" | "pg_authid" | "pg_roles" => "r",
+            "database" | "d" | "pg_database" => "d",
+            _ => return None,
+        };
+        let key = format!("{prefix}:{}", name.trim().to_ascii_lowercase());
+        self.comments.read().get(&key).cloned()
+    }
+
+    /// Table comment for `obj_description(name)` (name-based until OID catalog exists).
+    pub fn table_comment(&self, table: &str) -> Option<String> {
+        let key = format!("t:{}", table.trim().to_ascii_lowercase());
+        self.comments.read().get(&key).cloned()
+    }
+
+    /// Column comment for `col_description(table, column)` (name-based).
+    pub fn column_comment(&self, table: &str, column: &str) -> Option<String> {
+        let key = format!(
+            "c:{}.{}",
+            table.trim().to_ascii_lowercase(),
+            column.trim().to_ascii_lowercase()
+        );
+        self.comments.read().get(&key).cloned()
+    }
+
+    /// Flatten column name → catalog type token across all registered tables.
+    ///
+    /// Duplicate column names across tables: last writer wins (sufficient for
+    /// pgwire OID hints on projected result sets).
+    pub fn column_type_hints(&self) -> std::collections::HashMap<String, String> {
+        let mut hints = std::collections::HashMap::new();
+        for schema in self.schemas.read().values() {
+            for col in &schema.columns {
+                hints.insert(col.name.clone(), col.data_type.clone());
+            }
+        }
+        hints
     }
 
     /// Find which table owns a secondary index by name.
@@ -833,13 +1806,9 @@ impl TakyonicEngine {
             None => IndexDef::new(name, column),
         };
         {
-            let mut schemas = self.schemas.write();
-            let schema = schemas.get_mut(table).ok_or_else(|| {
-                TakyonicError::Sql(format!("unknown table `{table}`"))
-            })?;
+            let mut schema = self.table_schema(table)?;
             schema.indexes.push(index.clone());
-            self.stats.register_table(schema);
-            crate::catalog::save_catalog(&self.config.data_dir, &schemas)?;
+            self.replicate_or_install_schema(schema)?;
         }
 
         if let Some(spec) = vector {
@@ -926,12 +1895,9 @@ impl TakyonicEngine {
             let _ = fs::remove_file(path);
         }
 
-        {
-            let mut schemas = self.schemas.write();
-            if let Some(schema) = schemas.get_mut(&table) {
-                schema.indexes.retain(|i| i.name != name);
-                crate::catalog::save_catalog(&self.config.data_dir, &schemas)?;
-            }
+        if let Ok(mut schema) = self.table_schema(&table) {
+            schema.indexes.retain(|i| i.name != name);
+            self.replicate_or_install_schema(schema)?;
         }
         Ok(())
     }
@@ -951,19 +1917,17 @@ impl TakyonicEngine {
         if_not_exists: bool,
     ) -> Result<()> {
         self.ensure_open()?;
-        let mut auth = self.auth.write();
-        auth.create_role(name, can_login, is_superuser, password, if_not_exists)?;
-        auth.save(&self.config.data_dir)?;
-        Ok(())
+        let mut next = self.auth.read().clone();
+        next.create_role(name, can_login, is_superuser, password, if_not_exists)?;
+        self.replicate_or_install_auth(next)
     }
 
     /// Drop a role / user.
     pub fn drop_role(&self, name: &str, if_exists: bool) -> Result<()> {
         self.ensure_open()?;
-        let mut auth = self.auth.write();
-        auth.drop_role(name, if_exists)?;
-        auth.save(&self.config.data_dir)?;
-        Ok(())
+        let mut next = self.auth.read().clone();
+        next.drop_role(name, if_exists)?;
+        self.replicate_or_install_auth(next)
     }
 
     /// `GRANT <priv> ON <table> TO <grantee>`.
@@ -975,10 +1939,9 @@ impl TakyonicEngine {
     ) -> Result<()> {
         self.ensure_open()?;
         let _ = self.table_schema(table)?;
-        let mut auth = self.auth.write();
-        auth.grant(grantee, table, privileges)?;
-        auth.save(&self.config.data_dir)?;
-        Ok(())
+        let mut next = self.auth.read().clone();
+        next.grant(grantee, table, privileges)?;
+        self.replicate_or_install_auth(next)
     }
 
     /// `REVOKE <priv> ON <table> FROM <grantee>`.
@@ -989,19 +1952,86 @@ impl TakyonicEngine {
         privileges: &[crate::rbac::Privilege],
     ) -> Result<()> {
         self.ensure_open()?;
-        let mut auth = self.auth.write();
-        auth.revoke(grantee, table, privileges)?;
-        auth.save(&self.config.data_dir)?;
-        Ok(())
+        let mut next = self.auth.read().clone();
+        next.revoke(grantee, table, privileges)?;
+        self.replicate_or_install_auth(next)
+    }
+
+    /// `GRANT <priv> ON SCHEMA <schema> TO <grantee>`.
+    pub fn grant_schema_privilege(
+        &self,
+        grantee: &str,
+        schema: &str,
+        privileges: &[crate::rbac::SchemaPrivilege],
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut next = self.auth.read().clone();
+        next.grant_schema(grantee, schema, privileges)?;
+        self.replicate_or_install_auth(next)
+    }
+
+    /// `REVOKE <priv> ON SCHEMA <schema> FROM <grantee>`.
+    pub fn revoke_schema_privilege(
+        &self,
+        grantee: &str,
+        schema: &str,
+        privileges: &[crate::rbac::SchemaPrivilege],
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut next = self.auth.read().clone();
+        next.revoke_schema(grantee, schema, privileges)?;
+        self.replicate_or_install_auth(next)
+    }
+
+    /// `GRANT SELECT (col) ON <table> TO <grantee>`.
+    pub fn grant_column_privilege(
+        &self,
+        grantee: &str,
+        table: &str,
+        specs: &[crate::rbac::ColumnGrantSpec],
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let _ = self.table_schema(table)?;
+        let mut next = self.auth.read().clone();
+        next.grant_columns(grantee, table, specs)?;
+        self.replicate_or_install_auth(next)
+    }
+
+    /// `REVOKE SELECT (col) ON <table> FROM <grantee>`.
+    pub fn revoke_column_privilege(
+        &self,
+        grantee: &str,
+        table: &str,
+        specs: &[crate::rbac::ColumnGrantSpec],
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut next = self.auth.read().clone();
+        next.revoke_columns(grantee, table, specs)?;
+        self.replicate_or_install_auth(next)
     }
 
     /// `GRANT <role> TO <member>`.
     pub fn grant_role_membership(&self, role: &str, member: &str) -> Result<()> {
         self.ensure_open()?;
-        let mut auth = self.auth.write();
-        auth.grant_membership(role, member)?;
-        auth.save(&self.config.data_dir)?;
+        let mut next = self.auth.read().clone();
+        next.grant_membership(role, member)?;
+        self.replicate_or_install_auth(next)
+    }
+
+    fn install_auth_catalog(&self, catalog: crate::rbac::AuthCatalog) -> Result<()> {
+        catalog.save(&self.config.data_dir)?;
+        *self.auth.write() = catalog;
         Ok(())
+    }
+
+    fn replicate_or_install_auth(&self, catalog: crate::rbac::AuthCatalog) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let blob = bytes::Bytes::from(catalog.encode().into_bytes());
+            let _ = self.block_on_propose(&raft, RaftCommand::auth_replace(blob))?;
+            return Ok(());
+        }
+        self.install_auth_catalog(catalog)
     }
 
     /// Snapshot of table statistics for the optimizer.
@@ -1013,10 +2043,31 @@ impl TakyonicEngine {
     pub fn apply_analyzed_stats(&self, table: &str, new_stats: TableStats) -> Result<()> {
         self.ensure_open()?;
         let _ = self.table_schema(table)?;
-        self.stats.replace(table, new_stats);
-        let snapshot = self.stats.snapshot_all();
+        let mut snapshot = self.stats.snapshot_all();
+        snapshot.insert(table.to_string(), new_stats);
+        self.replicate_or_install_stats(snapshot)
+    }
+
+    fn install_stats_catalog(
+        &self,
+        snapshot: std::collections::BTreeMap<String, TableStats>,
+    ) -> Result<()> {
         stats::save_stats(&self.config.data_dir, &snapshot)?;
+        self.stats.load_all(snapshot);
         Ok(())
+    }
+
+    fn replicate_or_install_stats(
+        &self,
+        snapshot: std::collections::BTreeMap<String, TableStats>,
+    ) -> Result<()> {
+        if let Some(raft) = self.upgrade_distributed_raft() {
+            self.require_leader(&raft)?;
+            let blob = bytes::Bytes::from(stats::encode_stats(&snapshot).into_bytes());
+            let _ = self.block_on_propose(&raft, RaftCommand::stats_replace(blob))?;
+            return Ok(());
+        }
+        self.install_stats_catalog(snapshot)
     }
 
     /// Scan `table` under `txn`, compute statistics, and persist them.
@@ -1067,13 +2118,27 @@ impl TakyonicEngine {
             .into_iter()
             .map(|m| ManifestSst {
                 id: m.id,
-                path: m.path.to_string_lossy().into_owned(),
+                path: if self.manager.has_remote() {
+                    sst_object_key(m.level, m.id)
+                } else {
+                    m.path.to_string_lossy().into_owned()
+                },
                 level: m.level as u32,
             })
             .collect();
         if next.pages_key.is_empty() {
             next.pages_key = REMOTE_PAGES_KEY.to_string();
         }
+        if next.pages_prefix.is_empty() {
+            next.pages_prefix = PAGES_V2_PREFIX.to_string();
+        }
+        // Always publish V2 layout once the engine is writing through DiskManager chunks.
+        let chunk = self
+            .buffer_pool
+            .as_ref()
+            .map(|bpm| bpm.disk().chunk_size() as u64)
+            .unwrap_or(crate::manifest::DEFAULT_PAGES_CHUNK_BYTES);
+        next.pages_layout = crate::manifest::PagesLayout::ChunkV2 { chunk_size: chunk };
         // Let ManifestManager assign the next monotonic version.
         next.version = 0;
         // Preserve btree_roots from prior publishes.
@@ -1106,6 +2171,38 @@ impl TakyonicEngine {
             .into_iter()
             .map(|m| m.file_size)
             .sum()
+    }
+
+    /// Approximate heap size for `pg_relation_size` / `pg_table_size`.
+    pub fn relation_heap_bytes(&self, table: &str) -> Result<u64> {
+        let _ = self.table_schema(table)?;
+        let versions = self.count_versions_prefix(data_table_prefix(table).as_ref())?;
+        Ok(versions.saturating_mul(crate::oid::RELATION_SIZE_BYTES_PER_VERSION))
+    }
+
+    /// Approximate heap+index size for `pg_total_relation_size`.
+    pub fn relation_total_bytes(&self, table: &str) -> Result<u64> {
+        let _ = self.table_schema(table)?;
+        let versions = self.table_version_count(table)?;
+        Ok(versions.saturating_mul(crate::oid::RELATION_SIZE_BYTES_PER_VERSION))
+    }
+
+    /// Snapshot of relation size estimates for session scalar helpers.
+    pub fn relation_size_catalog(&self) -> crate::oid::RelationSizeCatalog {
+        let mut cat = crate::oid::RelationSizeCatalog::default();
+        for schema in self.list_table_schemas() {
+            let name = schema.name.clone();
+            let heap = self.relation_heap_bytes(&name).unwrap_or(0);
+            let total = self.relation_total_bytes(&name).unwrap_or(heap);
+            cat.insert(
+                &name,
+                crate::oid::RelationSizeEntry {
+                    heap_bytes: heap,
+                    total_bytes: total.max(heap),
+                },
+            );
+        }
+        cat
     }
 
     /// Count all MVCC versions under `Data_<table>_` and `Idx_<table>_`.
@@ -1479,24 +2576,83 @@ impl TakyonicEngine {
                     .unwrap_or(0),
             });
         }
+        // Meta side-effects (catalog / AUTH / STATS / COMMENTS) must run *before*
+        // `apply_log` advances `last_applied`. Otherwise a failed install leaves
+        // the index past the entry and followers never retry the catalog update.
+        // 2PC side-effects stay after apply_log (commit may depend on LSM apply).
+        for committed in entries {
+            match &committed.command {
+                RaftCommand::CatalogUpsert { table, schema } => {
+                    let text = std::str::from_utf8(schema.as_ref()).map_err(|e| {
+                        TakyonicError::Raft(format!("CatalogUpsert utf8: {e}"))
+                    })?;
+                    let parsed = crate::catalog::parse_table_block(text)?;
+                    if parsed.name != *table {
+                        return Err(TakyonicError::Raft(format!(
+                            "CatalogUpsert key `{table}` != TABLE `{}`",
+                            parsed.name
+                        )));
+                    }
+                    self.install_catalog_schema(parsed)?;
+                }
+                RaftCommand::CatalogDrop { table } => {
+                    self.remove_catalog_schema(table)?;
+                }
+                RaftCommand::AuthReplace { blob } => {
+                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
+                        TakyonicError::Raft(format!("AuthReplace utf8: {e}"))
+                    })?;
+                    let catalog = crate::rbac::AuthCatalog::parse(text)?;
+                    self.install_auth_catalog(catalog)?;
+                }
+                RaftCommand::StatsReplace { blob } => {
+                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
+                        TakyonicError::Raft(format!("StatsReplace utf8: {e}"))
+                    })?;
+                    let snapshot = stats::parse_stats(text)?;
+                    self.install_stats_catalog(snapshot)?;
+                }
+                RaftCommand::CommentsReplace { blob } => {
+                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
+                        TakyonicError::Raft(format!("CommentsReplace utf8: {e}"))
+                    })?;
+                    let map = parse_comments(text)?;
+                    self.install_comments_catalog(map)?;
+                }
+                _ => {}
+            }
+        }
+
         let node = self.raft_node()?;
         let result = node.apply_log(entries)?;
         // Keep the OCC index warm on every replica so failover preserves SI.
         for committed in entries {
-            if committed.command.is_meta() {
-                continue;
-            }
-            let keys: Vec<Key> = match &committed.command {
-                RaftCommand::Put { key, .. } | RaftCommand::Delete { key } => {
-                    vec![key.clone()]
+            match &committed.command {
+                RaftCommand::CatalogUpsert { .. }
+                | RaftCommand::CatalogDrop { .. }
+                | RaftCommand::AuthReplace { .. }
+                | RaftCommand::StatsReplace { .. }
+                | RaftCommand::CommentsReplace { .. } => {}
+                RaftCommand::TxnPrepare { .. }
+                | RaftCommand::TxnAbort { .. }
+                | RaftCommand::TxnCommit { .. } => {
+                    self.apply_twopc_side_effect(&committed.command)?;
                 }
-                RaftCommand::TxnBatch { ops } | RaftCommand::TxnCommit { ops, .. } => {
-                    ops.iter().map(|(k, _)| k.clone()).collect()
+                _ if committed.command.is_meta() => {}
+                _ => {
+                    let keys: Vec<Key> = match &committed.command {
+                        RaftCommand::Put { key, .. } | RaftCommand::Delete { key } => {
+                            vec![key.clone()]
+                        }
+                        RaftCommand::TxnBatch { ops } => {
+                            ops.iter().map(|(k, _)| k.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !keys.is_empty() {
+                        self.note_committed_keys(keys, committed.index);
+                    }
                 }
-                _ => Vec::new(),
-            };
-            if !keys.is_empty() {
-                self.note_committed_keys(keys, committed.index);
             }
         }
         self.maybe_flush_node(&node)?;
@@ -1697,7 +2853,10 @@ impl TakyonicEngine {
         Ok(())
     }
 
-    /// Snapshot memtable → L0 SST, rotate WAL. Does not hold locks across fsync.
+    /// Snapshot memtable → L0 SST(s), rotate WAL. Does not hold locks across fsync.
+    ///
+    /// Large memtables are split into multiple L0 files so each stays under
+    /// [`Config::max_sst_bytes`].
     fn flush_node(&self, node: &LocalRaftNode) -> Result<()> {
         let _flush = self.flush_mu.lock();
         let memtable = node.memtable();
@@ -1710,17 +2869,24 @@ impl TakyonicEngine {
         }
         drop(_flush);
 
-        let smallest = entries.first().expect("non-empty").key.clone();
-        let largest = entries.last().expect("non-empty").key.clone();
-        let id = self.manager.allocate_sst_id();
-        let path = self
-            .manager
-            .data_dir()
-            .join("L0")
-            .join(format!("{id:020}.sst"));
-        let info = SstWriter::write(id, &path, &entries, self.manager.block_size())?;
-        let meta = SstMeta::from_info(0, info, smallest, largest)?;
-        self.manager.add_sst(meta)?;
+        let slices = split_entries_by_max_bytes(&entries, self.manager.max_sst_bytes());
+        let mut total_entries = 0usize;
+        let mut last_id = 0u64;
+        for slice in slices {
+            let smallest = slice.first().expect("non-empty").key.clone();
+            let largest = slice.last().expect("non-empty").key.clone();
+            let id = self.manager.allocate_sst_id();
+            let path = self
+                .manager
+                .data_dir()
+                .join("L0")
+                .join(format!("{id:020}.sst"));
+            let info = SstWriter::write(id, &path, slice, self.manager.block_size())?;
+            let meta = SstMeta::from_info(0, info, smallest, largest)?;
+            self.manager.add_sst(meta)?;
+            total_entries += slice.len();
+            last_id = id;
+        }
         self.metrics.record_flush();
 
         let next = self.wal_segment.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1730,8 +2896,8 @@ impl TakyonicEngine {
         // Keep the previous segment: durable-but-not-yet-flushed applies may
         // still reference it until the next flush cycle. Full prune on close.
         debug!(
-            sst_id = id,
-            entries = entries.len(),
+            sst_id = last_id,
+            entries = total_entries,
             "flushed memtable to L0"
         );
         // Persist dirty BPM pages so eviction/checkpoint state matches SST install.
@@ -1928,6 +3094,16 @@ fn count_dead_across_keys(entries: &[Entry], watermark: CommitTs) -> u64 {
     dead
 }
 
+fn default_local_mpp_workers(n: u32) -> Vec<crate::mpp::WorkerEndpoint> {
+    (0..n)
+        .map(|slot| crate::mpp::WorkerEndpoint {
+            node_id: u64::from(slot) + 1,
+            address: format!("local-{slot}"),
+            slot,
+        })
+        .collect()
+}
+
 impl Drop for TakyonicEngine {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
@@ -2008,6 +3184,53 @@ fn recover_existing_ssts(manager: &SstManager) -> Result<()> {
     Ok(())
 }
 
+/// Pull SSTs listed in the shared manifest from object storage into the local
+/// data dir when this node has an empty / partial Tier-1 cache.
+fn hydrate_ssts_from_manifest(
+    manager: &SstManager,
+    manifest: &StorageManifest,
+) -> Result<()> {
+    if !manager.has_remote() || manifest.sstables.is_empty() {
+        return Ok(());
+    }
+    let present: std::collections::HashSet<u64> =
+        manager.all_files().into_iter().map(|m| m.id).collect();
+    let mut hydrated = 0u64;
+    for sst in &manifest.sstables {
+        if present.contains(&sst.id) {
+            continue;
+        }
+        let level = sst.level as usize;
+        let local = manager
+            .data_dir()
+            .join(format!("L{level}"))
+            .join(format!("{:020}.sst", sst.id));
+        let key = if sst.path.starts_with("sst/") {
+            sst.path.clone()
+        } else {
+            sst_object_key(level, sst.id)
+        };
+        info!(
+            id = sst.id,
+            level,
+            %key,
+            path = %local.display(),
+            "hydrating SST from object store"
+        );
+        manager.download_sst(&key, &local)?;
+        manager.recover_sst_file(level, sst.id, local)?;
+        hydrated += 1;
+    }
+    if hydrated > 0 {
+        info!(
+            hydrated,
+            manifest_version = manifest.version,
+            "manifest hydrate complete"
+        );
+    }
+    Ok(())
+}
+
 fn prune_wal_segments_below(wal_dir: &std::path::Path, keep_from: u64) -> Result<()> {
     for segment in list_wal_segments(wal_dir)? {
         if segment < keep_from {
@@ -2072,6 +3295,105 @@ fn list_wal_segments(wal_dir: &std::path::Path) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// On-disk object comments file (`COMMENT ON` / `obj_description`).
+pub const COMMENTS_FILE: &str = "COMMENTS";
+
+fn comments_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(COMMENTS_FILE)
+}
+
+fn escape_comment_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn unescape_comment_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Serialize comments to COMMENTS file text (Raft `CommentsReplace` payload).
+pub fn encode_comments(map: &BTreeMap<String, String>) -> String {
+    let mut out = String::from("# Takyonic COMMENTS\n");
+    for (k, v) in map {
+        out.push_str(k);
+        out.push('\t');
+        out.push_str(&escape_comment_value(v));
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse COMMENTS file text.
+pub fn parse_comments(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('\t') else {
+            return Err(TakyonicError::Integrity(format!(
+                "bad COMMENTS line (expected key\\tvalue): {line}"
+            )));
+        };
+        map.insert(key.to_string(), unescape_comment_value(value));
+    }
+    Ok(map)
+}
+
+/// Load comments from `data_dir/COMMENTS` (empty map when missing).
+pub fn load_comments(data_dir: &Path) -> Result<BTreeMap<String, String>> {
+    let path = comments_path(data_dir);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    parse_comments(&text)
+}
+
+/// Atomically rewrite `data_dir/COMMENTS`.
+pub fn save_comments(data_dir: &Path, map: &BTreeMap<String, String>) -> Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let path = comments_path(data_dir);
+    let tmp = data_dir.join(format!("{COMMENTS_FILE}.tmp"));
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(encode_comments(map).as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2097,6 +3419,79 @@ mod tests {
             .write_admission_ops_per_sec(100_000)
             .write_admission_min_ops_per_sec(1_000)
             .write_admission_burst(10_000)
+    }
+
+    #[test]
+    fn comments_replace_installs_via_apply_committed() {
+        let config = temp_config("comments-raft-apply", 64 * 1024 * 1024);
+        let data_dir = config.data_dir.clone();
+        let engine = TakyonicEngine::open(config).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("t:users".to_string(), "via raft".to_string());
+        map.insert("r:postgres".to_string(), "super".to_string());
+        let blob = bytes::Bytes::from(encode_comments(&map).into_bytes());
+        let next = engine.last_applied() + 1;
+        engine
+            .apply_committed(&[CommittedEntry::new(
+                next,
+                RaftCommand::comments_replace(blob),
+            )])
+            .unwrap();
+        assert_eq!(engine.table_comment("users").as_deref(), Some("via raft"));
+        assert_eq!(
+            engine.shared_comment("role", "postgres").as_deref(),
+            Some("super")
+        );
+        let loaded = load_comments(&data_dir).unwrap();
+        assert_eq!(loaded.get("t:users").map(String::as_str), Some("via raft"));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn comments_file_roundtrip_and_engine_reload() {
+        let config = temp_config("comments-persist", 64 * 1024 * 1024);
+        let root = config.data_dir.parent().unwrap().to_path_buf();
+        let data_dir = config.data_dir.clone();
+        {
+            let engine = TakyonicEngine::open(config).unwrap();
+            engine
+                .register_table(TableSchema::new("users", "id", vec![]))
+                .unwrap();
+            engine
+                .set_table_comment("users", Some("people\twith\nescapes"))
+                .unwrap();
+            engine
+                .set_column_comment("users", "id", Some("pk"))
+                .unwrap();
+            assert_eq!(
+                engine.table_comment("users").as_deref(),
+                Some("people\twith\nescapes")
+            );
+            engine.close().unwrap();
+        }
+        let reopened = TakyonicEngine::open(
+            Config::default()
+                .data_dir(data_dir.clone())
+                .wal_dir(root.join("wal"))
+                .memtable_size_bytes(64 * 1024 * 1024)
+                .block_size_bytes(64)
+                .l0_soft_limit(8)
+                .l0_hard_limit(32)
+                .l0_rapid_pool_threads(1)
+                .ln_haul_pool_threads(1)
+                .compaction_write_bytes_per_sec(1024 * 1024 * 1024)
+                .write_admission_ops_per_sec(100_000)
+                .write_admission_min_ops_per_sec(1_000)
+                .write_admission_burst(10_000),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.table_comment("users").as_deref(),
+            Some("people\twith\nescapes")
+        );
+        assert_eq!(reopened.column_comment("users", "id").as_deref(), Some("pk"));
+        reopened.close().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2230,6 +3625,50 @@ mod tests {
             b"v"
         );
         engine.close().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_table_persists_in_catalog_across_reopen() {
+        let config = temp_config("tbl-catalog", 64 * 1024 * 1024);
+        let root = config.data_dir.parent().unwrap().to_path_buf();
+        let wal_dir = config.wal_dir.clone();
+        let data_dir = config.data_dir.clone();
+        {
+            let engine = Arc::new(TakyonicEngine::open(config).unwrap());
+            engine
+                .create_table(
+                    "items",
+                    "id",
+                    vec![
+                        ColumnSpec::new("id", "BIGINT"),
+                        ColumnSpec::new("name", "TEXT"),
+                    ],
+                    false,
+                )
+                .unwrap();
+            let schema = engine.table_schema("items").unwrap();
+            assert_eq!(schema.columns.len(), 2);
+            assert_eq!(schema.columns[1].name, "name");
+            engine.close().unwrap();
+        }
+        let reopened = Arc::new(
+            TakyonicEngine::open(
+                Config::default()
+                    .data_dir(data_dir)
+                    .wal_dir(wal_dir)
+                    .memtable_size_bytes(64 * 1024 * 1024)
+                    .l0_rapid_pool_threads(1)
+                    .ln_haul_pool_threads(1)
+                    .compaction_write_bytes_per_sec(1024 * 1024 * 1024),
+            )
+            .unwrap(),
+        );
+        let schema = reopened.table_schema("items").unwrap();
+        assert_eq!(schema.primary_key, "id");
+        assert_eq!(schema.columns[0].data_type, "BIGINT");
+        assert_eq!(schema.columns[1].data_type, "TEXT");
+        reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2594,6 +4033,69 @@ mod tests {
     }
 
     #[test]
+    fn btree_table_survives_engine_reopen_via_lsm_hydrate() {
+        let config = temp_config("btree-hydrate", 64 * 1024 * 1024);
+        let root = config.data_dir.parent().unwrap().to_path_buf();
+        let wal_dir = config.wal_dir.clone();
+        let data_dir = config.data_dir.clone();
+        {
+            let engine = Arc::new(TakyonicEngine::open(config).unwrap());
+            engine
+                .register_table(
+                    TableSchema::new("hot", "id", vec![])
+                        .with_engine(crate::storage::StorageEngineKind::BTree),
+                )
+                .unwrap();
+            for i in 0..5 {
+                let mut txn = engine.begin().unwrap();
+                txn.put_record(
+                    "hot",
+                    Record::new()
+                        .set("id", i.to_string())
+                        .set("v", format!("v{i}")),
+                )
+                .unwrap();
+                txn.commit().unwrap();
+            }
+            // Read path must use the B-Tree mirror (not only LSM).
+            let mut txn = engine.begin().unwrap();
+            assert_eq!(
+                txn.get_record("hot", "3").unwrap().unwrap().get("v").unwrap(),
+                "v3"
+            );
+            txn.abort();
+            engine.close().unwrap();
+        }
+        let reopened = Arc::new(
+            TakyonicEngine::open(
+                Config::default()
+                    .data_dir(data_dir)
+                    .wal_dir(wal_dir)
+                    .memtable_size_bytes(64 * 1024 * 1024)
+                    .l0_rapid_pool_threads(1)
+                    .ln_haul_pool_threads(1)
+                    .compaction_write_bytes_per_sec(1024 * 1024 * 1024),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            reopened.table_schema("hot").unwrap().storage_engine,
+            crate::storage::StorageEngineKind::BTree
+        );
+        // Without LSM→BTree hydrate, the in-memory mirror would be empty here.
+        let mut txn = reopened.begin().unwrap();
+        let row = txn.get_record("hot", "3").unwrap().unwrap();
+        assert_eq!(row.get("v").unwrap(), "v3");
+        let keys = reopened
+            .scan_prefix_keys(data_table_prefix("hot").as_ref(), txn.read_ts())
+            .unwrap();
+        assert_eq!(keys.len(), 5);
+        txn.abort();
+        reopened.close().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn btree_table_vacuum_and_analyze_via_storage_manager() {
         let config = temp_config("btree-vac", 64 * 1024 * 1024);
         let root = config.data_dir.parent().unwrap().to_path_buf();
@@ -2720,6 +4222,106 @@ mod tests {
 
         engine_b.close().unwrap();
         let _ = fs::remove_dir_all(root_b);
+    }
+
+    /// D2: default [`Config::object_store_root`] path — after flush+close, wiping
+    /// Tier-1 and reopening must hydrate SSTs (and serve KV) from the shared store.
+    #[test]
+    fn object_store_root_cold_restart_hydrates_sst_and_kv() {
+        use crate::page::DEFAULT_PAGE_SIZE;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("takyonic-d2-hydrate-{nanos}"));
+        let _ = fs::remove_dir_all(&root);
+        let objects = root.join("objects");
+        let data = root.join("data");
+        let wal = root.join("wal");
+
+        let cfg = Config::default()
+            .data_dir(&data)
+            .wal_dir(&wal)
+            .object_store_root(&objects)
+            .memtable_size_bytes(64 * 1024 * 1024)
+            .bpm_pool_size(16)
+            .bpm_page_size(DEFAULT_PAGE_SIZE)
+            .l0_rapid_pool_threads(1)
+            .ln_haul_pool_threads(1)
+            .compaction_write_bytes_per_sec(1024 * 1024 * 1024);
+
+        let engine = TakyonicEngine::open(cfg).unwrap();
+        assert!(engine.manifest().is_some());
+        engine.put(&b"d2-key"[..], &b"from-object-store"[..]).unwrap();
+        engine.force_flush().unwrap();
+        let published = engine.publish_storage_manifest().unwrap().unwrap();
+        assert!(
+            !published.sstables.is_empty(),
+            "flush must publish at least one SST into the shared manifest"
+        );
+        published.verify().unwrap();
+
+        // Also exercise pages Tier-2 so cold reopen can hydrate BPM frames.
+        let bpm = Arc::clone(engine.buffer_pool().unwrap());
+        let guard = bpm.new_page().unwrap();
+        let page_id = guard.page_id();
+        guard.write(|data| {
+            data[..8].copy_from_slice(b"D2PAGES!");
+        });
+        drop(guard);
+        bpm.flush_all().unwrap();
+        engine.close().unwrap();
+
+        // Wipe Tier-1 only; shared object store keeps CURRENT.json + SST + pages.
+        fs::remove_dir_all(&data).unwrap();
+        fs::remove_dir_all(&wal).unwrap();
+
+        let cfg2 = Config::default()
+            .data_dir(root.join("data-cold"))
+            .wal_dir(root.join("wal-cold"))
+            .object_store_root(&objects)
+            .memtable_size_bytes(64 * 1024 * 1024)
+            .bpm_pool_size(16)
+            .bpm_page_size(DEFAULT_PAGE_SIZE)
+            .l0_rapid_pool_threads(1)
+            .ln_haul_pool_threads(1)
+            .compaction_write_bytes_per_sec(1024 * 1024 * 1024);
+
+        let cold = TakyonicEngine::open(cfg2).unwrap();
+        let m = cold.manifest().unwrap().current();
+        assert!(
+            m.version >= published.version,
+            "cold open must load published manifest version"
+        );
+        assert!(
+            !m.sstables.is_empty(),
+            "cold open must see SST inventory from object store"
+        );
+        assert!(
+            !cold.manager.all_files().is_empty(),
+            "hydrate_ssts_from_manifest must install local SST files"
+        );
+        assert_eq!(
+            cold.get(&Key::new(&b"d2-key"[..]))
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            b"from-object-store"
+        );
+
+        let bpm_cold = Arc::clone(cold.buffer_pool().unwrap());
+        let before = bpm_cold.stats().remote_fetches;
+        let g = bpm_cold.fetch_page(page_id).unwrap();
+        g.read(|data| assert_eq!(&data[..8], b"D2PAGES!"));
+        drop(g);
+        assert!(
+            bpm_cold.stats().remote_fetches > before,
+            "BPM miss must hydrate page bytes from object store"
+        );
+
+        cold.close().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

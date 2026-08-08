@@ -58,20 +58,56 @@ cargo run --release --bin takyonic-server
 In another terminal, connect with `psql`:
 
 ```bash
-PGPASSWORD=any psql -h 127.0.0.1 -p 5433 -U admin -d postgres
+PGPASSWORD=password psql -h 127.0.0.1 -p 5433 -U postgres -d postgres
 ```
 
-The server registers a demo `users` table. Try:
+By default the server seeds a demo `users` table when it is missing
+(`--demo-bootstrap` / `TAKYONIC_DEMO_BOOTSTRAP=1`). Disable for an empty
+catalog (`--no-demo-bootstrap` / `TAKYONIC_DEMO_BOOTSTRAP=0`) and create
+tables with SQL DDL instead.
 
 ```sql
+-- With demo bootstrap (default):
 INSERT INTO users (id, name, city, status)
 VALUES (1, 'Ada', 'London', 'active');
-
 SELECT * FROM users WHERE status = 'active';
+
+-- Empty catalog:
+CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT);
+INSERT INTO items (id, name) VALUES (1, 'widget');
 ```
 
-The demo pgwire endpoint accepts any username and password; place it behind
-appropriate authentication before exposing it to an untrusted network.
+The demo pgwire endpoint authenticates with SCRAM-SHA-256. Default role:
+`postgres` / `password`. Takyonic is **single-database**: connect with
+`-d postgres` (or omit `-d`); any other database name is rejected
+(`SQLSTATE 3D000`).
+
+Optional Tier-2 object storage (storage–compute decoupling):
+
+```bash
+# Local POSIX mirror
+cargo run --release --bin takyonic-server -- --object-store ./objects
+
+# MinIO / S3 (binary must be built with `--features s3`; Docker image includes it)
+cargo run --release --features s3 --bin takyonic-server -- \
+  --s3-endpoint http://127.0.0.1:9000 --s3-bucket takyonic \
+  --s3-access-key minioadmin --s3-secret-key minioadmin
+
+# Compose: MinIO + one S3-backed node on host :5436
+docker compose --profile s3 up --build node-s3 minio
+
+# Fast host-side smoke (MinIO via compose + local `--features s3` server):
+./scripts/smoke-s3-compose.sh
+```
+
+Env equivalents: `TAKYONIC_OBJECT_STORE`, `TAKYONIC_S3_ENDPOINT`,
+`TAKYONIC_S3_BUCKET`, `TAKYONIC_S3_ACCESS_KEY`, `TAKYONIC_S3_SECRET_KEY`.
+
+**PutObject policy (no multipart):** SST uploads are capped at `max_sst_bytes`
+(default 1 GiB) via flush/compaction split; BPM pages use ChunkV2 (default
+64 MiB chunks). Checkpoint flushes coalesce dirty pages to **one PutObject per
+touched chunk**. Single-object writes ≥5 GiB are refused so AWS/MinIO PutObject
+limits are never exceeded.
 
 ## Architecture
 

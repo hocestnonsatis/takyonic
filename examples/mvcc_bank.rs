@@ -32,7 +32,7 @@ fn decode_balance(v: &Value) -> i64 {
     i64::from_le_bytes(b.try_into().unwrap())
 }
 
-fn transfer(engine: &TakyonicEngine, from: u64, to: u64, amount: i64) -> Result<(), TakyonicError> {
+fn transfer(engine: &Arc<TakyonicEngine>, from: u64, to: u64, amount: i64) -> Result<(), TakyonicError> {
     let mut txn = engine.begin()?;
     let from_key = account_key(from);
     let to_key = account_key(to);

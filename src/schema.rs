@@ -9,27 +9,100 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::{Result, TakyonicError};
 use crate::types::{Key, Value};
+use crate::vector::VectorIndexSpec;
 
-const DATA_PREFIX: &[u8] = b"Data_";
-const IDX_PREFIX: &[u8] = b"Idx_";
+/// Storage key prefix for heap/table rows (`Data_<table>_<pk>`).
+pub const DATA_PREFIX: &[u8] = b"Data_";
+/// Storage key prefix for secondary index entries (`Idx_<table>_…`).
+pub const IDX_PREFIX: &[u8] = b"Idx_";
 const SEP: u8 = b'_';
 
-/// A secondary index on one column.
+/// A typed column declared in `CREATE TABLE` / catalog `COLUMN` lines.
+///
+/// Storage remains a string-field [`Record`] until typed coercion lands (Roadmap A2);
+/// this metadata is durable catalog state for planning and client Describe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnSpec {
+    /// Column / field name.
+    pub name: String,
+    /// Canonical type token without whitespace (`BIGINT`, `TEXT`, `BOOL`, …).
+    pub data_type: String,
+    /// When false, INSERT/UPDATE must supply a non-NULL value.
+    pub nullable: bool,
+    /// Optional SQL default expression text (`now()`, `'x'`, `gen_random_uuid()`, …).
+    pub default_sql: Option<String>,
+    /// When true, values must be unique across the table (secondary unique index).
+    pub unique: bool,
+}
+
+impl ColumnSpec {
+    /// Construct a nullable column specification (no default / unique).
+    pub fn new(name: impl Into<String>, data_type: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: true,
+            default_sql: None,
+            unique: false,
+        }
+    }
+
+    /// Builder: NOT NULL.
+    pub fn not_null(mut self) -> Self {
+        self.nullable = false;
+        self
+    }
+
+    /// Builder: column DEFAULT expression (SQL text).
+    pub fn with_default(mut self, expr: impl Into<String>) -> Self {
+        self.default_sql = Some(expr.into());
+        self
+    }
+
+    /// Builder: UNIQUE constraint.
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+}
+
+/// A secondary (B-Tree) or vector (HNSW) index on one column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDef {
-    /// Index name (also used in key encoding).
+    /// Index name (also used in key encoding / HNSW snapshot name).
     pub name: String,
     /// Column / field name in the record.
     pub column: String,
+    /// When set, this is an HNSW vector index (no `Idx_` B-Tree keys).
+    pub vector: Option<VectorIndexSpec>,
 }
 
 impl IndexDef {
-    /// Construct an index definition.
+    /// Construct a B-Tree secondary index definition.
     pub fn new(name: impl Into<String>, column: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             column: column.into(),
+            vector: None,
         }
+    }
+
+    /// Construct an HNSW vector index definition.
+    pub fn vector(
+        name: impl Into<String>,
+        column: impl Into<String>,
+        spec: VectorIndexSpec,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            column: column.into(),
+            vector: Some(spec),
+        }
+    }
+
+    /// True when this is an HNSW / ANN index.
+    pub fn is_vector(&self) -> bool {
+        self.vector.is_some()
     }
 }
 
@@ -40,12 +113,20 @@ pub struct TableSchema {
     pub name: String,
     /// Primary-key field name inside the record.
     pub primary_key: String,
+    /// Declared columns from DDL (may be empty for legacy API-registered tables).
+    pub columns: Vec<ColumnSpec>,
     /// Declared secondary indexes.
     pub indexes: Vec<IndexDef>,
+    /// Physical storage engine (LSM default, or B-Tree).
+    pub storage_engine: crate::storage::StorageEngineKind,
+    /// Horizontal partitioning strategy (`None` = unreplicated single placement).
+    pub partitioning: crate::partition::PartitioningStrategy,
+    /// Partition id → owning cluster node id.
+    pub partition_map: crate::partition::PartitionMap,
 }
 
 impl TableSchema {
-    /// Construct a table schema.
+    /// Construct a table schema (default LSM storage, no partitioning).
     pub fn new(
         name: impl Into<String>,
         primary_key: impl Into<String>,
@@ -54,13 +135,48 @@ impl TableSchema {
         Self {
             name: name.into(),
             primary_key: primary_key.into(),
+            columns: Vec::new(),
             indexes,
+            storage_engine: crate::storage::StorageEngineKind::Lsm,
+            partitioning: crate::partition::PartitioningStrategy::None,
+            partition_map: crate::partition::PartitionMap::default(),
         }
+    }
+
+    /// Builder: attach typed column metadata from `CREATE TABLE`.
+    pub fn with_columns(mut self, columns: Vec<ColumnSpec>) -> Self {
+        self.columns = columns;
+        self
+    }
+
+    /// Builder: select LSM or B-Tree storage for this table.
+    pub fn with_engine(mut self, engine: crate::storage::StorageEngineKind) -> Self {
+        self.storage_engine = engine;
+        self
+    }
+
+    /// Builder: attach a hashing / range partitioning strategy.
+    pub fn with_partitioning(
+        mut self,
+        strategy: crate::partition::PartitioningStrategy,
+    ) -> Self {
+        let n = strategy.partition_count();
+        self.partitioning = strategy;
+        if self.partition_map.assignments.is_empty() {
+            self.partition_map = crate::partition::PartitionMap::round_robin(&[], n);
+        }
+        self
+    }
+
+    /// Builder: set explicit partition → node assignments.
+    pub fn with_partition_map(mut self, map: crate::partition::PartitionMap) -> Self {
+        self.partition_map = map;
+        self
     }
 }
 
 /// Structured record: string field map (document projection).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Record {
     /// Field name → UTF-8 value.
     pub fields: BTreeMap<String, String>,
@@ -133,6 +249,34 @@ impl Record {
     }
 }
 
+/// Build `Data_<table>_` prefix for full-table data scans.
+pub fn data_table_prefix(table: &str) -> Bytes {
+    let mut buf = BytesMut::with_capacity(DATA_PREFIX.len() + table.len() + 1);
+    buf.put_slice(DATA_PREFIX);
+    buf.put_slice(table.as_bytes());
+    buf.put_u8(SEP);
+    buf.freeze()
+}
+
+/// Build `Idx_<table>_` prefix for secondary-index Vacuum scans.
+pub fn index_table_prefix(table: &str) -> Bytes {
+    let mut buf = BytesMut::with_capacity(IDX_PREFIX.len() + table.len() + 1);
+    buf.put_slice(IDX_PREFIX);
+    buf.put_slice(table.as_bytes());
+    buf.put_u8(SEP);
+    buf.freeze()
+}
+
+/// Extract table name from a `Data_<table>_…` or `Idx_<table>_…` user key.
+pub fn table_from_user_key(key: &Key) -> Option<String> {
+    let bytes = key.as_bytes();
+    let rest = bytes
+        .strip_prefix(DATA_PREFIX)
+        .or_else(|| bytes.strip_prefix(IDX_PREFIX))?;
+    let end = rest.iter().position(|&b| b == SEP)?;
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
 /// Build `Data_<table>_<pk>`.
 pub fn data_key(table: &str, pk: &str) -> Key {
     let mut buf = BytesMut::with_capacity(DATA_PREFIX.len() + table.len() + 1 + pk.len());
@@ -141,6 +285,16 @@ pub fn data_key(table: &str, pk: &str) -> Key {
     buf.put_u8(SEP);
     buf.put_slice(pk.as_bytes());
     Key::new(buf.freeze())
+}
+
+/// Extract the primary-key suffix from a `Data_<table>_<pk>` key.
+pub fn pk_from_data_key(key: &Key, table: &str) -> Option<String> {
+    let prefix = data_table_prefix(table);
+    let bytes = key.as_bytes();
+    if !bytes.starts_with(prefix.as_ref()) {
+        return None;
+    }
+    String::from_utf8(bytes[prefix.len()..].to_vec()).ok()
 }
 
 /// Build `Idx_<table>_<index>_<value>_<pk>`.

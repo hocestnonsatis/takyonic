@@ -23,10 +23,27 @@ Raft Leader -> grouped durable Raft log -> quorum
 MVCC state-machine apply -> Memtable -> SSTables
 ```
 
-The PostgreSQL endpoint and Smart Client share the same execution path beneath
-the protocol boundary. Followers reject mutations with a leader hint, allowing
-the Smart Client to rediscover the leader and retry without embedding topology
-logic in the application.
+The PostgreSQL endpoint and Smart Client share the same Raft / MVCC apply path
+beneath the protocol boundary. Followers reject mutations with a leader hint,
+allowing the Smart Client to rediscover the leader and retry without embedding
+topology logic in the application.
+
+## SQL surfaces (Smart Client vs pgwire)
+
+| Path | Role |
+|------|------|
+| **pgwire / `SessionState`** | Full local Volcano SQL: JOIN, aggregates, `ORDER BY`/`LIMIT`, session `BEGIN`/`COMMIT`, DDL, CTE/subquery, `UNION`, GUCs (`search_path`, `transaction_isolation`, `TimeZone`), … |
+| **Smart Client `execute_session_sql`** | Same Volcano path on the Raft leader (ephemeral `SessionState` per RPC) |
+| **Smart Client `execute_sql`** | Narrow RPC façade: `INSERT`; single-table filtered `SELECT`; `UPDATE`/`DELETE` with `pk = literal` |
+| **Smart Client `execute_txn` / `execute_dist_txn`** | Programmatic OCC / 2PC (not SQL) |
+
+Unsupported narrow `execute_sql` plans fail with a stable **`pgwire only`** error
+(`takyonic::client::PGWIRE_ONLY_HINT`). Rich SQL on gRPC uses
+`execute_session_sql` (or psql); it is not re-implemented as a second planner.
+
+`AT TIME ZONE` / `TIMEZONE()` accept fixed offsets (`UTC`/`GMT`/`±HH[:MM]`) and
+IANA names (embedded `tzdb`, DST-aware). Session `SET TimeZone` defaults to
+`UTC`; `LOCALTIMESTAMP` renders wall clock in the session zone.
 
 ## Write request lifecycle
 
@@ -44,10 +61,15 @@ An SQL write travels through the following stages:
    leader. A follower responds with `not_leader` and an address hint; the client
    invalidates its cache, discovers the current leader, and retries.
 4. **MVCC workspace and OCC validation** — A transaction reads at
-   `last_applied` and buffers its write set. At commit, the leader serializes
-   validation with proposal submission. It rejects the transaction if any key
-   in the read or write set committed after the transaction's `read_ts`.
-   Admission control is checked before the command enters consensus.
+   `last_applied` and buffers its write set. Default isolation is Snapshot
+   Isolation + OCC (PostgreSQL-equivalent `repeatable read`). `SET
+   transaction_isolation` accepts `read committed` (still SI), `repeatable
+   read`, and `serializable` (minimal SSI: concurrent readers of committed
+   write keys are doomed to abort — blocks classic write-skew). `read
+   uncommitted` is rejected. At commit, the leader serializes validation with
+   proposal submission. It rejects the transaction if any key in the read or
+   write set committed after the transaction's `read_ts`. Admission control is
+   checked before the command enters consensus.
 5. **Raft proposal and group commit** — The leader coalesces parked proposals
    into one durable Raft-log append, then replicates a multi-entry
    `AppendEntries` batch. This amortizes both local sync and network round trips.
@@ -152,3 +174,46 @@ treated as corruption, not as a repairable crash tail. SST creation follows
 temp-write, file-sync, atomic-rename, and parent-directory-sync ordering.
 Together with quorum commit and ordered apply, these boundaries ensure an
 acknowledged write is recoverable after process termination.
+
+Cross-shard 2PC decisions are appended to `data_dir/TC_DECISIONS` and
+`sync_data`'d before Phase-2 participant apply. On coordinator reopen,
+orphaned `PREPARED` shards are resolved from that log (presumed abort only
+when no decision was recorded). Use `TransactionCoordinator::open` (not
+`::new`) when decisions must survive process restart.
+
+Prometheus counters (when `metrics_enabled`):
+`takyonic_distributed_txn_{prepared,committed,aborted}_total` — scrape
+`/metrics` for a minimal 2PC dashboard (prepare vs decide outcome rates).
+
+## MPP honesty
+
+With `mpp_enabled` / `--mpp`, distributed aggregates that are a single
+`GROUP BY` column plus one of `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` run through the
+Coordinator + shuffle path (`DistAggKind`). Simple equi `DistributedJoin`
+remote-scans both sides then finishes with a local HashJoin (NLJ fallback
+for non-equi). Other aggregates fall back locally so EXPLAIN stays honest.
+Remote fragment dispatch retries once on transient transport errors.
+`REBALANCE TABLE name` measures per-node row load and applies one hot→cold
+partition-map move, persisting `PMAP` in the catalog.
+
+## Object-store pages
+
+BPM pages use ChunkV2 (default 64 MiB). Checkpoint `flush_all` coalesces dirty
+pages so each touched chunk is uploaded once (RMW overlay), not once per page.
+SST uploads use a single PutObject when under 5 GiB (`max_sst_bytes` still
+defaults to 1 GiB). Payloads at/above the AWS PutObject limit are uploaded via
+**multipart** (`CreateMultipartUpload` / `UploadPart` / `Complete`). Local and
+in-memory backends accept large objects without the AWS cap; the in-memory mock
+exposes multipart part counters for tests.
+
+## Sequences and schema product surface
+
+`SERIAL` / `CREATE SEQUENCE` state persists in `data_dir/SEQUENCES` across
+engine reopen. Column `DEFAULT`, `NOT NULL`, and single-column `UNIQUE`
+constraints are enforced on INSERT. File-based `COPY table FROM|TO 'path'`
+loads or dumps tab-separated text. `COPY … FROM STDIN` / `TO STDOUT` use the
+PostgreSQL copy protocol (pgwire `CopyHandler`); session helpers
+`SessionState::copy_from_tsv` / `copy_to_tsv` cover the same TSV format.
+
+Describe / `information_schema.columns` report UUID, BYTEA, NUMERIC, and
+TIMESTAMPTZ with matching `udt_name` tokens for basic ORM introspection.

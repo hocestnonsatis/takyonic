@@ -785,7 +785,22 @@ pub fn is_vectorizable(expr: &Expression) -> bool {
         | Expression::Exists { .. }
         | Expression::ScalarSubquery { .. }
         | Expression::Array(_)
+        | Expression::ArrayIndex { .. }
         | Expression::VectorDistance { .. }
+        | Expression::Like { .. }
+        | Expression::SimilarTo { .. }
+        | Expression::RegexMatch { .. }
+        | Expression::AtTimeZone { .. }
+        | Expression::Case { .. }
+        | Expression::IsNull { .. }
+        | Expression::IsBoolTest { .. }
+        | Expression::IsDistinctFrom { .. }
+        | Expression::QuantifiedCmp { .. }
+        | Expression::Coalesce(_)
+        | Expression::Cast { .. }
+        | Expression::NullIf { .. }
+        | Expression::ScalarFunction { .. }
+        | Expression::Not { .. }
         | Expression::OuterRef(_) => false,
     }
 }
@@ -805,16 +820,64 @@ fn walk(expr: &Expression, out: &mut Vec<String>) {
         Expression::BinaryOp { left, right, .. }
         | Expression::And { left, right }
         | Expression::Or { left, right }
-        | Expression::Arith { left, right, .. } => {
+        | Expression::Arith { left, right, .. }
+        | Expression::Like {
+            expr: left,
+            pattern: right,
+            ..
+        }
+        | Expression::SimilarTo {
+            expr: left,
+            pattern: right,
+            ..
+        }
+        | Expression::RegexMatch {
+            expr: left,
+            pattern: right,
+            ..
+        }
+        | Expression::AtTimeZone {
+            timestamp: left,
+            time_zone: right,
+        } => {
             walk(left, out);
             walk(right, out);
         }
-        Expression::InList { expr, .. } => walk(expr, out),
-        Expression::AggregateFunction { args, .. } => {
+        Expression::Case {
+            when_then,
+            else_result,
+        } => {
+            for (cond, result) in when_then {
+                walk(cond, out);
+                walk(result, out);
+            }
+            if let Some(e) = else_result {
+                walk(e, out);
+            }
+        }
+        Expression::IsNull { expr, .. }
+        | Expression::IsBoolTest { expr, .. }
+        | Expression::Cast { expr, .. }
+        | Expression::Not { expr } => {
+            walk(expr, out)
+        }
+        Expression::Coalesce(args) => {
             for a in args {
                 walk(a, out);
             }
         }
+        Expression::NullIf { left, right }
+        | Expression::IsDistinctFrom { left, right, .. }
+        | Expression::QuantifiedCmp { left, right, .. } => {
+            walk(left, out);
+            walk(right, out);
+        }
+        Expression::ScalarFunction { args, .. } | Expression::AggregateFunction { args, .. } => {
+            for a in args {
+                walk(a, out);
+            }
+        }
+        Expression::InList { expr, .. } => walk(expr, out),
         _ => {}
     }
 }

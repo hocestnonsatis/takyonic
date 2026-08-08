@@ -30,7 +30,7 @@ COPY proto ./proto
 RUN mkdir -p src/bin \
     && echo 'fn main() {}' > src/bin/takyonic-server.rs \
     && echo '' > src/lib.rs \
-    && cargo build --release --bin takyonic-server \
+    && cargo build --release --bin takyonic-server --features s3 \
     && rm -rf src
 
 # --- Real build layer -------------------------------------------------------
@@ -38,7 +38,7 @@ RUN mkdir -p src/bin \
 # on the previously-stubbed crate root and recompiles the first-party code.
 COPY src ./src
 RUN touch src/lib.rs src/bin/takyonic-server.rs \
-    && cargo build --release --bin takyonic-server \
+    && cargo build --release --bin takyonic-server --features s3 \
     && strip target/release/takyonic-server
 
 # Pre-create the data directory owned by the distroless `nonroot` uid (65532) so
