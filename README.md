@@ -45,26 +45,77 @@ resurrection, snapshot catch-up, and topology-mutation stress harnesses.
 > Benchmark results depend on hardware, filesystem, durability settings, value
 > size, and workload. Run the included harnesses on your target system.
 
+## Status
+
+Takyonic is a large in-tree engine, not a PostgreSQL-compatible product.
+`cargo test` includes `tests/pgwire_e2e.rs`, which starts `takyonic-server`
+and drives it with the `tokio-postgres` client. That test is the bar for
+what a single node actually does over the wire:
+
+| Works on one node | Notes |
+| --- | --- |
+| Process start, SCRAM-SHA-256 login | User `postgres`, password `password`. Only database name `postgres` is accepted. |
+| `CREATE TABLE` | Typed columns and a primary key. Catalog is written under the data directory. |
+| `INSERT` / `UPDATE` / `DELETE` | Explicit column lists. Parameterized extended-query (`$1`) works for the types the wire test covers (`BIGINT`, `INT`, `TEXT`). |
+| `SELECT` | `WHERE`, `ORDER BY`, `LIMIT`, and `SELECT *` in `CREATE TABLE` column order. |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | ReadyForQuery reports in-transaction (`T`) and idle (`I`). A statement error aborts the block (`25P02`) until `ROLLBACK`. `COMMIT` of an aborted block discards it. |
+| Durability | Committed rows and the catalog survive a clean process restart (SIGTERM, then start again on the same `--data-dir`). Uncommitted and rolled-back rows do not. |
+
+A second connection does not see another session's uncommitted insert.
+
+These parts exist in the codebase and have in-process tests. They are **not**
+what the wire integration test proves, and several are stubs or partial:
+
+- **Multi-node Raft.** Election, replication, snapshots, and membership are
+  implemented and covered by in-process cluster tests. A real multi-node
+  deployment is not part of the wire acceptance test. Followers reject local
+  commits with `NotLeader`.
+- **`pg_catalog` / `information_schema`.** A shape matcher answers common
+  `psql` `\dt` / `\d` queries. Arbitrary catalog SQL is not executed.
+- **PostgreSQL compatibility surface.** Many `pg_*` helpers (advisory locks,
+  WAL LSN, backup, `LISTEN`/`NOTIFY`) are process-local stubs. One database
+  only. No extensions, logical replication, or full type/function coverage.
+- **Storage engines.** Durability is the LSM memtable, WAL, and SSTs. The
+  optional B-tree engine is an in-memory mirror rebuilt from the LSM.
+- **MPP, 2PC, S3, JIT, vector/HNSW.** Present behind flags or features
+  (`--mpp`, `--features s3`). Treat them as experimental relative to the
+  single-node SQL path above.
+
 ## Quick start
 
-Prerequisites: Rust 1.85 or newer and a PostgreSQL client.
+Prerequisites: Rust 1.85 or newer and a PostgreSQL client (`psql` or any
+libpq / Rust / Python driver that speaks SCRAM-SHA-256).
 
-Start the single-node demo server:
+Start a single node. Data defaults to `./data` in the current directory
+(Docker images set `TAKYONIC_DATA=/data`):
 
 ```bash
-cargo run --release --bin takyonic-server
+cargo run --release --bin takyonic-server -- \
+  --data-dir ./data --bind-host 127.0.0.1 --no-demo-bootstrap
 ```
 
-In another terminal, connect with `psql`:
+In another terminal:
 
 ```bash
 PGPASSWORD=password psql -h 127.0.0.1 -p 5433 -U postgres -d postgres
 ```
 
-By default the server seeds a demo `users` table when it is missing
-(`--demo-bootstrap` / `TAKYONIC_DEMO_BOOTSTRAP=1`). Disable for an empty
-catalog (`--no-demo-bootstrap` / `TAKYONIC_DEMO_BOOTSTRAP=0`) and create
-tables with SQL DDL instead.
+The server listens for PostgreSQL on `5433` and Raft/gRPC on `5001`.
+Authentication is SCRAM-SHA-256. With `--no-demo-bootstrap` the catalog
+starts empty:
+
+```sql
+CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT);
+INSERT INTO items (id, name, qty) VALUES (1, 'widget', 10);
+SELECT id, name, qty FROM items WHERE qty >= 5 ORDER BY name LIMIT 10;
+BEGIN;
+UPDATE items SET qty = 11 WHERE id = 1;
+ROLLBACK;
+```
+
+`--demo-bootstrap` (the default) still registers a demo `users` table when
+it is missing. `--no-demo-bootstrap` / `TAKYONIC_DEMO_BOOTSTRAP=0` leaves
+the catalog empty.
 
 ```sql
 -- With demo bootstrap (default):

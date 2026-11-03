@@ -104,9 +104,7 @@ impl StorageManager {
     /// Register (or replace) a table's storage engine.
     pub fn register_table(&self, schema: &TableSchema) -> Result<()> {
         let kind = schema.storage_engine;
-        self.engines
-            .write()
-            .insert(schema.name.clone(), kind);
+        self.engines.write().insert(schema.name.clone(), kind);
         if kind == StorageEngineKind::BTree {
             self.btrees
                 .write()
@@ -226,8 +224,12 @@ mod tests {
 
         mgr.put_raw("logs", Key::new(&b"Data_logs_1"[..]), Value::new(&b"a"[..]))
             .unwrap();
-        mgr.put_raw("users", Key::new(&b"Data_users_1"[..]), Value::new(&b"b"[..]))
-            .unwrap();
+        mgr.put_raw(
+            "users",
+            Key::new(&b"Data_users_1"[..]),
+            Value::new(&b"b"[..]),
+        )
+        .unwrap();
 
         assert_eq!(
             mgr.get_raw("logs", &Key::new(&b"Data_logs_1"[..]))
@@ -336,15 +338,17 @@ mod tests {
         assert!(lsm_rps > 0.0 && bt_rps > 0.0);
         // Spot-check last keys survived.
         let last = format!("Data_lsm_t_{:08}", n - 1);
-        assert!(mgr
-            .get_raw("lsm_t", &Key::new(last.into_bytes()))
-            .unwrap()
-            .is_some());
+        assert!(
+            mgr.get_raw("lsm_t", &Key::new(last.into_bytes()))
+                .unwrap()
+                .is_some()
+        );
         let last = format!("Data_bt_t_{:08}", n - 1);
-        assert!(mgr
-            .get_raw("bt_t", &Key::new(last.into_bytes()))
-            .unwrap()
-            .is_some());
+        assert!(
+            mgr.get_raw("bt_t", &Key::new(last.into_bytes()))
+                .unwrap()
+                .is_some()
+        );
         mgr.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

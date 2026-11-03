@@ -38,13 +38,7 @@ impl RelationCatalog {
                     .collect()
             };
             cat.by_name.insert(name.clone(), oid);
-            cat.by_oid.insert(
-                oid,
-                RelationOidEntry {
-                    name,
-                    columns,
-                },
-            );
+            cat.by_oid.insert(oid, RelationOidEntry { name, columns });
         }
         cat
     }
@@ -82,10 +76,7 @@ impl RelationCatalog {
 
     /// 1-based `attnum` for a column name on `oid`, if present.
     pub fn attnum_of(&self, oid: u32, column: &str) -> Option<i64> {
-        let leaf = column
-            .trim()
-            .trim_matches('"')
-            .to_ascii_lowercase();
+        let leaf = column.trim().trim_matches('"').to_ascii_lowercase();
         let entry = self.by_oid(oid)?;
         entry
             .columns
@@ -102,11 +93,7 @@ pub fn relation_oid(table: &str) -> u32 {
         h ^= u32::from(b);
         h = h.wrapping_mul(16_777_619);
     }
-    if h == 0 {
-        16_384
-    } else {
-        h
-    }
+    if h == 0 { 16_384 } else { h }
 }
 
 /// Alias for role OIDs (`pg_authid` / `pg_get_userbyid`).
@@ -242,11 +229,7 @@ pub fn relation_schema_and_name(spec: &str) -> (String, String) {
 }
 
 /// `pg_table_is_visible(name)` — registered relation whose schema is on `search_path`.
-pub fn pg_table_is_visible_name(
-    search_path: &str,
-    catalog: &RelationCatalog,
-    spec: &str,
-) -> bool {
+pub fn pg_table_is_visible_name(search_path: &str, catalog: &RelationCatalog, spec: &str) -> bool {
     let (schema, name) = relation_schema_and_name(spec);
     catalog.oid_of(&name).is_some() && schema_on_search_path(search_path, &schema)
 }
@@ -297,11 +280,7 @@ pub fn pg_relation_is_updatable(
         NameOrOid::Name(name) => catalog.oid_of(name).is_some(),
         NameOrOid::Oid(oid) => catalog.by_oid(oid).is_some(),
     };
-    if exists {
-        RELATION_UPDATABLE_ALL
-    } else {
-        0
-    }
+    if exists { RELATION_UPDATABLE_ALL } else { 0 }
 }
 
 /// Column identity for `pg_column_is_updatable` (attnum or name).
@@ -497,10 +476,7 @@ pub fn pg_identify_object(
             if objsubid > 0 {
                 let rel = relations?.by_oid(objid)?;
                 let col = relations?.column_at(objid, i64::from(objsubid))?;
-                return Some(format!(
-                    "column {col} of table public.{}",
-                    rel.name
-                ));
+                return Some(format!("column {col} of table public.{}", rel.name));
             }
             if let Some(rel) = relations.and_then(|c| c.by_oid(objid)) {
                 return Some(format!("table public.{}", rel.name));
@@ -683,7 +659,11 @@ mod tests {
         let cat = RelationCatalog::from_schemas(&schemas);
         let oid = cat.oid_of("users").unwrap();
         assert!(pg_table_is_visible_name("public", &cat, "users"));
-        assert!(pg_table_is_visible_name("myschema, public", &cat, "public.users"));
+        assert!(pg_table_is_visible_name(
+            "myschema, public",
+            &cat,
+            "public.users"
+        ));
         assert!(!pg_table_is_visible_name("myschema", &cat, "users"));
         assert!(pg_table_is_visible_oid("public", &cat, oid));
         assert!(!pg_table_is_visible_oid("myschema", &cat, oid));
@@ -772,11 +752,10 @@ mod tests {
     fn describe_object_common_classes() {
         use crate::schema::IndexDef;
         let schemas = vec![
-            TableSchema::new("users", "id", vec![])
-                .with_columns(vec![
-                    ColumnSpec::new("id", "BIGINT"),
-                    ColumnSpec::new("name", "TEXT"),
-                ]),
+            TableSchema::new("users", "id", vec![]).with_columns(vec![
+                ColumnSpec::new("id", "BIGINT"),
+                ColumnSpec::new("name", "TEXT"),
+            ]),
             TableSchema::new(
                 "employees",
                 "id",
@@ -882,11 +861,10 @@ mod tests {
 
     #[test]
     fn identify_object_identity_strings() {
-        let schemas = vec![TableSchema::new("users", "id", vec![])
-            .with_columns(vec![
-                ColumnSpec::new("id", "BIGINT"),
-                ColumnSpec::new("name", "TEXT"),
-            ])];
+        let schemas = vec![TableSchema::new("users", "id", vec![]).with_columns(vec![
+            ColumnSpec::new("id", "BIGINT"),
+            ColumnSpec::new("name", "TEXT"),
+        ])];
         let rel = RelationCatalog::from_schemas(&schemas);
         let idx = IndexCatalog::from_schemas(&schemas);
         let users = rel.oid_of("users").unwrap();

@@ -146,8 +146,7 @@ impl HnswIndex {
 
         // Insert into layers `level` … 0 with ef_construction.
         for lc in (0..=level.min(entry_level)).rev() {
-            let candidates =
-                self.search_layer(&inner, &vector, curr, self.ef_construction, lc);
+            let candidates = self.search_layer(&inner, &vector, curr, self.ef_construction, lc);
             let selected = self.select_neighbors(&inner, &vector, &candidates, self.m);
             neighbors[lc] = selected.clone();
             // Bidirectional links (collect prune work to avoid borrow conflicts).
@@ -288,24 +287,14 @@ impl HnswIndex {
         let mut out: Vec<(f32, String)> = candidates
             .into_iter()
             .take(k)
-            .filter_map(|(id, dist)| {
-                inner
-                    .nodes
-                    .get(&id)
-                    .map(|n| (dist, n.pk.clone()))
-            })
+            .filter_map(|(id, dist)| inner.nodes.get(&id).map(|n| (dist, n.pk.clone())))
             .collect();
         out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
         out.truncate(k);
         Ok(out)
     }
 
-    fn exact_knn(
-        &self,
-        inner: &HnswInner,
-        query: &VectorValue,
-        k: usize,
-    ) -> Vec<(f32, String)> {
+    fn exact_knn(&self, inner: &HnswInner, query: &VectorValue, k: usize) -> Vec<(f32, String)> {
         let mut scored: Vec<(f32, String)> = inner
             .nodes
             .values()
@@ -386,12 +375,7 @@ impl HnswIndex {
         Ok(buf.freeze())
     }
 
-    fn decode(
-        name: &str,
-        dimension: usize,
-        metric: DistanceMetric,
-        bytes: &[u8],
-    ) -> Result<Self> {
+    fn decode(name: &str, dimension: usize, metric: DistanceMetric, bytes: &[u8]) -> Result<Self> {
         let mut buf = bytes;
         if buf.remaining() < 4 || &buf[..4] != MAGIC {
             return Err(TakyonicError::Integrity("bad HNSW magic".into()));
@@ -414,9 +398,7 @@ impl HnswIndex {
         let entry = buf.get_u32_le();
         let next_id = buf.get_u32_le();
         let index = Self::new(name.to_string(), dimension, metric);
-        index
-            .next_id
-            .store(next_id.max(1), AtomicOrdering::Relaxed);
+        index.next_id.store(next_id.max(1), AtomicOrdering::Relaxed);
         let mut inner = index.inner.write();
         for _ in 0..n_nodes {
             let id = buf.get_u32_le();
@@ -578,7 +560,11 @@ impl HnswIndex {
             id: enter,
         });
 
-        while let Some(MinCand { dist: c_dist, id: c }) = candidates.pop() {
+        while let Some(MinCand {
+            dist: c_dist,
+            id: c,
+        }) = candidates.pop()
+        {
             let f_dist = w.peek().map(|c| c.dist).unwrap_or(f32::MAX);
             if c_dist > f_dist {
                 break;
@@ -678,11 +664,8 @@ mod tests {
             for y in 0..5 {
                 for z in 0..5 {
                     let pk = format!("{x}_{y}_{z}");
-                    idx.insert(
-                        pk,
-                        VectorValue::new(vec![x as f32, y as f32, z as f32]),
-                    )
-                    .unwrap();
+                    idx.insert(pk, VectorValue::new(vec![x as f32, y as f32, z as f32]))
+                        .unwrap();
                 }
             }
         }
@@ -718,8 +701,7 @@ mod tests {
         idx.insert("p2", VectorValue::new(vec![0.0, 1.0, 0.0]))
             .unwrap();
         idx.save(&dir).unwrap();
-        let loaded =
-            HnswIndex::load(&dir, "v", 3, DistanceMetric::Euclidean).unwrap();
+        let loaded = HnswIndex::load(&dir, "v", 3, DistanceMetric::Euclidean).unwrap();
         assert_eq!(loaded.len(), 2);
         let hits = loaded
             .search_knn(&VectorValue::new(vec![0.9, 0.1, 0.0]), 1)

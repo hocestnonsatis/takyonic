@@ -109,10 +109,9 @@ impl ParticipantLogRecord {
                 read_ts,
                 writes,
             } => RaftCommand::txn_prepare(*txn_id, *read_ts, writes.clone()),
-            Self::Commit {
-                txn_id,
-                commit_ts,
-            } => RaftCommand::txn_commit(*txn_id, *commit_ts, Vec::new()),
+            Self::Commit { txn_id, commit_ts } => {
+                RaftCommand::txn_commit(*txn_id, *commit_ts, Vec::new())
+            }
             Self::Abort { txn_id } => RaftCommand::txn_abort(*txn_id),
         }
     }
@@ -130,9 +129,7 @@ impl ParticipantLogRecord {
                 writes: ops.clone(),
             }),
             RaftCommand::TxnCommit {
-                txn_id,
-                commit_ts,
-                ..
+                txn_id, commit_ts, ..
             } => Some(Self::Commit {
                 txn_id: *txn_id,
                 commit_ts: *commit_ts,
@@ -389,11 +386,9 @@ impl ShardParticipant for LocalShard {
                 locks.remove(k);
             }
         }
-        self.raft_log.lock().push(RaftCommand::txn_commit(
-            txn_id,
-            commit_ts,
-            writes.clone(),
-        ));
+        self.raft_log
+            .lock()
+            .push(RaftCommand::txn_commit(txn_id, commit_ts, writes.clone()));
         self.apply_writes(&writes, commit_ts);
         debug!(shard = self.id, txn_id, commit_ts, "COMMIT applied");
         Ok(())
@@ -604,7 +599,8 @@ impl TransactionCoordinator {
         }
         let cur = self.next_txn.load(Ordering::SeqCst);
         if max_id.saturating_add(1) > cur {
-            self.next_txn.store(max_id.saturating_add(1), Ordering::SeqCst);
+            self.next_txn
+                .store(max_id.saturating_add(1), Ordering::SeqCst);
         }
         *self.decision_log.lock() = Some(TcDecisionLog::open(data_dir)?);
         *self.decision_log_dir.lock() = Some(data_dir.to_path_buf());
@@ -647,9 +643,7 @@ impl TransactionCoordinator {
     pub fn begin(&self) -> (DistTxnId, CommitTs) {
         let txn_id = self.next_txn.fetch_add(1, Ordering::SeqCst);
         let read_ts = self.clock.tick();
-        self.inflight
-            .lock()
-            .insert(txn_id, TwopcState::Preparing);
+        self.inflight.lock().insert(txn_id, TwopcState::Preparing);
         (txn_id, read_ts)
     }
 
@@ -669,9 +663,7 @@ impl TransactionCoordinator {
         }
 
         // —— Phase 1: PREPARE ——
-        self.inflight
-            .lock()
-            .insert(txn_id, TwopcState::Preparing);
+        self.inflight.lock().insert(txn_id, TwopcState::Preparing);
         let shards = self.shards.read().clone();
         let mut prepared_shards: Vec<ShardId> = Vec::new();
         let mut prepare_err: Option<String> = None;
@@ -716,9 +708,7 @@ impl TransactionCoordinator {
             return Ok(DistTxnOutcome::Aborted { txn_id, reason });
         }
 
-        self.inflight
-            .lock()
-            .insert(txn_id, TwopcState::Prepared);
+        self.inflight.lock().insert(txn_id, TwopcState::Prepared);
 
         // —— Phase 2: COMMIT ——
         // Coordinator durable decision first (source of truth for recovery).
@@ -730,9 +720,7 @@ impl TransactionCoordinator {
                 commit_ts: Some(commit_ts),
             },
         )?;
-        self.inflight
-            .lock()
-            .insert(txn_id, TwopcState::Committed);
+        self.inflight.lock().insert(txn_id, TwopcState::Committed);
 
         if self.crash_after_decide.load(Ordering::SeqCst) {
             return Err(TakyonicError::Network(
@@ -747,7 +735,12 @@ impl TransactionCoordinator {
         if let Some(m) = &self.metrics {
             m.record_dtxn_committed();
         }
-        info!(txn_id, commit_ts, shards = req.branches.len(), "2PC committed");
+        info!(
+            txn_id,
+            commit_ts,
+            shards = req.branches.len(),
+            "2PC committed"
+        );
         Ok(DistTxnOutcome::Committed { txn_id, commit_ts })
     }
 

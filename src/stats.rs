@@ -146,11 +146,7 @@ impl HyperLogLog {
     /// Estimate cardinality (standard HLL alpha_m correction).
     pub fn count(&self) -> u64 {
         let m = HLL_M as f64;
-        let sum: f64 = self
-            .registers
-            .iter()
-            .map(|&r| 2f64.powi(-(r as i32)))
-            .sum();
+        let sum: f64 = self.registers.iter().map(|&r| 2f64.powi(-(r as i32))).sum();
         let alpha = match HLL_M {
             16 => 0.673,
             32 => 0.697,
@@ -363,7 +359,9 @@ impl StatsCatalog {
 }
 
 fn pages_for(row_count: u64) -> u64 {
-    row_count.div_ceil(ROWS_PER_PAGE).max(if row_count == 0 { 0 } else { 1 })
+    row_count
+        .div_ceil(ROWS_PER_PAGE)
+        .max(if row_count == 0 { 0 } else { 1 })
 }
 
 /// Build [`TableStats`] from a full table scan + reservoir/HLL.
@@ -400,16 +398,14 @@ pub fn compute_table_stats(schema: &TableSchema, records: &[Record]) -> TableSta
                 }
                 Some(v) => {
                     hlls.get_mut(col).unwrap().add(v);
-                    mins
-                        .entry(col.clone())
+                    mins.entry(col.clone())
                         .and_modify(|m| {
                             if v < m.as_str() {
                                 *m = v.to_string();
                             }
                         })
                         .or_insert_with(|| v.to_string());
-                    maxs
-                        .entry(col.clone())
+                    maxs.entry(col.clone())
                         .and_modify(|m| {
                             if v > m.as_str() {
                                 *m = v.to_string();
@@ -466,10 +462,7 @@ pub fn compute_table_stats(schema: &TableSchema, records: &[Record]) -> TableSta
 
     let mut distinct = BTreeMap::new();
     for idx in &schema.indexes {
-        let ndv = columns
-            .get(&idx.column)
-            .map(|c| c.ndv)
-            .unwrap_or(1);
+        let ndv = columns.get(&idx.column).map(|c| c.ndv).unwrap_or(1);
         distinct.insert(idx.name.clone(), ndv);
     }
 
@@ -561,9 +554,9 @@ pub fn parse_stats(text: &str) -> Result<BTreeMap<String, TableStats>> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let tag = parts.next().ok_or_else(|| {
-            TakyonicError::Engine(format!("stats line {}: empty", lineno + 1))
-        })?;
+        let tag = parts
+            .next()
+            .ok_or_else(|| TakyonicError::Engine(format!("stats line {}: empty", lineno + 1)))?;
         match tag {
             "TABLE" => {
                 let name = parts.next().ok_or_else(|| {
@@ -613,12 +606,13 @@ pub fn parse_stats(text: &str) -> Result<BTreeMap<String, TableStats>> {
                     TakyonicError::Engine(format!("stats line {}: MCV missing column", lineno + 1))
                 })?;
                 let st = tables.entry(table.to_string()).or_default();
-                let cs = st.columns.entry(column.to_string()).or_insert_with(|| {
-                    ColumnStats {
+                let cs = st
+                    .columns
+                    .entry(column.to_string())
+                    .or_insert_with(|| ColumnStats {
                         column: column.to_string(),
                         ..Default::default()
-                    }
-                });
+                    });
                 for pair in parts {
                     if let Some((v, f)) = pair.rsplit_once(':') {
                         if let Ok(freq) = f.parse::<u64>() {
@@ -637,12 +631,13 @@ pub fn parse_stats(text: &str) -> Result<BTreeMap<String, TableStats>> {
                 let rest: Vec<&str> = parts.collect();
                 let joined = rest.join(" ");
                 let st = tables.entry(table.to_string()).or_default();
-                let cs = st.columns.entry(column.to_string()).or_insert_with(|| {
-                    ColumnStats {
+                let cs = st
+                    .columns
+                    .entry(column.to_string())
+                    .or_insert_with(|| ColumnStats {
                         column: column.to_string(),
                         ..Default::default()
-                    }
-                });
+                    });
                 cs.histogram = joined
                     .split('|')
                     .filter(|s| !s.is_empty())

@@ -69,7 +69,8 @@ pub struct ExecutionContext {
     /// Client TCP port for `inet_client_port`.
     pub inet_client_port: Option<i64>,
     /// Shared `COMMENT ON` map for `obj_description` / `col_description`.
-    pub comments: Option<std::sync::Arc<parking_lot::RwLock<std::collections::BTreeMap<String, String>>>>,
+    pub comments:
+        Option<std::sync::Arc<parking_lot::RwLock<std::collections::BTreeMap<String, String>>>>,
     /// Synthetic relation OIDs for `to_regclass` / OID-form descriptions.
     pub relation_catalog: Option<std::sync::Arc<crate::oid::RelationCatalog>>,
     /// Approximate relation byte sizes for `pg_relation_size` / `pg_table_size`.
@@ -223,11 +224,7 @@ pub fn current_schemas_array(search_path: &str, include_implicit: bool) -> Strin
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if include_implicit
-        && !parts
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case("pg_catalog"))
-    {
+    if include_implicit && !parts.iter().any(|s| s.eq_ignore_ascii_case("pg_catalog")) {
         parts.insert(0, "pg_catalog".into());
     }
     if parts.is_empty() {
@@ -640,14 +637,12 @@ fn optimize_plan_tree(
                     filters: filters.clone(),
                     predicate: None,
                 };
-                if let Some(semi) =
-                    try_subquery_unnest(&scan, pred, schema_of, stats_of)?
-                {
+                if let Some(semi) = try_subquery_unnest(&scan, pred, schema_of, stats_of)? {
                     return Ok(semi);
                 }
             }
             optimize_table_access(table, filters, predicate.as_ref(), schema_of, stats_of)
-        },
+        }
         LogicalPlan::Insert {
             table,
             columns,
@@ -697,8 +692,7 @@ fn optimize_plan_tree(
             selection,
             returning,
         } => {
-            let input =
-                optimize_table_access(table, &[], selection.as_ref(), schema_of, stats_of)?;
+            let input = optimize_table_access(table, &[], selection.as_ref(), schema_of, stats_of)?;
             Ok(PhysicalPlan::Update {
                 table: table.clone(),
                 assignments: assignments.clone(),
@@ -711,8 +705,7 @@ fn optimize_plan_tree(
             selection,
             returning,
         } => {
-            let input =
-                optimize_table_access(table, &[], selection.as_ref(), schema_of, stats_of)?;
+            let input = optimize_table_access(table, &[], selection.as_ref(), schema_of, stats_of)?;
             Ok(PhysicalPlan::Delete {
                 table: table.clone(),
                 input: Box::new(input),
@@ -857,9 +850,7 @@ fn optimize_plan_tree(
             // DistributedJoin: local fallback → same HashJoin / NestedLoop as Join.
             let left_phys = Box::new(optimize_plan_tree(left, schema_of, stats_of)?);
             let right_phys = Box::new(optimize_plan_tree(right, schema_of, stats_of)?);
-            if let Some((left_key, right_key)) =
-                match_equi_join_keys(on, left, right, schema_of)
-            {
+            if let Some((left_key, right_key)) = match_equi_join_keys(on, left, right, schema_of) {
                 // Prefer MergeJoin when both sides are already sorted on the join key.
                 if *join_type == JoinType::Inner
                     && is_sorted_on(&left_phys, &left_key)
@@ -929,14 +920,18 @@ fn optimize_plan_tree(
         } => {
             // VectorIndexSelectionRule: ORDER BY col <-> query LIMIT k → HNSW scan.
             if !*with_ties {
-                if let Some(vis) =
-                    try_vector_index_selection(input, *skip, *fetch, schema_of)
-                {
+                if let Some(vis) = try_vector_index_selection(input, *skip, *fetch, schema_of) {
                     return Ok(vis);
                 }
             }
-            if let (false, Some(fetch), LogicalPlan::Sort { input: sort_in, exprs }) =
-                (*with_ties, *fetch, input.as_ref())
+            if let (
+                false,
+                Some(fetch),
+                LogicalPlan::Sort {
+                    input: sort_in,
+                    exprs,
+                },
+            ) = (*with_ties, *fetch, input.as_ref())
             {
                 return Ok(PhysicalPlan::TopN {
                     input: Box::new(optimize_plan_tree(sort_in, schema_of, stats_of)?),
@@ -980,17 +975,13 @@ fn optimize_plan_tree(
             exprs: exprs.clone(),
         }),
         LogicalPlan::Filter { input, predicate } => {
-            if let Some(semi) =
-                try_subquery_unnest(input, predicate, schema_of, stats_of)?
-            {
+            if let Some(semi) = try_subquery_unnest(input, predicate, schema_of, stats_of)? {
                 return Ok(semi);
             }
             let input_phys = Box::new(optimize_plan_tree(input, schema_of, stats_of)?);
             Ok(filter_or_apply(input_phys, predicate.clone()))
         }
-        LogicalPlan::SubqueryAlias { input, .. } => {
-            optimize_plan_tree(input, schema_of, stats_of)
-        }
+        LogicalPlan::SubqueryAlias { input, .. } => optimize_plan_tree(input, schema_of, stats_of),
         LogicalPlan::Values { columns, rows } => {
             let ctx = ExecutionContext::new();
             let empty = Record::new();
@@ -1231,9 +1222,7 @@ fn maybe_attach_vectorized(
                         (input.as_ref().clone(), Some(predicate.clone()))
                     }
                     PhysicalPlan::JitExec {
-                        input,
-                        predicate,
-                        ..
+                        input, predicate, ..
                     } => (input.as_ref().clone(), predicate.clone()),
                     other => (other.clone(), None),
                 };
@@ -1330,12 +1319,14 @@ fn maybe_attach_jit(
             aggr_exprs,
         } if group_exprs.is_empty() && enough && aggr_exprs.iter().all(aggr_args_jit_ok) => {
             match *input {
-                PhysicalPlan::Filter { input: scan, predicate }
-                    if is_jit_compilable(&predicate)
-                        && matches!(
-                            scan.as_ref(),
-                            PhysicalPlan::TableScan { .. } | PhysicalPlan::Values { .. }
-                        ) =>
+                PhysicalPlan::Filter {
+                    input: scan,
+                    predicate,
+                } if is_jit_compilable(&predicate)
+                    && matches!(
+                        scan.as_ref(),
+                        PhysicalPlan::TableScan { .. } | PhysicalPlan::Values { .. }
+                    ) =>
                 {
                     PhysicalPlan::JitExec {
                         input: scan,
@@ -1507,14 +1498,16 @@ fn collect_tables(plan: &LogicalPlan) -> Vec<String> {
             t.extend(collect_tables(right));
             t
         }
-        LogicalPlan::Update { table, .. } | LogicalPlan::Delete { table, .. }
+        LogicalPlan::Update { table, .. }
+        | LogicalPlan::Delete { table, .. }
         | LogicalPlan::Truncate { table, .. }
         | LogicalPlan::Copy { table, .. } => {
             vec![table.clone()]
         }
         LogicalPlan::Insert { table, .. } => vec![table.clone()],
-        LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::DistributedAggregate { input, .. } => collect_tables(input),
+        LogicalPlan::Aggregate { input, .. } | LogicalPlan::DistributedAggregate { input, .. } => {
+            collect_tables(input)
+        }
         LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Filter { input, .. }
@@ -1528,7 +1521,7 @@ fn collect_tables(plan: &LogicalPlan) -> Vec<String> {
             let mut t = collect_tables(left);
             t.extend(collect_tables(right));
             t
-        },
+        }
         LogicalPlan::CreateIndex { table, .. }
         | LogicalPlan::CreateTable { name: table, .. }
         | LogicalPlan::CreateTableAs { name: table, .. }
@@ -1608,8 +1601,7 @@ fn try_subquery_unnest(
             negated,
             correlated: true,
         } => {
-            let Some((outer_col, inner_col, inner_plan)) =
-                extract_single_equi_outer_ref(subquery)
+            let Some((outer_col, inner_col, inner_plan)) = extract_single_equi_outer_ref(subquery)
             else {
                 return Ok(None);
             };
@@ -1638,8 +1630,7 @@ fn try_subquery_unnest(
             // Unnest when the correlation equi is on the same columns as the IN
             // probe (`outer.c IN (SELECT inner.c … WHERE inner.c = OuterRef(c))`)
             // or when OuterRef column matches the IN probe column name.
-            let Some((outer_col, inner_col, inner_plan)) =
-                extract_single_equi_outer_ref(subquery)
+            let Some((outer_col, inner_col, inner_plan)) = extract_single_equi_outer_ref(subquery)
             else {
                 return Ok(None);
             };
@@ -1671,9 +1662,7 @@ fn try_subquery_unnest(
 
 /// Pull a single `inner.col = OuterRef(outer.col)` (either order) out of a
 /// correlated subquery and return the residual plan without that predicate.
-fn extract_single_equi_outer_ref(
-    subquery: &LogicalPlan,
-) -> Option<(String, String, LogicalPlan)> {
+fn extract_single_equi_outer_ref(subquery: &LogicalPlan) -> Option<(String, String, LogicalPlan)> {
     match subquery {
         LogicalPlan::Project { input, .. } | LogicalPlan::SubqueryAlias { input, .. } => {
             extract_single_equi_outer_ref(input)
@@ -1691,10 +1680,7 @@ fn extract_single_equi_outer_ref(
             };
             Some((outer_col, inner_col, plan))
         }
-        LogicalPlan::Filter {
-            input,
-            predicate,
-        } => {
+        LogicalPlan::Filter { input, predicate } => {
             let (outer_col, inner_col, residual) = split_equi_outer_ref(predicate)?;
             let plan = match residual {
                 Some(p) => LogicalPlan::Filter {
@@ -1709,9 +1695,7 @@ fn extract_single_equi_outer_ref(
     }
 }
 
-fn split_equi_outer_ref(
-    pred: &Expression,
-) -> Option<(String, String, Option<Expression>)> {
+fn split_equi_outer_ref(pred: &Expression) -> Option<(String, String, Option<Expression>)> {
     match pred {
         Expression::BinaryOp {
             left,
@@ -1745,13 +1729,8 @@ fn optimize_table_access(
     schema_of: &dyn Fn(&str) -> Option<TableSchema>,
     stats_of: &dyn Fn(&str) -> Option<TableStats>,
 ) -> Result<PhysicalPlan> {
-    let local = optimize_table_access_local(
-        table,
-        residual_filters,
-        predicate,
-        schema_of,
-        stats_of,
-    )?;
+    let local =
+        optimize_table_access_local(table, residual_filters, predicate, schema_of, stats_of)?;
     // PartitionPruningRule: wrap with DistributedScan when the table is sharded.
     if let Some(schema) = schema_of(table) {
         if !matches!(
@@ -1760,10 +1739,8 @@ fn optimize_table_access(
         ) {
             let router = crate::partition::PartitionRouter::new(Vec::new());
             let remote_workers =
-                crate::partition::PartitionPruningRule::prune_workers(
-                    &schema, predicate, &router,
-                )
-                .unwrap_or_default();
+                crate::partition::PartitionPruningRule::prune_workers(&schema, predicate, &router)
+                    .unwrap_or_default();
             return Ok(PhysicalPlan::DistributedScan {
                 table: table.to_string(),
                 remote_workers,
@@ -1841,7 +1818,11 @@ fn try_vector_index_selection(
     schema_of: &dyn Fn(&str) -> Option<TableSchema>,
 ) -> Option<PhysicalPlan> {
     let fetch = fetch?;
-    let LogicalPlan::Sort { input: sort_in, exprs } = input else {
+    let LogicalPlan::Sort {
+        input: sort_in,
+        exprs,
+    } = input
+    else {
         return None;
     };
     if exprs.len() != 1 || !exprs[0].asc {
@@ -1919,10 +1900,7 @@ fn match_secondary_index_equality(
                 None => (true, 1),
             };
             if prefer {
-                let replace = best
-                    .as_ref()
-                    .map(|(c, _, _, _)| cost < *c)
-                    .unwrap_or(true);
+                let replace = best.as_ref().map(|(c, _, _, _)| cost < *c).unwrap_or(true);
                 if replace {
                     best = Some((cost, idx.name.clone(), idx.column.clone(), key_value));
                 }
@@ -1945,25 +1923,28 @@ fn estimate_physical_rows(
     stats_of: &dyn Fn(&str) -> Option<TableStats>,
 ) -> u64 {
     match plan {
-        PhysicalPlan::TableScan { table, .. } => stats_of(table)
-            .map(|s| s.row_count.max(1))
-            .unwrap_or(1_000),
-        PhysicalPlan::IndexScan { table, index_column, key_value, .. } => {
+        PhysicalPlan::TableScan { table, .. } => {
+            stats_of(table).map(|s| s.row_count.max(1)).unwrap_or(1_000)
+        }
+        PhysicalPlan::IndexScan {
+            table,
+            index_column,
+            key_value,
+            ..
+        } => {
             let lit = literal_text(key_value);
             stats_of(table)
                 .map(|s| s.eq_rows_for_column(index_column, lit.as_deref()))
                 .unwrap_or(1)
         }
         PhysicalPlan::VectorIndexScan { fetch, .. } => *fetch as u64,
-        PhysicalPlan::Filter { input, .. } => {
-            (estimate_physical_rows(input, stats_of) / 3).max(1)
-        }
+        PhysicalPlan::Filter { input, .. } => (estimate_physical_rows(input, stats_of) / 3).max(1),
         PhysicalPlan::Values { rows } => rows.len() as u64,
         PhysicalPlan::LateralJsonSrf { left, .. }
         | PhysicalPlan::LateralUnnest { left, .. }
-        | PhysicalPlan::LateralRegexpSrf { left, .. } => {
-            estimate_physical_rows(left, stats_of).saturating_mul(4).max(1)
-        }
+        | PhysicalPlan::LateralRegexpSrf { left, .. } => estimate_physical_rows(left, stats_of)
+            .saturating_mul(4)
+            .max(1),
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::MergeJoin { left, right, .. } => estimate_physical_rows(left, stats_of)
@@ -1997,11 +1978,7 @@ fn estimate_physical_rows(
                 crate::sql::SetOpKind::Except => n_left.saturating_mul(3) / 4 + 1,
             }
         }
-        PhysicalPlan::Insert {
-            values,
-            input,
-            ..
-        } => {
+        PhysicalPlan::Insert { values, input, .. } => {
             if let Some(child) = input {
                 estimate_physical_rows(child, stats_of)
             } else {
@@ -2018,9 +1995,9 @@ fn estimate_physical_rows(
 /// True when `plan` is (or wraps) an ascending Sort whose leading key equals `key`.
 fn is_sorted_on(plan: &PhysicalPlan, key: &Expression) -> bool {
     match plan {
-        PhysicalPlan::Sort { exprs, .. } => exprs
-            .first()
-            .is_some_and(|se| se.asc && &se.expr == key),
+        PhysicalPlan::Sort { exprs, .. } => {
+            exprs.first().is_some_and(|se| se.asc && &se.expr == key)
+        }
         PhysicalPlan::Limit { input, .. } | PhysicalPlan::Filter { input, .. } => {
             is_sorted_on(input, key)
         }
@@ -2050,8 +2027,9 @@ fn match_column_equality(expr: &Expression, column: &str) -> Option<Expression> 
             _ => None,
         },
         // AND: prefer left then right (first matching equality).
-        Expression::And { left, right } => match_column_equality(left, column)
-            .or_else(|| match_column_equality(right, column)),
+        Expression::And { left, right } => {
+            match_column_equality(left, column).or_else(|| match_column_equality(right, column))
+        }
         _ => None,
     }
 }
@@ -2108,7 +2086,11 @@ pub fn optimize_with_values(plan: &LogicalPlan, rows: Vec<Record>) -> Result<Phy
             exprs: exprs.clone(),
         }),
         LogicalPlan::Limit {
-            skip, fetch, with_ties, ties_order, ..
+            skip,
+            fetch,
+            with_ties,
+            ties_order,
+            ..
         } => Ok(PhysicalPlan::Limit {
             input: Box::new(PhysicalPlan::Values { rows }),
             skip: *skip,
@@ -2133,11 +2115,9 @@ pub fn execute_plan(
     ctx: &ExecutionContext,
     txn: &mut Transaction,
 ) -> Result<Vec<Record>> {
-    let physical = optimize_with_catalog(
-        plan,
-        &|t| txn.table_schema(t).ok(),
-        &|t| Some(txn.engine().table_stats(t)),
-    )?;
+    let physical = optimize_with_catalog(plan, &|t| txn.table_schema(t).ok(), &|t| {
+        Some(txn.engine().table_stats(t))
+    })?;
     let mut exec = open_executor_with_txn(physical, ctx, txn)?;
     collect_rows(exec.as_mut())
 }
@@ -2230,10 +2210,7 @@ pub trait Executor: Send {
 
 /// Open a physical plan without storage — only [`PhysicalPlan::Values`] (and
 /// filters/joins over values) can run; [`PhysicalPlan::TableScan`] errors.
-pub fn open_executor(
-    plan: PhysicalPlan,
-    ctx: &ExecutionContext,
-) -> Result<Box<dyn Executor>> {
+pub fn open_executor(plan: PhysicalPlan, ctx: &ExecutionContext) -> Result<Box<dyn Executor>> {
     open_executor_with_storage(plan, ctx, None)
 }
 
@@ -2294,9 +2271,7 @@ fn open_apply_executor(
     storage: Option<&mut Transaction>,
 ) -> Result<Box<dyn Executor>> {
     let txn = storage.ok_or_else(|| {
-        TakyonicError::Sql(
-            "Apply (correlated subquery) requires an active MVCC transaction".into(),
-        )
+        TakyonicError::Sql("Apply (correlated subquery) requires an active MVCC transaction".into())
     })?;
     // SAFETY: `txn` is borrowed from `execute_plan` / open_executor_with_txn for
     // the full lifetime of the returned executor. ApplyExec only touches it from
@@ -2338,7 +2313,11 @@ fn open_executor_with_storage(
                 ))
             })?;
             Ok(Box::new(IndexScanExec::open(
-                txn, &table, index.as_deref(), &key_value, ctx,
+                txn,
+                &table,
+                index.as_deref(),
+                &key_value,
+                ctx,
             )?))
         }
         PhysicalPlan::VectorIndexScan {
@@ -2366,8 +2345,7 @@ fn open_executor_with_storage(
         } => {
             match join_type {
                 JoinType::Inner | JoinType::Left | JoinType::Full => {
-                    let left_exec =
-                        open_executor_with_storage(*left, ctx, storage.as_deref_mut())?;
+                    let left_exec = open_executor_with_storage(*left, ctx, storage.as_deref_mut())?;
                     let mut right_exec =
                         open_executor_with_storage(*right, ctx, storage.as_deref_mut())?;
                     let right_rows = drain_executor(right_exec.as_mut())?;
@@ -2400,11 +2378,7 @@ fn open_executor_with_storage(
                 }
             }
         }
-        PhysicalPlan::LateralJsonSrf {
-            left,
-            doc,
-            kind,
-        } => {
+        PhysicalPlan::LateralJsonSrf { left, doc, kind } => {
             let left_exec = open_executor_with_storage(*left, ctx, storage)?;
             Ok(Box::new(LateralJsonSrfExec {
                 left: left_exec,
@@ -2585,14 +2559,7 @@ fn open_executor_with_storage(
             let txn = storage.as_deref_mut().ok_or_else(|| {
                 TakyonicError::Sql("INSERT requires an active MVCC transaction".into())
             })?;
-            InsertExec::run(
-                txn,
-                &table,
-                records,
-                on_conflict,
-                returning.as_ref(),
-                ctx,
-            )
+            InsertExec::run(txn, &table, records, on_conflict, returning.as_ref(), ctx)
         }
         PhysicalPlan::Update {
             table,
@@ -2606,14 +2573,7 @@ fn open_executor_with_storage(
             let txn = storage.as_deref_mut().ok_or_else(|| {
                 TakyonicError::Sql("UPDATE requires an active MVCC transaction".into())
             })?;
-            UpdateExec::run(
-                txn,
-                &table,
-                &assignments,
-                targets,
-                returning.as_ref(),
-                ctx,
-            )
+            UpdateExec::run(txn, &table, &assignments, targets, returning.as_ref(), ctx)
         }
         PhysicalPlan::Delete {
             table,
@@ -2728,9 +2688,7 @@ fn open_executor_with_storage(
             group_exprs,
             aggr_exprs,
         } => {
-            let metrics = storage
-                .as_ref()
-                .map(|t| Arc::clone(t.engine().metrics()));
+            let metrics = storage.as_ref().map(|t| Arc::clone(t.engine().metrics()));
             let child = open_executor_with_storage(*input, ctx, storage)?;
             Ok(Box::new(JitPipelineExec::try_new(
                 child,
@@ -2746,15 +2704,10 @@ fn open_executor_with_storage(
             predicate,
             aggr_exprs,
         } => {
-            let metrics = storage
-                .as_ref()
-                .map(|t| Arc::clone(t.engine().metrics()));
+            let metrics = storage.as_ref().map(|t| Arc::clone(t.engine().metrics()));
             let child = open_executor_with_storage(*input, ctx, storage)?;
             Ok(Box::new(VectorizedPipelineExec::try_new(
-                child,
-                predicate,
-                aggr_exprs,
-                metrics,
+                child, predicate, aggr_exprs, metrics,
             )?))
         }
         PhysicalPlan::DistributedScan { input, .. } => {
@@ -3024,12 +2977,8 @@ fn validate_record_against_catalog(record: &Record, schema: &TableSchema) -> Res
             )));
         }
         if let Some(s) = val.filter(|s| !s.is_empty()) {
-            coerce_column_value(&col.data_type, s).map_err(|e| {
-                TakyonicError::Sql(format!(
-                    "column \"{}\": {e}",
-                    col.name
-                ))
-            })?;
+            coerce_column_value(&col.data_type, s)
+                .map_err(|e| TakyonicError::Sql(format!("column \"{}\": {e}", col.name)))?;
         }
     }
     for idx in &schema.indexes {
@@ -3060,9 +3009,7 @@ fn coerce_column_value(data_type: &str, value: &str) -> Result<()> {
             if value.starts_with("\\x") || value.starts_with("\\X") {
                 let hex = &value[2..];
                 if hex.len() % 2 != 0 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(TakyonicError::Sql(
-                        "invalid bytea hex encoding".into(),
-                    ));
+                    return Err(TakyonicError::Sql("invalid bytea hex encoding".into()));
                 }
             }
         }
@@ -3164,15 +3111,12 @@ impl AnalyzeExec {
         let schema = txn.table_schema(&table)?;
         let records = txn.scan_table_records(&table)?;
         let stats = crate::stats::compute_table_stats(&schema, &records);
-        txn.engine()
-            .apply_analyzed_stats(&table, stats.clone())?;
+        txn.engine().apply_analyzed_stats(&table, stats.clone())?;
         let row = Record::new()
             .set("table", table)
             .set("rows", stats.row_count.to_string())
             .set("pages", stats.page_count.to_string());
-        Ok(Self {
-            result: Some(row),
-        })
+        Ok(Self { result: Some(row) })
     }
 }
 
@@ -3199,9 +3143,7 @@ impl VacuumExec {
             .set("versions_after", stats.versions_after.to_string())
             .set("dead_heap", stats.dead_heap_versions.to_string())
             .set("dead_index", stats.dead_index_versions.to_string());
-        Ok(Self {
-            result: Some(row),
-        })
+        Ok(Self { result: Some(row) })
     }
 }
 
@@ -3390,10 +3332,7 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
                 ..
             } => match index {
                 Some(idx) => {
-                    let _ = writeln!(
-                        out,
-                        "{pad}IndexScan({idx}) on {table}.{index_column}"
-                    );
+                    let _ = writeln!(out, "{pad}IndexScan({idx}) on {table}.{index_column}");
                 }
                 None => {
                     let _ = writeln!(out, "{pad}IndexScan(pk) on {table}.{index_column}");
@@ -3411,7 +3350,7 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
                     out,
                     "{pad}VectorIndexScanExec({index}) on {table}.{index_column} k={fetch} skip={skip}"
                 );
-            },
+            }
             PhysicalPlan::Filter { input, .. } => {
                 let _ = writeln!(out, "{pad}Filter");
                 walk(input, indent + 1, out);
@@ -3455,10 +3394,7 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
                 walk(left, indent + 1, out);
             }
             PhysicalPlan::LateralRegexpSrf {
-                left,
-                column,
-                kind,
-                ..
+                left, column, kind, ..
             } => {
                 let label = match kind {
                     LateralRegexpSrfKind::SplitToTable => {
@@ -3598,10 +3534,7 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
                     remote_workers.len()
                 );
                 for (node, part) in remote_workers {
-                    let _ = writeln!(
-                        out,
-                        "{pad}  RemoteWorker(node={node}, partition={part})"
-                    );
+                    let _ = writeln!(out, "{pad}  RemoteWorker(node={node}, partition={part})");
                 }
                 walk(input, indent + 1, out);
             }
@@ -3918,9 +3851,7 @@ impl WindowExec {
                                     }
                                 }
                             }
-                            out_cells[i] = hit
-                                .map(|v| value_to_field(&v))
-                                .unwrap_or_default();
+                            out_cells[i] = hit.map(|v| value_to_field(&v)).unwrap_or_default();
                         } else {
                             let target = if call.kind == crate::sql::WindowKind::FirstValue {
                                 members[0]
@@ -3959,9 +3890,7 @@ impl WindowExec {
                                     break;
                                 }
                             }
-                            out_cells[i] = hit
-                                .map(|v| value_to_field(&v))
-                                .unwrap_or_default();
+                            out_cells[i] = hit.map(|v| value_to_field(&v)).unwrap_or_default();
                         } else if n > 0 && n <= members.len() {
                             let v = evaluate(value_expr, &rows[members[n - 1]], &self.ctx)?;
                             out_cells[i] = value_to_field(&v);
@@ -4045,16 +3974,15 @@ impl WindowExec {
                     | crate::sql::WindowKind::Mode
                     | crate::sql::WindowKind::JsonObjectAgg
                     | crate::sql::WindowKind::JsonbObjectAgg => {
-                        let members =
-                            window_frame_members(
-                                i,
-                                part_start,
-                                part_end,
-                                call.frame.as_ref(),
-                                &call.order_by,
-                                &rows,
-                                &self.ctx,
-                            )?;
+                        let members = window_frame_members(
+                            i,
+                            part_start,
+                            part_end,
+                            call.frame.as_ref(),
+                            &call.order_by,
+                            &rows,
+                            &self.ctx,
+                        )?;
                         let acc_name = match call.kind {
                             crate::sql::WindowKind::Sum => "SUM",
                             crate::sql::WindowKind::Avg => "AVG",
@@ -4125,10 +4053,7 @@ impl WindowExec {
                                             "{acc_name} missing second argument"
                                         ))
                                     })?;
-                                    vec![
-                                        evaluate(y, row, &self.ctx)?,
-                                        evaluate(x, row, &self.ctx)?,
-                                    ]
+                                    vec![evaluate(y, row, &self.ctx)?, evaluate(x, row, &self.ctx)?]
                                 }
                                 _ => match &call.value {
                                     None => Vec::new(),
@@ -4285,9 +4210,7 @@ fn groups_frame_range(
     ctx: &ExecutionContext,
 ) -> Result<(usize, usize)> {
     if order_by.is_empty() {
-        return Err(TakyonicError::Sql(
-            "GROUPS frames require ORDER BY".into(),
-        ));
+        return Err(TakyonicError::Sql("GROUPS frames require ORDER BY".into()));
     }
     let groups = build_peer_groups(part_start, part_end, order_by, rows, ctx)?;
     if groups.is_empty() {
@@ -4605,11 +4528,7 @@ fn apply_set_op(
         }
         (SetOpKind::Intersect, false) => {
             let right_set: HashSet<Record> = right.into_iter().collect();
-            dedupe_records(
-                left.into_iter()
-                    .filter(|r| right_set.contains(r))
-                    .collect(),
-            )
+            dedupe_records(left.into_iter().filter(|r| right_set.contains(r)).collect())
         }
         (SetOpKind::Intersect, true) => {
             let mut right_counts: HashMap<Record, usize> = HashMap::new();
@@ -4764,9 +4683,7 @@ impl VectorizedPipelineExec {
         aggr_exprs: Vec<Expression>,
         metrics: Option<Arc<EngineMetrics>>,
     ) -> Result<Self> {
-        use crate::vectorized::{
-            VectorizedAggregateExec, collect_vector_columns, is_vectorizable,
-        };
+        use crate::vectorized::{VectorizedAggregateExec, collect_vector_columns, is_vectorizable};
 
         // Filter-only: run masked batch scan and emit compacted rows.
         if aggr_exprs.is_empty() {
@@ -4795,12 +4712,8 @@ impl VectorizedPipelineExec {
         // Single SUM / COUNT global aggregate.
         if aggr_exprs.len() != 1 {
             // Fall back: materialize via interpreted AggregateExec path.
-            let mut agg = AggregateExec::new(
-                input,
-                Vec::new(),
-                aggr_exprs,
-                ExecutionContext::new(),
-            )?;
+            let mut agg =
+                AggregateExec::new(input, Vec::new(), aggr_exprs, ExecutionContext::new())?;
             let mut rows = Vec::new();
             while let Some(r) = agg.next_row()? {
                 rows.push(r);
@@ -4831,12 +4744,8 @@ impl VectorizedPipelineExec {
                     cols.dedup();
                     (Some(args[0].clone()), result_name, cols)
                 } else {
-                    let mut agg = AggregateExec::new(
-                        input,
-                        Vec::new(),
-                        aggr_exprs,
-                        ExecutionContext::new(),
-                    )?;
+                    let mut agg =
+                        AggregateExec::new(input, Vec::new(), aggr_exprs, ExecutionContext::new())?;
                     let mut rows = Vec::new();
                     while let Some(r) = agg.next_row()? {
                         rows.push(r);
@@ -4854,14 +4763,8 @@ impl VectorizedPipelineExec {
             }
         };
 
-        let mut vex = VectorizedAggregateExec::new(
-            input,
-            cols,
-            predicate,
-            sum_expr,
-            result_name,
-            metrics,
-        );
+        let mut vex =
+            VectorizedAggregateExec::new(input, cols, predicate, sum_expr, result_name, metrics);
         let rec = vex.run()?;
         Ok(Self {
             pending: Some(vec![rec]),
@@ -5177,16 +5080,12 @@ impl Executor for NestedLoopJoin {
                 // Seed left null template for FULL from the first left row's keys.
                 if self.join_type == JoinType::Full && self.left_null_template.fields.is_empty() {
                     if let Some(row) = self.current_left.as_ref() {
-                        self.left_null_template =
-                            null_template_from_keys(row.fields.keys());
+                        self.left_null_template = null_template_from_keys(row.fields.keys());
                     }
                 }
             }
 
-            let outer_row = self
-                .current_left
-                .as_ref()
-                .expect("current_left set above");
+            let outer_row = self.current_left.as_ref().expect("current_left set above");
 
             while self.right_idx < self.right_rows.len() {
                 let ri = self.right_idx;
@@ -5368,10 +5267,7 @@ impl HashJoinExec {
                         let i = self.full_dangling_row_idx;
                         self.full_dangling_row_idx += 1;
                         if !rows[i].1 {
-                            return Some(combine_rows(
-                                &self.left_null_template,
-                                &rows[i].0,
-                            ));
+                            return Some(combine_rows(&self.left_null_template, &rows[i].0));
                         }
                     }
                 }
@@ -5435,10 +5331,7 @@ impl Executor for HashJoinExec {
                 };
                 self.match_idx = 0;
                 if self.matches.is_empty() {
-                    return Ok(Some(combine_rows(
-                        &probe_row,
-                        &self.right_null_template,
-                    )));
+                    return Ok(Some(combine_rows(&probe_row, &self.right_null_template)));
                 }
                 self.current_probe = Some(probe_row);
             },
@@ -5470,8 +5363,7 @@ impl Executor for HashJoinExec {
                     return Ok(self.next_full_dangling());
                 };
                 if self.left_null_template.fields.is_empty() {
-                    self.left_null_template =
-                        null_template_from_keys(probe_row.fields.keys());
+                    self.left_null_template = null_template_from_keys(probe_row.fields.keys());
                 }
                 let key = evaluate(&self.probe_key, &probe_row, &self.ctx)?;
                 self.matches.clear();
@@ -5486,10 +5378,7 @@ impl Executor for HashJoinExec {
                 }
                 self.match_idx = 0;
                 if self.matches.is_empty() {
-                    return Ok(Some(combine_rows(
-                        &probe_row,
-                        &self.right_null_template,
-                    )));
+                    return Ok(Some(combine_rows(&probe_row, &self.right_null_template)));
                 }
                 self.current_probe = Some(probe_row);
             },
@@ -5515,10 +5404,7 @@ impl Executor for HashJoinExec {
                 };
                 self.match_idx = 0;
                 if self.matches.is_empty() {
-                    return Ok(Some(combine_rows(
-                        &self.left_null_template,
-                        &probe_row,
-                    )));
+                    return Ok(Some(combine_rows(&self.left_null_template, &probe_row)));
                 }
                 self.current_probe = Some(probe_row);
             },
@@ -5784,8 +5670,7 @@ impl Accumulator for OrderedAccumulator {
     }
 
     fn update_ordered(&mut self, values: &[Value], order_keys: &[Value]) -> Result<()> {
-        self.buffered
-            .push((order_keys.to_vec(), values.to_vec()));
+        self.buffered.push((order_keys.to_vec(), values.to_vec()));
         Ok(())
     }
 
@@ -6595,12 +6480,10 @@ fn advisory_lock_key_from_args(vals: &[Value]) -> Result<i64> {
     match vals.len() {
         1 => value_as_i64(&vals[0]),
         2 => {
-            let k1 = i32::try_from(value_as_i64(&vals[0])?).map_err(|_| {
-                TakyonicError::Sql("advisory lock key1 out of int32 range".into())
-            })?;
-            let k2 = i32::try_from(value_as_i64(&vals[1])?).map_err(|_| {
-                TakyonicError::Sql("advisory lock key2 out of int32 range".into())
-            })?;
+            let k1 = i32::try_from(value_as_i64(&vals[0])?)
+                .map_err(|_| TakyonicError::Sql("advisory lock key1 out of int32 range".into()))?;
+            let k2 = i32::try_from(value_as_i64(&vals[1])?)
+                .map_err(|_| TakyonicError::Sql("advisory lock key2 out of int32 range".into()))?;
             Ok(crate::sql::advisory_lock_key_pair(k1, k2))
         }
         _ => Err(TakyonicError::Sql(
@@ -6675,8 +6558,7 @@ fn eval_arith(left: &Value, op: crate::sql::ArithOp, right: &Value) -> Result<Va
         (None, Some(delta), ArithOp::Sub) => {
             let ts = left.to_display();
             return Ok(Value::String(crate::sql::add_secs_to_timestamp_text(
-                &ts,
-                -delta,
+                &ts, -delta,
             )?));
         }
         (Some(_), None, ArithOp::Sub) => {
@@ -6737,9 +6619,7 @@ fn new_base_accumulator(name: &str) -> Result<Box<dyn Accumulator>> {
         "MIN" => Box::new(MinAccumulator::default()),
         "MAX" => Box::new(MaxAccumulator::default()),
         "JSON_AGG" | "JSONB_AGG" => Box::new(JsonAggAccumulator::default()),
-        "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => {
-            Box::new(JsonObjectAggAccumulator::default())
-        }
+        "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => Box::new(JsonObjectAggAccumulator::default()),
         "STRING_AGG" => Box::new(StringAggAccumulator::default()),
         "ARRAY_AGG" => Box::new(ArrayAggAccumulator::default()),
         "BOOL_AND" | "EVERY" => Box::new(BoolAndAccumulator::default()),
@@ -6799,9 +6679,7 @@ fn new_accumulator(expr: &Expression) -> Result<Box<dyn Accumulator>> {
         "MIN" => Box::new(MinAccumulator::default()),
         "MAX" => Box::new(MaxAccumulator::default()),
         "JSON_AGG" | "JSONB_AGG" => Box::new(JsonAggAccumulator::default()),
-        "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => {
-            Box::new(JsonObjectAggAccumulator::default())
-        }
+        "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG" => Box::new(JsonObjectAggAccumulator::default()),
         "STRING_AGG" => Box::new(StringAggAccumulator::default()),
         "ARRAY_AGG" => Box::new(ArrayAggAccumulator::default()),
         "BOOL_AND" | "EVERY" => Box::new(BoolAndAccumulator::default()),
@@ -6848,7 +6726,10 @@ fn new_accumulator(expr: &Expression) -> Result<Box<dyn Accumulator>> {
         });
     }
     // MODE / PERCENTILE_* use order_by for WITHIN GROUP direction, not OrderedAccumulator.
-    if !order_by.is_empty() && name != "MODE" && name != "PERCENTILE_CONT" && name != "PERCENTILE_DISC"
+    if !order_by.is_empty()
+        && name != "MODE"
+        && name != "PERCENTILE_CONT"
+        && name != "PERCENTILE_DISC"
     {
         let star_count = name == "COUNT" && args.is_empty();
         Ok(Box::new(OrderedAccumulator {
@@ -7064,11 +6945,7 @@ fn cmp_sort_keys(a: &[Value], b: &[Value], exprs: &[SortExpr]) -> Ordering {
     Ordering::Equal
 }
 
-fn eval_sort_keys(
-    row: &Record,
-    exprs: &[SortExpr],
-    ctx: &ExecutionContext,
-) -> Result<Vec<Value>> {
+fn eval_sort_keys(row: &Record, exprs: &[SortExpr], ctx: &ExecutionContext) -> Result<Vec<Value>> {
     let mut keys = Vec::with_capacity(exprs.len());
     for se in exprs {
         keys.push(evaluate(&se.expr, row, ctx)?);
@@ -7343,9 +7220,8 @@ fn const_json_doc_text(expr: &Expression) -> Result<String> {
         ));
     }
     let s = v.to_display();
-    let parsed: serde_json::Value = serde_json::from_str(s.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("JSON SRF: invalid JSON: {e}"))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(s.trim())
+        .map_err(|e| TakyonicError::Sql(format!("JSON SRF: invalid JSON: {e}")))?;
     Ok(parsed.to_string())
 }
 
@@ -7446,14 +7322,9 @@ impl Executor for LateralUnnestExec {
                 .into_iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    let mut inner =
-                        Record::new().set(self.column.clone(), value_to_field(&v));
+                    let mut inner = Record::new().set(self.column.clone(), value_to_field(&v));
                     if let Some(ord) = &self.ordinality_column {
-                        let n = if self.zero_based_ordinality {
-                            i
-                        } else {
-                            i + 1
-                        };
+                        let n = if self.zero_based_ordinality { i } else { i + 1 };
                         inner = inner.set(ord.clone(), n.to_string());
                     }
                     combine_rows(&outer, &inner)
@@ -7471,9 +7342,7 @@ fn regexp_srf_needs_row(
 ) -> bool {
     crate::sql::expr_needs_row_eval(string)
         || crate::sql::expr_needs_row_eval(pattern)
-        || flags
-            .as_ref()
-            .is_some_and(crate::sql::expr_needs_row_eval)
+        || flags.as_ref().is_some_and(crate::sql::expr_needs_row_eval)
 }
 
 fn fold_regexp_srf_args(
@@ -7602,14 +7471,9 @@ pub fn evaluate(expr: &Expression, row: &Record, ctx: &ExecutionContext) -> Resu
             .get(name)
             .map(Value::from_text)
             .ok_or_else(|| TakyonicError::Sql(format!("column `{name}` not found"))),
-        Expression::OuterRef(name) => row
-            .get(name)
-            .map(Value::from_text)
-            .ok_or_else(|| {
-                TakyonicError::Sql(format!(
-                    "outer reference `{name}` not found on current row"
-                ))
-            }),
+        Expression::OuterRef(name) => row.get(name).map(Value::from_text).ok_or_else(|| {
+            TakyonicError::Sql(format!("outer reference `{name}` not found on current row"))
+        }),
         Expression::Literal(s) => Ok(Value::from_text(s)),
         Expression::Parameter(idx) => Ok(ctx.param(*idx)?.clone()),
         Expression::BinaryOp { left, op, right } => {
@@ -7689,15 +7553,20 @@ pub fn evaluate(expr: &Expression, row: &Record, ctx: &ExecutionContext) -> Resu
             if idx_v.is_null() {
                 return Ok(Value::Null);
             }
-            let idx = idx_v.as_f64().ok_or_else(|| {
-                TakyonicError::Sql("array subscript must be numeric".into())
-            })? as i64;
+            let idx = idx_v
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("array subscript must be numeric".into()))?
+                as i64;
             if idx < 1 || idx as usize > elems.len() {
                 return Ok(Value::Null);
             }
             Ok(elems[(idx as usize) - 1].clone())
         }
-        Expression::VectorDistance { left, right, metric } => {
+        Expression::VectorDistance {
+            left,
+            right,
+            metric,
+        } => {
             let lv = evaluate_as_vector(left, row, ctx)?;
             let rv = evaluate_as_vector(right, row, ctx)?;
             // Prefer SIMD Euclidean for the `<->` operator path.
@@ -7889,9 +7758,7 @@ pub fn evaluate(expr: &Expression, row: &Record, ctx: &ExecutionContext) -> Resu
                 Ok(lv)
             }
         }
-        Expression::ScalarFunction { name, args } => {
-            eval_scalar_function(name, args, row, ctx)
-        }
+        Expression::ScalarFunction { name, args } => eval_scalar_function(name, args, row, ctx),
     }
 }
 
@@ -8072,18 +7939,19 @@ fn eval_scalar_function(
             if vals.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let operand = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("width_bucket operand must be numeric".into())
-            })?;
-            let low = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("width_bucket low must be numeric".into())
-            })?;
-            let high = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("width_bucket high must be numeric".into())
-            })?;
-            let count = vals[3].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("width_bucket count must be numeric".into())
-            })? as i64;
+            let operand = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("width_bucket operand must be numeric".into()))?;
+            let low = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("width_bucket low must be numeric".into()))?;
+            let high = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("width_bucket high must be numeric".into()))?;
+            let count = vals[3]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("width_bucket count must be numeric".into()))?
+                as i64;
             Ok(Value::Int(crate::sql::width_bucket(
                 operand, low, high, count,
             )?))
@@ -8144,7 +8012,10 @@ fn eval_scalar_function(
                 return Ok(Value::Null);
             }
             let length = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql(format!("{} length must be numeric", name.to_ascii_lowercase()))
+                TakyonicError::Sql(format!(
+                    "{} length must be numeric",
+                    name.to_ascii_lowercase()
+                ))
             })? as i64;
             let fill = match vals.get(2) {
                 None => " ".to_string(),
@@ -8162,9 +8033,10 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let count = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("repeat count must be numeric".into())
-            })? as i64;
+            let count = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("repeat count must be numeric".into()))?
+                as i64;
             Ok(Value::String(crate::sql::repeat(
                 &vals[0].to_display(),
                 count,
@@ -8209,9 +8081,10 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let n = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("chr argument must be numeric".into())
-            })? as i64;
+            let n = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("chr argument must be numeric".into()))?
+                as i64;
             Ok(Value::String(crate::sql::chr(n)?))
         }
         "MD5" => {
@@ -8260,15 +8133,18 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() || vals[2].is_null() {
                 return Ok(Value::Null);
             }
-            let from = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("overlay FROM must be numeric".into())
-            })? as i64;
+            let from = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("overlay FROM must be numeric".into()))?
+                as i64;
             let for_count = match vals.get(3) {
                 None => None,
                 Some(v) if v.is_null() => None,
-                Some(v) => Some(v.as_f64().ok_or_else(|| {
-                    TakyonicError::Sql("overlay FOR must be numeric".into())
-                })? as i64),
+                Some(v) => Some(
+                    v.as_f64()
+                        .ok_or_else(|| TakyonicError::Sql("overlay FOR must be numeric".into()))?
+                        as i64,
+                ),
             };
             Ok(Value::String(crate::sql::overlay(
                 &vals[0].to_display(),
@@ -8327,36 +8203,36 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("CEIL requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("CEIL requires a number".into()))?;
             Ok(Value::Float(f.ceil()))
         }
         "FLOOR" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("FLOOR requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("FLOOR requires a number".into()))?;
             Ok(Value::Float(f.floor()))
         }
         "ROUND" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("ROUND requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("ROUND requires a number".into()))?;
             let digits = vals
                 .get(1)
                 .map(|v| {
                     if v.is_null() {
                         Ok(0i64)
                     } else {
-                        v.as_f64()
-                            .map(|x| x as i64)
-                            .ok_or_else(|| TakyonicError::Sql("ROUND digits must be numeric".into()))
+                        v.as_f64().map(|x| x as i64).ok_or_else(|| {
+                            TakyonicError::Sql("ROUND digits must be numeric".into())
+                        })
                     }
                 })
                 .transpose()?
@@ -8368,18 +8244,18 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("TRUNC requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("TRUNC requires a number".into()))?;
             let digits = vals
                 .get(1)
                 .map(|v| {
                     if v.is_null() {
                         Ok(0i64)
                     } else {
-                        v.as_f64()
-                            .map(|x| x as i64)
-                            .ok_or_else(|| TakyonicError::Sql("TRUNC digits must be numeric".into()))
+                        v.as_f64().map(|x| x as i64).ok_or_else(|| {
+                            TakyonicError::Sql("TRUNC digits must be numeric".into())
+                        })
                     }
                 })
                 .transpose()?
@@ -8390,21 +8266,21 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("SIGN requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("SIGN requires a number".into()))?;
             Ok(Value::Float(crate::sql::sign(f)))
         }
         "MOD" => {
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let a = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MOD requires numbers".into())
-            })?;
-            let b = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MOD requires numbers".into())
-            })?;
+            let a = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MOD requires numbers".into()))?;
+            let b = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MOD requires numbers".into()))?;
             if b == 0.0 {
                 return Err(TakyonicError::Sql("division by zero in MOD".into()));
             }
@@ -8418,12 +8294,12 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let y = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("DIV requires numbers".into())
-            })?;
-            let x = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("DIV requires numbers".into())
-            })?;
+            let y = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("DIV requires numbers".into()))?;
+            let x = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("DIV requires numbers".into()))?;
             Ok(Value::Int(crate::sql::div_int(y, x)?))
         }
         "PI" => Ok(Value::Float(std::f64::consts::PI)),
@@ -8431,9 +8307,9 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("SQRT requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("SQRT requires a number".into()))?;
             if f < 0.0 {
                 return Err(TakyonicError::Sql(
                     "cannot take square root of a negative number".into(),
@@ -8445,18 +8321,18 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("CBRT requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("CBRT requires a number".into()))?;
             Ok(Value::Float(f.cbrt()))
         }
         "LN" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("LN requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("LN requires a number".into()))?;
             if f <= 0.0 {
                 return Err(TakyonicError::Sql(
                     "cannot take logarithm of a non-positive number".into(),
@@ -8481,35 +8357,31 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("EXP requires a number".into())
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("EXP requires a number".into()))?;
             Ok(Value::Float(f.exp()))
         }
         "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "RADIANS" | "DEGREES" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let f = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql(format!("{name} requires a number"))
-            })?;
+            let f = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql(format!("{name} requires a number")))?;
             let out = match name {
                 "SIN" => f.sin(),
                 "COS" => f.cos(),
                 "TAN" => f.tan(),
                 "ASIN" => {
                     if !(-1.0..=1.0).contains(&f) {
-                        return Err(TakyonicError::Sql(
-                            "ASIN input out of range [-1, 1]".into(),
-                        ));
+                        return Err(TakyonicError::Sql("ASIN input out of range [-1, 1]".into()));
                     }
                     f.asin()
                 }
                 "ACOS" => {
                     if !(-1.0..=1.0).contains(&f) {
-                        return Err(TakyonicError::Sql(
-                            "ACOS input out of range [-1, 1]".into(),
-                        ));
+                        return Err(TakyonicError::Sql("ACOS input out of range [-1, 1]".into()));
                     }
                     f.acos()
                 }
@@ -8524,28 +8396,27 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let y = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("ATAN2 requires numbers".into())
-            })?;
-            let x = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("ATAN2 requires numbers".into())
-            })?;
+            let y = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("ATAN2 requires numbers".into()))?;
+            let x = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("ATAN2 requires numbers".into()))?;
             Ok(Value::Float(y.atan2(x)))
         }
         "POWER" | "POW" => {
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let a = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("POWER requires numbers".into())
-            })?;
-            let b = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("POWER requires numbers".into())
-            })?;
+            let a = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("POWER requires numbers".into()))?;
+            let b = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("POWER requires numbers".into()))?;
             Ok(Value::Float(a.powf(b)))
         }
-        "NOW" | "CURRENT_TIMESTAMP" | "STATEMENT_TIMESTAMP"
-        | "TRANSACTION_TIMESTAMP" => {
+        "NOW" | "CURRENT_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
             Ok(Value::String(ctx.statement_timestamp.clone()))
         }
         "LOCALTIMESTAMP" => {
@@ -8603,9 +8474,10 @@ fn eval_scalar_function(
             let value = match &vals[1] {
                 Value::Int(i) => *i,
                 Value::Float(f) => *f as i64,
-                other => other.to_display().parse::<i64>().map_err(|_| {
-                    TakyonicError::Sql("SETVAL value must be an integer".into())
-                })?,
+                other => other
+                    .to_display()
+                    .parse::<i64>()
+                    .map_err(|_| TakyonicError::Sql("SETVAL value must be an integer".into()))?,
             };
             let is_called = vals.get(2).map(|v| v.is_truthy()).unwrap_or(true);
             Ok(Value::Int(crate::sql::setval(
@@ -8619,10 +8491,7 @@ fn eval_scalar_function(
             if vals.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            match crate::sql::pg_get_serial_sequence(
-                &vals[0].to_display(),
-                &vals[1].to_display(),
-            ) {
+            match crate::sql::pg_get_serial_sequence(&vals[0].to_display(), &vals[1].to_display()) {
                 Some(s) => Ok(Value::String(s)),
                 None => Ok(Value::Null),
             }
@@ -8639,14 +8508,11 @@ fn eval_scalar_function(
         "PG_CURRENT_WAL_LSN" | "PG_CURRENT_WAL_INSERT_LSN" | "PG_CURRENT_WAL_FLUSH_LSN" => {
             Ok(Value::String(crate::sql::pg_current_wal_lsn()))
         }
-        "PG_SWITCH_WAL" | "PG_SWITCH_XLOG" => {
-            Ok(Value::String(crate::sql::pg_switch_wal()))
+        "PG_SWITCH_WAL" | "PG_SWITCH_XLOG" => Ok(Value::String(crate::sql::pg_switch_wal())),
+        "PG_LAST_WAL_RECEIVE_LSN" | "PG_LAST_WAL_REPLAY_LSN" | "PG_LAST_XACT_REPLAY_TIMESTAMP" => {
+            Ok(Value::Null)
         }
-        "PG_LAST_WAL_RECEIVE_LSN" | "PG_LAST_WAL_REPLAY_LSN"
-        | "PG_LAST_XACT_REPLAY_TIMESTAMP" => Ok(Value::Null),
-        "PG_IS_WAL_REPLAY_PAUSED" => {
-            Ok(Value::Bool(crate::sql::pg_is_wal_replay_paused()))
-        }
+        "PG_IS_WAL_REPLAY_PAUSED" => Ok(Value::Bool(crate::sql::pg_is_wal_replay_paused())),
         "PG_WAL_REPLAY_PAUSE" => {
             crate::sql::pg_wal_replay_pause();
             Ok(Value::Null)
@@ -8669,9 +8535,7 @@ fn eval_scalar_function(
                 &vals[0].to_display(),
             )?))
         }
-        "PG_BACKUP_STOP" | "PG_STOP_BACKUP" => {
-            Ok(Value::String(crate::sql::pg_backup_stop()?))
-        }
+        "PG_BACKUP_STOP" | "PG_STOP_BACKUP" => Ok(Value::String(crate::sql::pg_backup_stop()?)),
         "PG_CREATE_RESTORE_POINT" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
@@ -9045,9 +8909,7 @@ fn eval_scalar_function(
                         TakyonicError::Sql(format!("PG_DESCRIBE_OBJECT {label} out of range"))
                     }),
                     other => other.to_display().parse::<u32>().map_err(|_| {
-                        TakyonicError::Sql(format!(
-                            "PG_DESCRIBE_OBJECT {label} must be an OID"
-                        ))
+                        TakyonicError::Sql(format!("PG_DESCRIBE_OBJECT {label} must be an OID"))
                     }),
                 }
             };
@@ -9090,9 +8952,7 @@ fn eval_scalar_function(
                         TakyonicError::Sql(format!("PG_IDENTIFY_OBJECT {label} out of range"))
                     }),
                     other => other.to_display().parse::<u32>().map_err(|_| {
-                        TakyonicError::Sql(format!(
-                            "PG_IDENTIFY_OBJECT {label} must be an OID"
-                        ))
+                        TakyonicError::Sql(format!("PG_IDENTIFY_OBJECT {label} must be an OID"))
                     }),
                 }
             };
@@ -9134,11 +8994,11 @@ fn eval_scalar_function(
                 Value::Float(f) => *f as i64,
                 other => {
                     let s = other.to_display();
-                    s.parse::<i64>().or_else(|_| {
-                        s.parse::<f64>().map(|f| f as i64)
-                    }).map_err(|_| {
-                        TakyonicError::Sql("PG_SIZE_PRETTY requires a numeric argument".into())
-                    })?
+                    s.parse::<i64>()
+                        .or_else(|_| s.parse::<f64>().map(|f| f as i64))
+                        .map_err(|_| {
+                            TakyonicError::Sql("PG_SIZE_PRETTY requires a numeric argument".into())
+                        })?
                 }
             };
             Ok(Value::String(crate::sql::pg_size_pretty(n)))
@@ -9166,21 +9026,21 @@ fn eval_scalar_function(
         "CURRENT_TIME" | "LOCALTIME" => Ok(Value::String(crate::sql::time_from_timestamp_text(
             &ctx.statement_timestamp,
         ))),
-        "NUM_NONNULLS" => {
-            Ok(Value::Int(vals.iter().filter(|v| !v.is_null()).count() as i64))
-        }
-        "NUM_NULLS" => {
-            Ok(Value::Int(vals.iter().filter(|v| v.is_null()).count() as i64))
-        }
+        "NUM_NONNULLS" => Ok(Value::Int(
+            vals.iter().filter(|v| !v.is_null()).count() as i64
+        )),
+        "NUM_NULLS" => Ok(Value::Int(
+            vals.iter().filter(|v| v.is_null()).count() as i64
+        )),
         "RANDOM" => Ok(Value::Float(crate::sql::random_f64())),
         "GEN_RANDOM_UUID" => Ok(Value::String(crate::sql::gen_random_uuid())),
         "PG_SLEEP" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let secs = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("PG_SLEEP requires a numeric argument".into())
-            })?;
+            let secs = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("PG_SLEEP requires a numeric argument".into()))?;
             crate::sql::pg_sleep(secs)?;
             Ok(Value::Null)
         }
@@ -9191,16 +9051,12 @@ fn eval_scalar_function(
             crate::sql::pg_notify(&vals[0].to_display(), &vals[1].to_display())?;
             Ok(Value::Null)
         }
-        "PG_NOTIFICATION_QUEUE_USAGE" => {
-            Ok(Value::Float(crate::sql::pg_notification_queue_usage(
-                ctx.session_id,
-            )))
-        }
-        "PG_LISTENING_CHANNELS" => {
-            Ok(Value::String(crate::sql::format_listening_channels(
-                &ctx.listening_channels,
-            )))
-        }
+        "PG_NOTIFICATION_QUEUE_USAGE" => Ok(Value::Float(crate::sql::pg_notification_queue_usage(
+            ctx.session_id,
+        ))),
+        "PG_LISTENING_CHANNELS" => Ok(Value::String(crate::sql::format_listening_channels(
+            &ctx.listening_channels,
+        ))),
         "PG_COLUMN_SIZE" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
@@ -9267,9 +9123,7 @@ fn eval_scalar_function(
                 None => Ok(Value::Null),
             }
         }
-        "PG_POSTMASTER_START_TIME" => {
-            Ok(Value::String(crate::sql::pg_postmaster_start_time()))
-        }
+        "PG_POSTMASTER_START_TIME" => Ok(Value::String(crate::sql::pg_postmaster_start_time())),
         "CURRENT_SETTING" => {
             if vals[0].is_null() {
                 return Ok(Value::Null);
@@ -9349,10 +9203,7 @@ fn eval_scalar_function(
                     vals[2].to_display(),
                 )
             } else {
-                if vals[0].is_null()
-                    || vals[1].is_null()
-                    || vals[2].is_null()
-                    || vals[3].is_null()
+                if vals[0].is_null() || vals[1].is_null() || vals[2].is_null() || vals[3].is_null()
                 {
                     return Ok(Value::Null);
                 }
@@ -9447,7 +9298,11 @@ fn eval_scalar_function(
                     format!("t:{}", table.trim().to_ascii_lowercase())
                 }
             };
-            match ctx.comments.as_ref().and_then(|c| c.read().get(&key).cloned()) {
+            match ctx
+                .comments
+                .as_ref()
+                .and_then(|c| c.read().get(&key).cloned())
+            {
                 Some(s) => Ok(Value::String(s)),
                 None => Ok(Value::Null),
             }
@@ -9479,7 +9334,11 @@ fn eval_scalar_function(
                     )
                 }
             };
-            match ctx.comments.as_ref().and_then(|c| c.read().get(&key).cloned()) {
+            match ctx
+                .comments
+                .as_ref()
+                .and_then(|c| c.read().get(&key).cloned())
+            {
                 Some(s) => Ok(Value::String(s)),
                 None => Ok(Value::Null),
             }
@@ -9670,7 +9529,11 @@ fn eval_scalar_function(
                 }
             };
             let key = format!("{prefix}:{}", name.trim().to_ascii_lowercase());
-            match ctx.comments.as_ref().and_then(|c| c.read().get(&key).cloned()) {
+            match ctx
+                .comments
+                .as_ref()
+                .and_then(|c| c.read().get(&key).cloned())
+            {
                 Some(s) => Ok(Value::String(s)),
                 None => Ok(Value::Null),
             }
@@ -9721,12 +9584,7 @@ fn eval_scalar_function(
                 } else {
                     ctx.current_user.eq_ignore_ascii_case("postgres")
                 };
-                crate::rbac::has_schema_privilege(
-                    is_superuser,
-                    &schema,
-                    &ctx.search_path,
-                    &privs,
-                )?
+                crate::rbac::has_schema_privilege(is_superuser, &schema, &ctx.search_path, &privs)?
             };
             Ok(Value::Bool(held))
         }
@@ -9845,9 +9703,7 @@ fn eval_scalar_function(
             };
             let privs = crate::rbac::RolePrivilege::parse_list(&priv_s)?;
             let Some(catalog) = ctx.auth_catalog.as_ref() else {
-                return Err(TakyonicError::Sql(
-                    "PG_HAS_ROLE requires a session".into(),
-                ));
+                return Err(TakyonicError::Sql("PG_HAS_ROLE requires a session".into()));
             };
             let cat = catalog.read();
             let resolve = |v: &Value| -> Result<String> {
@@ -9860,17 +9716,13 @@ fn eval_scalar_function(
                         crate::oid::user_by_oid(oid, names)
                             .map(str::to_string)
                             .ok_or_else(|| {
-                                TakyonicError::Sql(format!(
-                                    "role with OID {oid} does not exist"
-                                ))
+                                TakyonicError::Sql(format!("role with OID {oid} does not exist"))
                             })
                     }
                     other => {
                         let name = crate::rbac::role_name_leaf(&other.to_display());
                         if name.is_empty() {
-                            return Err(TakyonicError::Sql(
-                                "role \"\" does not exist".into(),
-                            ));
+                            return Err(TakyonicError::Sql("role \"\" does not exist".into()));
                         }
                         Ok(name)
                     }
@@ -9926,12 +9778,9 @@ fn eval_scalar_function(
                 }
                 other => other.to_display(),
             };
-            let held = crate::rbac::has_type_privilege(
-                is_superuser,
-                &type_key,
-                &privs,
-                |n| crate::oid::type_oid_from_name(n).is_some(),
-            )?;
+            let held = crate::rbac::has_type_privilege(is_superuser, &type_key, &privs, |n| {
+                crate::oid::type_oid_from_name(n).is_some()
+            })?;
             Ok(Value::Bool(held))
         }
         "HAS_SEQUENCE_PRIVILEGE" => {
@@ -9991,9 +9840,9 @@ fn eval_scalar_function(
             if vals[0].is_null() {
                 return Ok(Value::Null);
             }
-            let s = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("SETSEED requires a numeric argument".into())
-            })?;
+            let s = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("SETSEED requires a numeric argument".into()))?;
             crate::sql::setseed(s)?;
             Ok(Value::Null)
         }
@@ -10039,9 +9888,7 @@ fn eval_scalar_function(
                 return Ok(Value::Float(crate::sql::extract_epoch_secs(&src)?));
             }
             let parts = crate::sql::parse_timestamp_parts(&src).ok_or_else(|| {
-                TakyonicError::Sql(format!(
-                    "EXTRACT source is not a date/timestamp: `{src}`"
-                ))
+                TakyonicError::Sql(format!("EXTRACT source is not a date/timestamp: `{src}`"))
             })?;
             let (y, m, d, hh, mm, ss) = parts;
             let n = match field.as_str() {
@@ -10077,51 +9924,61 @@ fn eval_scalar_function(
             if vals.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let y = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_DATE year must be numeric".into())
-            })? as i64;
-            let m = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_DATE month must be numeric".into())
-            })? as i64;
-            let d = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_DATE day must be numeric".into())
-            })? as i64;
+            let y = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_DATE year must be numeric".into()))?
+                as i64;
+            let m = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_DATE month must be numeric".into()))?
+                as i64;
+            let d = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_DATE day must be numeric".into()))?
+                as i64;
             Ok(Value::String(crate::sql::make_date_text(y, m, d)?))
         }
         "MAKE_TIME" => {
             if vals.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let h = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIME hour must be numeric".into())
-            })? as i64;
-            let mi = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIME minute must be numeric".into())
-            })? as i64;
-            let s = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIME second must be numeric".into())
-            })?;
+            let h = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIME hour must be numeric".into()))?
+                as i64;
+            let mi = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIME minute must be numeric".into()))?
+                as i64;
+            let s = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIME second must be numeric".into()))?;
             Ok(Value::String(crate::sql::make_time_text(h, mi, s)?))
         }
         "MAKE_TIMESTAMP" => {
             if vals.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let y = vals[0].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIMESTAMP year must be numeric".into())
-            })? as i64;
-            let m = vals[1].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIMESTAMP month must be numeric".into())
-            })? as i64;
-            let d = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIMESTAMP day must be numeric".into())
-            })? as i64;
-            let h = vals[3].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIMESTAMP hour must be numeric".into())
-            })? as i64;
-            let mi = vals[4].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("MAKE_TIMESTAMP minute must be numeric".into())
-            })? as i64;
+            let y = vals[0]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIMESTAMP year must be numeric".into()))?
+                as i64;
+            let m = vals[1]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIMESTAMP month must be numeric".into()))?
+                as i64;
+            let d = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIMESTAMP day must be numeric".into()))?
+                as i64;
+            let h = vals[3]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIMESTAMP hour must be numeric".into()))?
+                as i64;
+            let mi = vals[4]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("MAKE_TIMESTAMP minute must be numeric".into()))?
+                as i64;
             let s = vals[5].as_f64().ok_or_else(|| {
                 TakyonicError::Sql("MAKE_TIMESTAMP second must be numeric".into())
             })?;
@@ -10245,10 +10102,7 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() {
                 return Ok(Value::Null);
             }
-            let n = crate::sql::to_number_text(
-                &vals[0].to_display(),
-                &vals[1].to_display(),
-            )?;
+            let n = crate::sql::to_number_text(&vals[0].to_display(), &vals[1].to_display())?;
             if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
                 Ok(Value::Int(n as i64))
             } else {
@@ -10324,9 +10178,10 @@ fn eval_scalar_function(
             if vals[0].is_null() || vals[1].is_null() || vals[2].is_null() {
                 return Ok(Value::Null);
             }
-            let field = vals[2].as_f64().ok_or_else(|| {
-                TakyonicError::Sql("split_part field must be numeric".into())
-            })? as i64;
+            let field = vals[2]
+                .as_f64()
+                .ok_or_else(|| TakyonicError::Sql("split_part field must be numeric".into()))?
+                as i64;
             Ok(Value::String(crate::sql::split_part(
                 &vals[0].to_display(),
                 &vals[1].to_display(),
@@ -10374,9 +10229,7 @@ fn eval_scalar_function(
             let right_keys: Vec<String> = right.iter().map(|v| v.to_display()).collect();
             let ok = match name {
                 "ARRAY_CONTAINS" => right_keys.iter().all(|r| left_keys.iter().any(|l| l == r)),
-                "ARRAY_CONTAINED_BY" => {
-                    left_keys.iter().all(|l| right_keys.iter().any(|r| r == l))
-                }
+                "ARRAY_CONTAINED_BY" => left_keys.iter().all(|l| right_keys.iter().any(|r| r == l)),
                 "ARRAY_OVERLAP" => left_keys.iter().any(|l| right_keys.iter().any(|r| r == l)),
                 _ => unreachable!(),
             };
@@ -10545,11 +10398,7 @@ fn eval_scalar_function(
     }
 }
 
-fn eval_row_to_json(
-    args: &[Expression],
-    row: &Record,
-    ctx: &ExecutionContext,
-) -> Result<Value> {
+fn eval_row_to_json(args: &[Expression], row: &Record, ctx: &ExecutionContext) -> Result<Value> {
     if args.is_empty() {
         let fields: Vec<(String, Value)> = row
             .fields
@@ -10633,9 +10482,9 @@ fn evaluate_as_vector(
         }
         Expression::Literal(s) => crate::vector::VectorValue::from_text(s),
         Expression::Column(name) => {
-            let text = row.get(name).ok_or_else(|| {
-                TakyonicError::Sql(format!("column `{name}` not found"))
-            })?;
+            let text = row
+                .get(name)
+                .ok_or_else(|| TakyonicError::Sql(format!("column `{name}` not found")))?;
             crate::vector::VectorValue::from_text(text)
         }
         Expression::Parameter(idx) => {
@@ -10741,7 +10590,7 @@ fn rewrite_uncorrelated_subqueries(
                 when_then: arms,
                 else_result,
             })
-        },
+        }
         Expression::IsNull { expr, negated } => Ok(Expression::IsNull {
             expr: Box::new(rewrite_uncorrelated_subqueries(*expr, ctx, txn)?),
             negated,
@@ -10836,7 +10685,9 @@ fn rewrite_uncorrelated_subqueries(
             let rows = execute_subquery_rows(&subquery, ctx, txn)?;
             let exists = !rows.is_empty();
             let flag = if negated { !exists } else { exists };
-            Ok(Expression::Literal(if flag { "true" } else { "false" }.into()))
+            Ok(Expression::Literal(
+                if flag { "true" } else { "false" }.into(),
+            ))
         }
         Expression::ScalarSubquery {
             subquery,
@@ -10899,25 +10750,22 @@ fn predicate_has_correlated(expr: &Expression) -> bool {
         | Expression::AtTimeZone {
             timestamp: left,
             time_zone: right,
-        } => {
-            predicate_has_correlated(left) || predicate_has_correlated(right)
-        }
+        } => predicate_has_correlated(left) || predicate_has_correlated(right),
         Expression::Case {
             when_then,
             else_result,
         } => {
-            when_then.iter().any(|(c, r)| {
-                predicate_has_correlated(c) || predicate_has_correlated(r)
-            }) || else_result
-                .as_ref()
-                .is_some_and(|e| predicate_has_correlated(e))
+            when_then
+                .iter()
+                .any(|(c, r)| predicate_has_correlated(c) || predicate_has_correlated(r))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| predicate_has_correlated(e))
         }
         Expression::IsNull { expr, .. }
         | Expression::IsBoolTest { expr, .. }
         | Expression::Cast { expr, .. }
-        | Expression::Not { expr } => {
-            predicate_has_correlated(expr)
-        }
+        | Expression::Not { expr } => predicate_has_correlated(expr),
         Expression::NullIf { left, right }
         | Expression::IsDistinctFrom { left, right, .. }
         | Expression::QuantifiedCmp { left, right, .. } => {
@@ -11330,11 +11178,7 @@ fn execute_subquery_rows(
     ctx: &ExecutionContext,
     txn: &mut Transaction,
 ) -> Result<Vec<Record>> {
-    let physical = optimize_with_catalog(
-        plan,
-        &|t| txn.table_schema(t).ok(),
-        &|_| None,
-    )?;
+    let physical = optimize_with_catalog(plan, &|t| txn.table_schema(t).ok(), &|_| None)?;
     let mut exec = open_executor_with_txn(physical, ctx, txn)?;
     collect_rows(exec.as_mut())
 }
@@ -11478,12 +11322,11 @@ fn eval_quantified_cmp(
 fn compare_sql_values(left: &Value, op: FilterOp, right: &Value) -> bool {
     // Numeric path (Int / Float / Bool / numeric String).
     if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
-        let both_numeric = !matches!(left, Value::String(_)) || left.to_display().parse::<f64>().is_ok();
+        let both_numeric =
+            !matches!(left, Value::String(_)) || left.to_display().parse::<f64>().is_ok();
         let both_numeric = both_numeric
             && (!matches!(right, Value::String(_)) || right.to_display().parse::<f64>().is_ok());
-        if both_numeric
-            && !matches!((left, right), (Value::String(_), Value::String(_)))
-        {
+        if both_numeric && !matches!((left, right), (Value::String(_), Value::String(_))) {
             return match op {
                 FilterOp::Eq => (a - b).abs() < f64::EPSILON,
                 FilterOp::Ne => (a - b).abs() >= f64::EPSILON,
@@ -11833,24 +11676,17 @@ mod tests {
         )
         .unwrap();
         execute_plan_autocommit(
-            &LogicalPlanner::plan(
-                "INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2)",
-            )
-            .unwrap(),
+            &LogicalPlanner::plan("INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2)")
+                .unwrap(),
             &ctx,
             engine.begin().unwrap(),
         )
         .unwrap();
 
-        let sql =
-            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id";
+        let sql = "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(
             matches!(
                 physical,
@@ -11891,12 +11727,8 @@ mod tests {
             op: FilterOp::Eq,
             right: Box::new(Expression::Column("user_id".into())),
         };
-        let mut join = NestedLoopJoin::from_rows_with_type(
-            users,
-            orders,
-            condition,
-            JoinType::Left,
-        );
+        let mut join =
+            NestedLoopJoin::from_rows_with_type(users, orders, condition, JoinType::Left);
         let out = collect_rows(&mut join).unwrap();
         assert_eq!(out.len(), 2);
         let bob = out
@@ -12134,8 +11966,7 @@ mod tests {
         assert_eq!(affected_row_count(&rows), 2);
 
         // 2. UPDATE Ada's age.
-        let update =
-            LogicalPlanner::plan("UPDATE users SET age = 31 WHERE name = 'Ada'").unwrap();
+        let update = LogicalPlanner::plan("UPDATE users SET age = 31 WHERE name = 'Ada'").unwrap();
         let rows = execute_plan_autocommit(&update, &ctx, engine.begin().unwrap()).unwrap();
         assert_eq!(affected_row_count(&rows), 1);
 
@@ -12159,10 +11990,14 @@ mod tests {
     fn group_by_count_sum_via_sql() {
         let (engine, root) = temp_engine("agg");
         engine
-            .register_table(TableSchema::new("employees", "id", vec![
-                IndexDef::new("department", "department"),
-                IndexDef::new("salary", "salary"),
-            ]))
+            .register_table(TableSchema::new(
+                "employees",
+                "id",
+                vec![
+                    IndexDef::new("department", "department"),
+                    IndexDef::new("salary", "salary"),
+                ],
+            ))
             .unwrap();
         let ctx = ExecutionContext::new();
 
@@ -12177,8 +12012,7 @@ mod tests {
         )
         .unwrap();
 
-        let sql =
-            "SELECT department, COUNT(id), SUM(salary) FROM employees GROUP BY department";
+        let sql = "SELECT department, COUNT(id), SUM(salary) FROM employees GROUP BY department";
         let plan = LogicalPlanner::plan(sql).unwrap();
         match &plan {
             LogicalPlan::Aggregate {
@@ -12258,7 +12092,8 @@ mod tests {
         )
         .unwrap();
 
-        let sql = "SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1";
+        let sql =
+            "SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1";
         let plan = LogicalPlanner::plan(sql).unwrap();
         assert!(
             matches!(plan, LogicalPlan::Filter { .. }),
@@ -12312,12 +12147,8 @@ mod tests {
             SELECT 1 FROM dept_budget d WHERE d.dept = e.dept
         )";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         let explain = explain_physical(&physical);
         assert!(
             explain.contains("HashSemiJoin"),
@@ -12374,12 +12205,8 @@ mod tests {
             SELECT d.dept FROM dept_budget d WHERE d.dept = e.dept
         )";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         let explain = explain_physical(&physical);
         assert!(
             explain.contains("HashSemiJoin"),
@@ -12466,12 +12293,8 @@ mod tests {
             SELECT d.budget FROM dept_budget d WHERE d.dept = e.dept
         )";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         let explain = explain_physical(&physical);
         assert!(
             explain.contains("Apply"),
@@ -12519,12 +12342,8 @@ mod tests {
             SELECT 1 FROM dept_budget d WHERE d.dept = e.dept
         )";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(
             explain_physical(&physical).contains("HashSemiJoin"),
             "bench query must use unnest path"
@@ -12552,11 +12371,7 @@ mod tests {
             Record::new().set("name", "Bob").set("age", "20"),
         ];
         let ctx = ExecutionContext::new();
-        let values = open_executor(
-            PhysicalPlan::Values { rows: rows.clone() },
-            &ctx,
-        )
-        .unwrap();
+        let values = open_executor(PhysicalPlan::Values { rows: rows.clone() }, &ctx).unwrap();
         let mut sort = SortExec::new(
             values,
             vec![SortExpr::asc(Expression::Column("name".into()))],
@@ -12564,7 +12379,9 @@ mod tests {
         );
         let out = collect_rows(&mut sort).unwrap();
         assert_eq!(
-            out.iter().map(|r| r.get("name").unwrap()).collect::<Vec<_>>(),
+            out.iter()
+                .map(|r| r.get("name").unwrap())
+                .collect::<Vec<_>>(),
             vec!["Ada", "Bob", "Cy"]
         );
 
@@ -12576,7 +12393,9 @@ mod tests {
         );
         let out = collect_rows(&mut sort).unwrap();
         assert_eq!(
-            out.iter().map(|r| r.get("age").unwrap()).collect::<Vec<_>>(),
+            out.iter()
+                .map(|r| r.get("age").unwrap())
+                .collect::<Vec<_>>(),
             vec!["30", "25", "20"]
         );
     }
@@ -12650,7 +12469,14 @@ mod tests {
         let physical =
             optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(
-            matches!(physical, PhysicalPlan::TopN { fetch: 1, skip: 0, .. }),
+            matches!(
+                physical,
+                PhysicalPlan::TopN {
+                    fetch: 1,
+                    skip: 0,
+                    ..
+                }
+            ),
             "CBO must fuse Sort+Limit into TopN, got {physical:?}"
         );
 
@@ -12689,14 +12515,11 @@ mod tests {
             .create_index("idx_dept", "employees", "department", false)
             .unwrap();
 
-        let plan =
-            LogicalPlanner::plan("SELECT * FROM employees WHERE department = 'Engineering'")
-                .unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|t| Some(engine.table_stats(t)),
-        )
+        let plan = LogicalPlanner::plan("SELECT * FROM employees WHERE department = 'Engineering'")
+            .unwrap();
+        let physical = optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|t| {
+            Some(engine.table_stats(t))
+        })
         .unwrap();
         match &physical {
             PhysicalPlan::IndexScan {
@@ -12708,10 +12531,7 @@ mod tests {
                 assert_eq!(table, "employees");
                 assert_eq!(index.as_deref(), Some("idx_dept"));
                 assert_eq!(index_column, "department");
-                assert_eq!(
-                    *key_value,
-                    Expression::Literal("Engineering".into())
-                );
+                assert_eq!(*key_value, Expression::Literal("Engineering".into()));
             }
             other => panic!("expected secondary IndexScan, got {other:?}"),
         }
@@ -12757,12 +12577,8 @@ mod tests {
              (SELECT department FROM employees WHERE id = 2)",
         )
         .unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(
             matches!(
                 physical,
@@ -12822,11 +12638,9 @@ mod tests {
 
         let plan = LogicalPlanner::plan("ANALYZE employees").unwrap();
         assert!(matches!(plan, LogicalPlan::Analyze { .. }));
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|t| Some(engine.table_stats(t)),
-        )
+        let physical = optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|t| {
+            Some(engine.table_stats(t))
+        })
         .unwrap();
         assert!(matches!(physical, PhysicalPlan::Analyze { .. }));
 
@@ -12854,9 +12668,7 @@ mod tests {
         let ctx = ExecutionContext::new();
 
         // 1000 rows: 960 Sales (frequent), 40 Engineering (rare).
-        let mut values = String::from(
-            "INSERT INTO employees (id, department, salary) VALUES ",
-        );
+        let mut values = String::from("INSERT INTO employees (id, department, salary) VALUES ");
         for i in 1..=1000 {
             if i > 1 {
                 values.push_str(", ");
@@ -12876,10 +12688,7 @@ mod tests {
 
         // Before ANALYZE: incremental NDV heuristic still prefers IndexScan.
         let before = optimize_with_catalog(
-            &LogicalPlanner::plan(
-                "SELECT * FROM employees WHERE department = 'Sales'",
-            )
-            .unwrap(),
+            &LogicalPlanner::plan("SELECT * FROM employees WHERE department = 'Sales'").unwrap(),
             &|t| engine.table_schema(t).ok(),
             &|t| Some(engine.table_stats(t)),
         )
@@ -12897,10 +12706,7 @@ mod tests {
         .unwrap();
 
         let frequent = optimize_with_catalog(
-            &LogicalPlanner::plan(
-                "SELECT * FROM employees WHERE department = 'Sales'",
-            )
-            .unwrap(),
+            &LogicalPlanner::plan("SELECT * FROM employees WHERE department = 'Sales'").unwrap(),
             &|t| engine.table_schema(t).ok(),
             &|t| Some(engine.table_stats(t)),
         )
@@ -12916,10 +12722,8 @@ mod tests {
         );
 
         let rare = optimize_with_catalog(
-            &LogicalPlanner::plan(
-                "SELECT * FROM employees WHERE department = 'Engineering'",
-            )
-            .unwrap(),
+            &LogicalPlanner::plan("SELECT * FROM employees WHERE department = 'Engineering'")
+                .unwrap(),
             &|t| engine.table_schema(t).ok(),
             &|t| Some(engine.table_stats(t)),
         )
@@ -12964,15 +12768,10 @@ mod tests {
         }
         session_txn.commit().unwrap();
 
-        let sql =
-            "SELECT SUM(salary * tax_rate) FROM employees WHERE age > 30";
+        let sql = "SELECT SUM(salary * tax_rate) FROM employees WHERE age > 30";
         let plan = LogicalPlanner::plan(sql).unwrap();
-        let physical = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let physical =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         let explain = explain_physical(&physical);
         assert!(
             explain.contains("JitExec"),
@@ -12993,12 +12792,8 @@ mod tests {
         assert_eq!(sum, "1100");
 
         // Interpreter path must agree.
-        let baseline = optimize_without_jit(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let baseline =
+            optimize_without_jit(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(
             !explain_physical(&baseline).contains("JitExec"),
             "optimize_without_jit must stay Volcano"
@@ -13037,20 +12832,12 @@ mod tests {
         let sql = "SELECT SUM(salary * tax_rate) FROM employees WHERE age > 30";
         let plan = LogicalPlanner::plan(sql).unwrap();
 
-        let jit_plan = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let jit_plan =
+            optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
         assert!(explain_physical(&jit_plan).contains("JitExec"));
 
-        let interp_plan = optimize_without_jit(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| None,
-        )
-        .unwrap();
+        let interp_plan =
+            optimize_without_jit(&plan, &|t| engine.table_schema(t).ok(), &|_| None).unwrap();
 
         // Warm-up
         for _ in 0..2 {
@@ -13072,7 +12859,11 @@ mod tests {
             let mut e =
                 open_executor_with_txn(jit_plan.clone(), &ExecutionContext::new(), &mut t).unwrap();
             let rows = collect_rows(e.as_mut()).unwrap();
-            let col = rows[0].fields.keys().find(|k| k.starts_with("sum(")).unwrap();
+            let col = rows[0]
+                .fields
+                .keys()
+                .find(|k| k.starts_with("sum("))
+                .unwrap();
             jit_sum = rows[0].get(col).unwrap().to_string();
         }
         let jit_ns = t0.elapsed().as_nanos() as f64;
@@ -13085,7 +12876,11 @@ mod tests {
                 open_executor_with_txn(interp_plan.clone(), &ExecutionContext::new(), &mut t)
                     .unwrap();
             let rows = collect_rows(e.as_mut()).unwrap();
-            let col = rows[0].fields.keys().find(|k| k.starts_with("sum(")).unwrap();
+            let col = rows[0]
+                .fields
+                .keys()
+                .find(|k| k.starts_with("sum("))
+                .unwrap();
             interp_sum = rows[0].get(col).unwrap().to_string();
         }
         let interp_ns = t1.elapsed().as_nanos() as f64;
@@ -13116,17 +12911,13 @@ mod tests {
         let plan = LogicalPlanner::plan(sql).unwrap();
 
         // Small cardinality → scalar JitExec (or Aggregate).
-        let small = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| {
-                Some(TableStats {
-                    row_count: 10,
-                    page_count: 1,
-                    ..TableStats::default()
-                })
-            },
-        )
+        let small = optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| {
+            Some(TableStats {
+                row_count: 10,
+                page_count: 1,
+                ..TableStats::default()
+            })
+        })
         .unwrap();
         let small_text = explain_physical(&small);
         assert!(
@@ -13135,17 +12926,13 @@ mod tests {
         );
 
         // Large OLAP → VectorizedExec via JITVectorizationRule.
-        let large = optimize_with_catalog(
-            &plan,
-            &|t| engine.table_schema(t).ok(),
-            &|_| {
-                Some(TableStats {
-                    row_count: 100_000,
-                    page_count: 1000,
-                    ..TableStats::default()
-                })
-            },
-        )
+        let large = optimize_with_catalog(&plan, &|t| engine.table_schema(t).ok(), &|_| {
+            Some(TableStats {
+                row_count: 100_000,
+                page_count: 1000,
+                ..TableStats::default()
+            })
+        })
         .unwrap();
         let text = explain_physical(&large);
         assert!(

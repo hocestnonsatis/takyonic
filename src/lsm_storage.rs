@@ -129,13 +129,9 @@ impl LSMStorage {
 
     /// Latest live value.
     pub fn get(&self, key: &Key) -> Result<Option<Value>> {
-        Ok(self.get_at(key, u64::MAX)?.and_then(|e| {
-            if e.tombstone {
-                None
-            } else {
-                e.value
-            }
-        }))
+        Ok(self
+            .get_at(key, u64::MAX)?
+            .and_then(|e| if e.tombstone { None } else { e.value }))
     }
 
     fn maybe_flush(&self) -> Result<()> {
@@ -205,7 +201,11 @@ impl LSMStorage {
         let meta = SstMeta::from_info(0, info, smallest, largest)?;
         self.manager.add_sst(meta)?;
         mem.clear();
-        debug!(sst_id = id, entries = entries.len(), "LSMStorage flushed memtable → L0");
+        debug!(
+            sst_id = id,
+            entries = entries.len(),
+            "LSMStorage flushed memtable → L0"
+        );
         Ok(id)
     }
 
@@ -435,7 +435,10 @@ mod tests {
         store.put(&b"k"[..], &b"v3"[..]).unwrap();
         let _ = store.flush();
         let reader = LSMReader::new(&store).unwrap();
-        let e = reader.get_at(&Key::new(&b"k"[..]), u64::MAX).unwrap().unwrap();
+        let e = reader
+            .get_at(&Key::new(&b"k"[..]), u64::MAX)
+            .unwrap()
+            .unwrap();
         assert_eq!(e.value.unwrap().as_bytes(), b"v3");
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(root);

@@ -167,10 +167,7 @@ pub fn run_command_round(
 
 fn cargo_bin_example(example: &str) -> String {
     // Prefer CARGO_BIN_EXE_* when available (integration tests / harnesses).
-    if let Ok(path) = std::env::var(format!(
-        "CARGO_BIN_EXE_{}",
-        example.replace('-', "_")
-    )) {
+    if let Ok(path) = std::env::var(format!("CARGO_BIN_EXE_{}", example.replace('-', "_"))) {
         return path;
     }
     // Next: already-built release example next to this process / under CARGO_TARGET_DIR.
@@ -327,15 +324,9 @@ pub fn run_continuous_chaos(
         let per = remaining.min(Duration::from_secs(30 * 60));
 
         let schedule: Vec<RoundResult> = if dry {
-            vec![
-                dry_run_round("crash_recovery"),
-                dry_run_round("raft_chaos"),
-            ]
+            vec![dry_run_round("crash_recovery"), dry_run_round("raft_chaos")]
         } else {
-            let mut v = vec![
-                round_crash_recovery(&cfg, per),
-                round_raft_chaos(&cfg, per),
-            ];
+            let mut v = vec![round_crash_recovery(&cfg, per), round_raft_chaos(&cfg, per)];
             if cfg.include_mobile {
                 v.push(round_mobile_stress(&cfg, per));
             }

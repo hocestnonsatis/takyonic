@@ -211,7 +211,14 @@ mod tests {
         let t1 = s.put(&b"k"[..], &b"v1"[..]);
         let t2 = s.put(&b"k"[..], &b"v2"[..]);
         assert!(t2 > t1);
-        assert_eq!(s.get_at(&Key::new(&b"k"[..]), t1).unwrap().value.unwrap().as_bytes(), b"v1");
+        assert_eq!(
+            s.get_at(&Key::new(&b"k"[..]), t1)
+                .unwrap()
+                .value
+                .unwrap()
+                .as_bytes(),
+            b"v1"
+        );
         assert_eq!(s.get(&Key::new(&b"k"[..])).unwrap().as_bytes(), b"v2");
         // Watermark strictly above the latest version: keep t2, drop t1.
         let removed = s.vacuum_below(t2 + 1);

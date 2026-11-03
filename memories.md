@@ -1,6 +1,19 @@
 # Takyonic — Persistent Context
 
-Güncelleme: 2026-08-08 (Faz 4D Smart Client Session SQL DONE)
+Güncelleme: 2026-11-03 (single-node pgwire acceptance)
+
+## Wire acceptance (2026-11-03)
+- Branch: `cursor/single-node-pgwire-e2e-7fb5`. Gerçek istemci: `tests/pgwire_e2e.rs` (`tokio-postgres`).
+- Tek düğüm: SCRAM, CREATE/INSERT/SELECT (WHERE, ORDER BY, LIMIT, `SELECT *` katalog sırası), UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, 25P02, restart sonrası kalıcılık. İkinci oturum commit edilmemiş satırı görmez.
+- pgwire boşlukları kapatıldı: ParameterDescription tipi çıkarımı, binary sonuç kodlaması, NoData (parametreli INSERT), benzersiz backend pid (aksi halde tüm bağlantılar pid 0 oturumunu paylaşır), `TransactionStart`/`TransactionEnd`, basit sorgu script'i.
+- Çok düğümlü Raft wire testi yok. `pg_catalog` şekil eşleştirici. B-tree LSM aynası. MPP/2PC/S3/JIT/HNSW deneysel.
+- OOM: `CARGO_BUILD_JOBS=2`. rustc 1.99 / edition 2024. `.cargo/config.toml` içindeki makineye özel `-L .../gcc/16` yolu kaldırıldı (yoksa rustc arama yolu hatası).
+- `AtomicU64::fetch_update` MSRV 1.85 için `#[allow(deprecated)]` (`try_update` 1.88+).
+
+## Geliştirme döngüsü (loop)
+- **Öncelik:** tek düğüm wire yolu yeşil; sıradaki ürün boşlukları: pg_catalog gerçek yürütme, tip kapsamı, çok düğümlü Raft'ın gerçek istemciyle kanıtı
+- Eski not "commit yok / main'de çalış" bu oturumun PR talebiyle çelişir; PR açılır
+- OOM notu: tick başına tek suite; büyük paralel cargo spawn etme
 
 ## Geliştirme döngüsü (loop)
 - **Öncelik:** Faz 4E+ (multi-DB / loom) ürün önceliğine göre; PG niche varsayılan değil

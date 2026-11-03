@@ -411,8 +411,7 @@ impl Config {
             }
         }
         if self.object_pages_chunk_bytes == 0
-            || (self.bpm_page_size > 0
-                && self.object_pages_chunk_bytes % self.bpm_page_size != 0)
+            || (self.bpm_page_size > 0 && self.object_pages_chunk_bytes % self.bpm_page_size != 0)
         {
             return Err(TakyonicError::Config(
                 "object_pages_chunk_bytes must be a non-zero multiple of bpm_page_size".into(),
@@ -429,8 +428,7 @@ impl Config {
                 crate::object_store::AWS_S3_PUT_OBJECT_MAX_BYTES
             )));
         }
-        if self.object_pages_chunk_bytes as u64
-            >= crate::object_store::AWS_S3_PUT_OBJECT_MAX_BYTES
+        if self.object_pages_chunk_bytes as u64 >= crate::object_store::AWS_S3_PUT_OBJECT_MAX_BYTES
         {
             return Err(TakyonicError::Config(format!(
                 "object_pages_chunk_bytes ({}) must be < AWS PutObject limit ({})",

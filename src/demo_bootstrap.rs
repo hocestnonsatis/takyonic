@@ -5,9 +5,9 @@
 //! can still seed `users(id, status, city)` when explicitly enabled (server
 //! default for back-compat).
 
+use crate::TakyonicEngine;
 use crate::error::Result;
 use crate::schema::{IndexDef, TableSchema};
-use crate::TakyonicEngine;
 
 /// Outcome of [`ensure_demo_users`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

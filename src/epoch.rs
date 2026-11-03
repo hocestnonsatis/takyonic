@@ -75,7 +75,11 @@ impl EpochManager {
 ///
 /// A version is dead iff it is **not** among the survivors selected by
 /// [`survivors_for_key`].
-pub fn is_dead_version(versions_newest_first: &[CommitTs], commit_ts: CommitTs, watermark: CommitTs) -> bool {
+pub fn is_dead_version(
+    versions_newest_first: &[CommitTs],
+    commit_ts: CommitTs,
+    watermark: CommitTs,
+) -> bool {
     !survivors_for_key(versions_newest_first, watermark).contains(&commit_ts)
 }
 
@@ -96,7 +100,10 @@ pub fn survivors_for_key(versions_newest_first: &[CommitTs], watermark: CommitTs
 }
 
 /// Commit timestamps that are safe to drop under `watermark`.
-pub fn dead_versions_for_key(versions_newest_first: &[CommitTs], watermark: CommitTs) -> Vec<CommitTs> {
+pub fn dead_versions_for_key(
+    versions_newest_first: &[CommitTs],
+    watermark: CommitTs,
+) -> Vec<CommitTs> {
     let survivors = survivors_for_key(versions_newest_first, watermark);
     versions_newest_first
         .iter()

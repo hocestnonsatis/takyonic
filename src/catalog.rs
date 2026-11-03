@@ -45,13 +45,16 @@ pub fn load_catalog(data_dir: &Path) -> Result<BTreeMap<String, TableSchema>> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let tag = parts.next().ok_or_else(|| {
-            TakyonicError::Engine(format!("catalog line {}: empty", lineno + 1))
-        })?;
+        let tag = parts
+            .next()
+            .ok_or_else(|| TakyonicError::Engine(format!("catalog line {}: empty", lineno + 1)))?;
         match tag {
             "TABLE" => {
                 let name = parts.next().ok_or_else(|| {
-                    TakyonicError::Engine(format!("catalog line {}: TABLE missing name", lineno + 1))
+                    TakyonicError::Engine(format!(
+                        "catalog line {}: TABLE missing name",
+                        lineno + 1
+                    ))
                 })?;
                 let pk = parts.next().ok_or_else(|| {
                     TakyonicError::Engine(format!(
@@ -321,10 +324,7 @@ pub fn save_catalog(data_dir: &Path, schemas: &BTreeMap<String, TableSchema>) ->
                 schema.storage_engine.as_str()
             )?;
             for col in &schema.columns {
-                let mut line = format!(
-                    "COLUMN {} {} {}",
-                    schema.name, col.name, col.data_type
-                );
+                let mut line = format!("COLUMN {} {} {}", schema.name, col.name, col.data_type);
                 if !col.nullable {
                     line.push_str(" NOTNULL");
                 }
@@ -333,11 +333,7 @@ pub fn save_catalog(data_dir: &Path, schemas: &BTreeMap<String, TableSchema>) ->
                 }
                 writeln!(f, "{line}")?;
                 if let Some(def) = &col.default_sql {
-                    writeln!(
-                        f,
-                        "COLDEFAULT {} {} {}",
-                        schema.name, col.name, def
-                    )?;
+                    writeln!(f, "COLDEFAULT {} {} {}", schema.name, col.name, def)?;
                 }
             }
             match &schema.partitioning {
@@ -374,12 +370,7 @@ pub fn save_catalog(data_dir: &Path, schemas: &BTreeMap<String, TableSchema>) ->
                     writeln!(
                         f,
                         "VINDEX {} {} {} {} {} {}",
-                        schema.name,
-                        idx.name,
-                        idx.column,
-                        spec.dimension,
-                        metric,
-                        spec.index_type
+                        schema.name, idx.name, idx.column, spec.dimension, metric, spec.index_type
                     )?;
                 } else {
                     writeln!(f, "INDEX {} {} {}", schema.name, idx.name, idx.column)?;
@@ -405,10 +396,7 @@ pub fn encode_table_block(schema: &TableSchema) -> String {
         schema.storage_engine.as_str()
     ));
     for col in &schema.columns {
-        let mut line = format!(
-            "COLUMN {} {} {}",
-            schema.name, col.name, col.data_type
-        );
+        let mut line = format!("COLUMN {} {} {}", schema.name, col.name, col.data_type);
         if !col.nullable {
             line.push_str(" NOTNULL");
         }
@@ -459,12 +447,7 @@ pub fn encode_table_block(schema: &TableSchema) -> String {
             };
             out.push_str(&format!(
                 "VINDEX {} {} {} {} {} {}\n",
-                schema.name,
-                idx.name,
-                idx.column,
-                spec.dimension,
-                metric,
-                spec.index_type
+                schema.name, idx.name, idx.column, spec.dimension, metric, spec.index_type
             ));
         } else {
             out.push_str(&format!(
@@ -555,10 +538,7 @@ mod tests {
                 ColumnSpec::new("department", "TEXT"),
             ]
         );
-        assert_eq!(
-            loaded.get("employees").unwrap().indexes[0].name,
-            "idx_dept"
-        );
+        assert_eq!(loaded.get("employees").unwrap().indexes[0].name, "idx_dept");
         assert_eq!(
             loaded.get("employees").unwrap().indexes[0].column,
             "department"
@@ -580,15 +560,11 @@ mod tests {
 
     #[test]
     fn encode_parse_table_block_roundtrip() {
-        let schema = TableSchema::new(
-            "t",
-            "id",
-            vec![IndexDef::new("idx_a", "a")],
-        )
-        .with_columns(vec![
-            ColumnSpec::new("id", "BIGINT"),
-            ColumnSpec::new("a", "TEXT"),
-        ]);
+        let schema =
+            TableSchema::new("t", "id", vec![IndexDef::new("idx_a", "a")]).with_columns(vec![
+                ColumnSpec::new("id", "BIGINT"),
+                ColumnSpec::new("a", "TEXT"),
+            ]);
         let block = encode_table_block(&schema);
         let parsed = parse_table_block(&block).unwrap();
         assert_eq!(parsed.name, "t");

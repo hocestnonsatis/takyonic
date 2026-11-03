@@ -73,10 +73,7 @@ pub fn run_ha_soak(cfg: HaSoakConfig) -> ReliabilityReport {
 
 async fn run_ha_soak_async(cfg: HaSoakConfig) -> ReliabilityReport {
     let mut report = ReliabilityReport::new(cfg.keys as u64);
-    let root = std::env::temp_dir().join(format!(
-        "takyonic-ha-soak-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("takyonic-ha-soak-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     if let Err(e) = std::fs::create_dir_all(&root) {
         report.fail(format!("mkdir: {e}"));
@@ -130,10 +127,9 @@ async fn run_ha_soak_async(cfg: HaSoakConfig) -> ReliabilityReport {
     let stop_storm = Arc::new(AtomicBool::new(false));
     let storm_ok = Arc::new(AtomicU64::new(0));
     let next_key = Arc::new(AtomicU64::new(0));
-    let leader_slot: Arc<tokio::sync::RwLock<Option<Arc<TakyonicNode>>>> =
-        Arc::new(tokio::sync::RwLock::new(
-            live.get(&leader_id).map(|l| Arc::clone(&l.node)),
-        ));
+    let leader_slot: Arc<tokio::sync::RwLock<Option<Arc<TakyonicNode>>>> = Arc::new(
+        tokio::sync::RwLock::new(live.get(&leader_id).map(|l| Arc::clone(&l.node))),
+    );
 
     let storm_tasks: Vec<_> = (0..4)
         .map(|w| {
@@ -214,10 +210,7 @@ async fn run_ha_soak_async(cfg: HaSoakConfig) -> ReliabilityReport {
                 report.fail("new leader id equals assassinated id");
                 break;
             }
-            let new_leader = survivors
-                .iter()
-                .find(|n| n.id() == new_id)
-                .cloned();
+            let new_leader = survivors.iter().find(|n| n.id() == new_id).cloned();
             let Some(new_leader) = new_leader else {
                 report.fail("new leader missing from survivors");
                 break;
@@ -302,13 +295,7 @@ async fn run_ha_soak_async(cfg: HaSoakConfig) -> ReliabilityReport {
                         // Only fail if majority of live nodes have it.
                         let present = live
                             .values()
-                            .filter(|l| {
-                                l.node
-                                    .get(&key)
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                            })
+                            .filter(|l| l.node.get(&key).ok().flatten().is_some())
                             .count();
                         if present >= 2 {
                             report.fail(format!(

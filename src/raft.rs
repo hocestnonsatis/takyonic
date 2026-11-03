@@ -470,11 +470,9 @@ impl RaftCommand {
             COMMAND_NOOP => Err(TakyonicError::Raft(
                 "Noop command must have empty key and value".into(),
             )),
-            COMMAND_TXN_BATCH if key_len == 0 => {
-                Ok(Self::TxnBatch {
-                    ops: Self::decode_ops_body(value)?,
-                })
-            }
+            COMMAND_TXN_BATCH if key_len == 0 => Ok(Self::TxnBatch {
+                ops: Self::decode_ops_body(value)?,
+            }),
             COMMAND_TXN_BATCH => Err(TakyonicError::Raft(
                 "TxnBatch must have empty key framing".into(),
             )),
@@ -510,18 +508,16 @@ impl RaftCommand {
                 "TxnAbort requires 8-byte txn_id and empty value".into(),
             )),
             COMMAND_CATALOG_UPSERT => {
-                let table = String::from_utf8(key_bytes.to_vec()).map_err(|e| {
-                    TakyonicError::Raft(format!("CatalogUpsert table utf8: {e}"))
-                })?;
+                let table = String::from_utf8(key_bytes.to_vec())
+                    .map_err(|e| TakyonicError::Raft(format!("CatalogUpsert table utf8: {e}")))?;
                 Ok(Self::CatalogUpsert {
                     table,
                     schema: value,
                 })
             }
             COMMAND_CATALOG_DROP if value_len == 0 => {
-                let table = String::from_utf8(key_bytes.to_vec()).map_err(|e| {
-                    TakyonicError::Raft(format!("CatalogDrop table utf8: {e}"))
-                })?;
+                let table = String::from_utf8(key_bytes.to_vec())
+                    .map_err(|e| TakyonicError::Raft(format!("CatalogDrop table utf8: {e}")))?;
                 Ok(Self::CatalogDrop { table })
             }
             COMMAND_CATALOG_DROP => Err(TakyonicError::Raft(
@@ -1059,11 +1055,7 @@ mod tests {
                 vec![(Key::new(&b"a"[..]), Some(Value::new(&b"1"[..])))],
             ),
             RaftCommand::txn_abort(9),
-            RaftCommand::catalog_upsert(&crate::schema::TableSchema::new(
-                "t",
-                "id",
-                vec![],
-            )),
+            RaftCommand::catalog_upsert(&crate::schema::TableSchema::new("t", "id", vec![])),
             RaftCommand::catalog_drop("t"),
             RaftCommand::auth_replace(b"# AUTH\n".as_slice()),
             RaftCommand::stats_replace(b"# STATS\n".as_slice()),

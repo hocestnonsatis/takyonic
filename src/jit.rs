@@ -112,9 +112,8 @@ impl JitCompiler {
 
     /// Same as [`Self::new`], recording compile latency into `metrics`.
     pub fn new_with_metrics(metrics: Option<Arc<EngineMetrics>>) -> Result<Self> {
-        let builder = JITBuilder::new(default_libcall_names()).map_err(|e| {
-            TakyonicError::Sql(format!("cranelift JIT builder failed: {e}"))
-        })?;
+        let builder = JITBuilder::new(default_libcall_names())
+            .map_err(|e| TakyonicError::Sql(format!("cranelift JIT builder failed: {e}")))?;
         let module = JITModule::new(builder);
         let ctx = module.make_context();
         Ok(Self {
@@ -439,10 +438,7 @@ pub fn is_jit_compilable(expr: &Expression) -> bool {
                 && list.iter().all(|v| {
                     matches!(
                         v,
-                        SqlValue::Int(_)
-                            | SqlValue::Float(_)
-                            | SqlValue::Bool(_)
-                            | SqlValue::Null
+                        SqlValue::Int(_) | SqlValue::Float(_) | SqlValue::Bool(_) | SqlValue::Null
                     )
                 })
         }
@@ -752,14 +748,10 @@ fn lower_expr(
 fn expr_needs_float(expr: &Expression) -> bool {
     match expr {
         Expression::Literal(s) => matches!(SqlValue::from_text(s), SqlValue::Float(_)),
-        Expression::Arith { left, right, .. } => {
-            expr_needs_float(left) || expr_needs_float(right)
-        }
+        Expression::Arith { left, right, .. } => expr_needs_float(left) || expr_needs_float(right),
         Expression::BinaryOp { left, right, .. }
         | Expression::And { left, right }
-        | Expression::Or { left, right } => {
-            expr_needs_float(left) || expr_needs_float(right)
-        }
+        | Expression::Or { left, right } => expr_needs_float(left) || expr_needs_float(right),
         _ => false,
     }
 }
@@ -846,7 +838,10 @@ mod tests {
             right: Box::new(Expression::Column("tax_rate".into())),
         };
         let cols = collect_jit_columns(&expr);
-        let compiled = jit.compile_scalar(&expr, &cols).unwrap().expect("compilable");
+        let compiled = jit
+            .compile_scalar(&expr, &cols)
+            .unwrap()
+            .expect("compilable");
         let row = Record::new().set("salary", "100").set("tax_rate", "3");
         let mut scratch = vec![0i64; cols.len()];
         pack_row(&row, &compiled.columns, &mut scratch);

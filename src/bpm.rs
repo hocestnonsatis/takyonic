@@ -194,11 +194,7 @@ impl BufferPoolManager {
     }
 
     /// Fetch a page-aligned region from a registered secondary file into the pool.
-    pub fn fetch_file_page(
-        self: &Arc<Self>,
-        file_id: u32,
-        page_index: u32,
-    ) -> Result<PageGuard> {
+    pub fn fetch_file_page(self: &Arc<Self>, file_id: u32, page_index: u32) -> Result<PageGuard> {
         let page_id = crate::disk::file_page_id(file_id, page_index);
         self.fetch_page(page_id)
     }
@@ -368,8 +364,10 @@ impl BufferPoolManager {
         };
         if !snaps.is_empty() {
             let t0 = Instant::now();
-            let refs: Vec<(PageId, &[u8])> =
-                snaps.iter().map(|(id, data)| (*id, data.as_slice())).collect();
+            let refs: Vec<(PageId, &[u8])> = snaps
+                .iter()
+                .map(|(id, data)| (*id, data.as_slice()))
+                .collect();
             self.disk.write_page_snapshots_coalesced(&refs)?;
             let elapsed = t0.elapsed();
             for _ in 0..snaps.len() {
@@ -474,10 +472,7 @@ impl BufferPoolManager {
                 return Ok(idx);
             }
             let dist = backward_k_distance(&f.history, self.k, now);
-            let replace = best
-                .as_ref()
-                .map(|(_, d)| dist > *d)
-                .unwrap_or(true);
+            let replace = best.as_ref().map(|(_, d)| dist > *d).unwrap_or(true);
             if replace {
                 best = Some((idx, dist));
             }

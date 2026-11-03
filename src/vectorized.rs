@@ -15,9 +15,9 @@ use std::time::Instant;
 use std::arch::x86_64::*;
 
 use crate::error::{Result, TakyonicError};
-use crate::executor::{ExecutionContext, Executor, evaluate_bool};
 #[cfg(test)]
 use crate::executor::evaluate;
+use crate::executor::{ExecutionContext, Executor, evaluate_bool};
 use crate::query::FilterOp;
 use crate::schema::Record;
 use crate::sql::{ArithOp, Expression, Value as SqlValue};
@@ -518,18 +518,15 @@ impl SimdKernels {
 }
 
 /// Evaluate a numeric expression into a dense output column for the batch.
-pub fn eval_arith_column(
-    expr: &Expression,
-    batch: &VectorBatch,
-    out: &mut Vec<f64>,
-) -> Result<()> {
+pub fn eval_arith_column(expr: &Expression, batch: &VectorBatch, out: &mut Vec<f64>) -> Result<()> {
     out.clear();
     out.resize(batch.len, 0.0);
     match expr {
         Expression::Column(c) => {
-            let src = batch.columns.get(c).ok_or_else(|| {
-                TakyonicError::Sql(format!("vectorized: unknown column `{c}`"))
-            })?;
+            let src = batch
+                .columns
+                .get(c)
+                .ok_or_else(|| TakyonicError::Sql(format!("vectorized: unknown column `{c}`")))?;
             out.copy_from_slice(&src[..batch.len]);
             Ok(())
         }
@@ -761,16 +758,12 @@ pub fn rows_per_ms(rows: u64, elapsed: std::time::Duration) -> f64 {
 pub fn is_vectorizable(expr: &Expression) -> bool {
     match expr {
         Expression::Column(_) => true,
-        Expression::Literal(s) => {
-            !matches!(SqlValue::from_text(s), SqlValue::String(_))
-        }
+        Expression::Literal(s) => !matches!(SqlValue::from_text(s), SqlValue::String(_)),
         Expression::Parameter(_) => false,
         Expression::BinaryOp { left, right, .. }
         | Expression::And { left, right }
         | Expression::Or { left, right }
-        | Expression::Arith { left, right, .. } => {
-            is_vectorizable(left) && is_vectorizable(right)
-        }
+        | Expression::Arith { left, right, .. } => is_vectorizable(left) && is_vectorizable(right),
         Expression::InList { expr, list, .. } => {
             is_vectorizable(expr)
                 && list.iter().all(|v| {
@@ -858,9 +851,7 @@ fn walk(expr: &Expression, out: &mut Vec<String>) {
         Expression::IsNull { expr, .. }
         | Expression::IsBoolTest { expr, .. }
         | Expression::Cast { expr, .. }
-        | Expression::Not { expr } => {
-            walk(expr, out)
-        }
+        | Expression::Not { expr } => walk(expr, out),
         Expression::Coalesce(args) => {
             for a in args {
                 walk(a, out);
