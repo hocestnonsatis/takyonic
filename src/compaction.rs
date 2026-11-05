@@ -194,8 +194,7 @@ impl SstManager {
     /// Apply flush/compaction SST size cap from engine config.
     pub fn set_max_sst_bytes(&self, max_bytes: u64) {
         if max_bytes > 0 {
-            self.max_sst_bytes
-                .store(max_bytes, AtomicOrdering::Relaxed);
+            self.max_sst_bytes.store(max_bytes, AtomicOrdering::Relaxed);
         }
     }
 
@@ -810,10 +809,7 @@ impl<S: EntrySource> KWayMergeIterator<S> {
 impl KWayMergeIterator<VecSource> {
     /// Each `run` must be sorted by user-key ascending, commit-ts descending.
     pub fn from_sorted_runs(runs: Vec<Vec<Entry>>, watermark: u64) -> Result<Self> {
-        let sources = runs
-            .into_iter()
-            .map(|r| VecSource(r.into_iter()))
-            .collect();
+        let sources = runs.into_iter().map(|r| VecSource(r.into_iter())).collect();
         Self::new(sources, watermark)
     }
 }
@@ -1102,13 +1098,9 @@ fn execute_plan(
         let smallest = slice.first().expect("non-empty slice").key.clone();
         let largest = slice.last().expect("non-empty slice").key.clone();
         let output_path = manager.output_path(plan.output_level, id);
-        let info = SstWriter::write_paced(
-            id,
-            &output_path,
-            slice,
-            manager.block_size,
-            |bytes| pacer.pace(bytes),
-        )?;
+        let info = SstWriter::write_paced(id, &output_path, slice, manager.block_size, |bytes| {
+            pacer.pace(bytes)
+        })?;
         let output = SstMeta::from_info(plan.output_level, info, smallest, largest)?;
         if let Err(register_error) = manager.registry.register(output.id, &output.path) {
             let _ = std::fs::remove_file(&output.path);
@@ -1417,7 +1409,11 @@ mod tests {
             rapid.outputs.len() >= 2,
             "expected split outputs, got {} (sizes {:?})",
             rapid.outputs.len(),
-            rapid.outputs.iter().map(|o| o.file_size).collect::<Vec<_>>()
+            rapid
+                .outputs
+                .iter()
+                .map(|o| o.file_size)
+                .collect::<Vec<_>>()
         );
         for out in &rapid.outputs {
             assert!(
@@ -1446,12 +1442,7 @@ mod tests {
         mgr.attach_remote(Arc::clone(&remote));
         mgr.set_max_sst_bytes(1024 * 1024);
 
-        write_add(
-            &mgr,
-            0,
-            42,
-            &[Entry::put(&b"hello"[..], &b"world"[..], 1)],
-        );
+        write_add(&mgr, 0, 42, &[Entry::put(&b"hello"[..], &b"world"[..], 1)]);
         let key = sst_object_key(0, 42);
         let bytes = store.read_all(&key).expect("SST must be uploaded");
         assert!(!bytes.is_empty());

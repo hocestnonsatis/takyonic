@@ -1,6 +1,4 @@
-# Ryzen / native Linux: use system GCC (not Termux/proot aarch64 cross).
+# Use the system C compiler. Do not hard-code a host GCC library path;
+# rustc finds libgcc through the normal linker search path.
 [env]
 CC = "gcc"
-
-[build]
-rustflags = ["-L", "/usr/lib/gcc/x86_64-pc-linux-gnu/16"]

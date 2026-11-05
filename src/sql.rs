@@ -10,17 +10,17 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Action, AlterColumnOperation, AlterTable, AlterTableOperation, Analyze, Array, AssignmentTarget, BinaryOperator,
-    CastKind, CeilFloorKind, ColumnOption, CreateIndex, CreateRole, CreateTable, CreateUser,
-    DataType, DateTimeField, Distinct as AstDistinct, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, Grantee, GranteeName, GroupByExpr,
-    Ident, IndexColumn, Interval as AstInterval, JoinConstraint, JoinOperator, LimitClause, Fetch,
-    ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Password,
-    Privileges as AstPrivileges, Query, RenameTableNameKind, Revoke, Select, SelectItem, Set, SetExpr, SetOperator,
-    SetQuantifier, Statement, Subscript, AccessExpr,
-    TableConstraint, TableFactor, TableObject, TransactionMode, TrimWhereField, UnaryOperator,
-    VacuumStatement, Value as SqlValue, ValueWithSpan, WindowFrameBound, WindowFrameUnits,
-    WindowSpec, WindowType, NullTreatment,
+    AccessExpr, Action, AlterColumnOperation, AlterTable, AlterTableOperation, Analyze, Array,
+    AssignmentTarget, BinaryOperator, CastKind, CeilFloorKind, ColumnOption, CreateIndex,
+    CreateRole, CreateTable, CreateUser, DataType, DateTimeField, Distinct as AstDistinct,
+    DuplicateTreatment, Expr, Fetch, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, Grantee, GranteeName,
+    GroupByExpr, Ident, IndexColumn, Interval as AstInterval, JoinConstraint, JoinOperator,
+    LimitClause, NullTreatment, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByExpr,
+    OrderByKind, Password, Privileges as AstPrivileges, Query, RenameTableNameKind, Revoke, Select,
+    SelectItem, Set, SetExpr, SetOperator, SetQuantifier, Statement, Subscript, TableConstraint,
+    TableFactor, TableObject, TransactionMode, TrimWhereField, UnaryOperator, VacuumStatement,
+    Value as SqlValue, ValueWithSpan, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 use sqlparser::ast::{NamedWindowDefinition, NamedWindowExpr};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -469,16 +469,17 @@ fn expr_contains_aggregate(expr: &Expression) -> bool {
         | Expression::QuantifiedCmp { left, right, .. }
         | Expression::NullIf { left, right } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
-        },
+        }
         Expression::Case {
             when_then,
             else_result,
         } => {
-            when_then.iter().any(|(w, t)| {
-                expr_contains_aggregate(w) || expr_contains_aggregate(t)
-            }) || else_result
-                .as_ref()
-                .is_some_and(|e| expr_contains_aggregate(e))
+            when_then
+                .iter()
+                .any(|(w, t)| expr_contains_aggregate(w) || expr_contains_aggregate(t))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| expr_contains_aggregate(e))
         }
         Expression::ScalarFunction { args, .. } => args.iter().any(expr_contains_aggregate),
         _ => false,
@@ -490,9 +491,10 @@ fn collect_aggregates_into(expr: &Expression, out: &mut Vec<Expression>) {
     match expr {
         Expression::AggregateFunction { .. } => {
             let name = aggregate_result_column(expr);
-            let exists = name
-                .as_ref()
-                .is_some_and(|n| out.iter().any(|e| aggregate_result_column(e).as_ref() == Some(n)));
+            let exists = name.as_ref().is_some_and(|n| {
+                out.iter()
+                    .any(|e| aggregate_result_column(e).as_ref() == Some(n))
+            });
             if !exists {
                 out.push(expr.clone());
             }
@@ -815,10 +817,7 @@ pub fn ctas_output_columns(plan: &LogicalPlan) -> Result<Vec<String>> {
                 }
             }
             for a in aggr_exprs {
-                names.push(
-                    aggregate_result_column(a)
-                        .unwrap_or_else(|| "aggr".into()),
-                );
+                names.push(aggregate_result_column(a).unwrap_or_else(|| "aggr".into()));
             }
             Ok(names)
         }
@@ -1483,6 +1482,27 @@ pub enum LogicalPlan {
 pub struct LogicalPlanner;
 
 impl LogicalPlanner {
+    /// Parse one or more SQL statements.
+    ///
+    /// A single statement goes through [`Self::plan`] so session-only syntax
+    /// (`LISTEN`, `REBALANCE`, …) keeps working. Multiple statements are parsed
+    /// with the PostgreSQL dialect and translated one by one — this is the
+    /// simple-query script path (`BEGIN; INSERT …; COMMIT`).
+    pub fn plan_script(sql: &str) -> Result<Vec<LogicalPlan>> {
+        let prepared = preprocess_sql(sql);
+        let dialect = PostgreSqlDialect {};
+        if let Ok(stmts) = Parser::parse_sql(&dialect, &prepared) {
+            if stmts.len() > 1 {
+                let mut plans = Vec::with_capacity(stmts.len());
+                for stmt in &stmts {
+                    plans.push(Self::from_statement(stmt)?);
+                }
+                return Ok(plans);
+            }
+        }
+        Ok(vec![Self::plan(sql)?])
+    }
+
     /// Parse a single SQL statement into a [`LogicalPlan`].
     pub fn plan(sql: &str) -> Result<LogicalPlan> {
         let trimmed = sql.trim_start();
@@ -1643,18 +1663,20 @@ impl LogicalPlanner {
     }
 
     fn plan_analyze(analyze: &Analyze) -> Result<LogicalPlan> {
-        let name = analyze.table_name.as_ref().ok_or_else(|| {
-            TakyonicError::Sql("ANALYZE requires a table name".into())
-        })?;
+        let name = analyze
+            .table_name
+            .as_ref()
+            .ok_or_else(|| TakyonicError::Sql("ANALYZE requires a table name".into()))?;
         Ok(LogicalPlan::Analyze {
             table: object_name_leaf(name)?,
         })
     }
 
     fn plan_vacuum(vacuum: &VacuumStatement) -> Result<LogicalPlan> {
-        let name = vacuum.table_name.as_ref().ok_or_else(|| {
-            TakyonicError::Sql("VACUUM requires a table name".into())
-        })?;
+        let name = vacuum
+            .table_name
+            .as_ref()
+            .ok_or_else(|| TakyonicError::Sql("VACUUM requires a table name".into()))?;
         Ok(LogicalPlan::Vacuum {
             table: object_name_leaf(name)?,
         })
@@ -1770,9 +1792,7 @@ impl LogicalPlanner {
                     value,
                 })
             }
-            other => Err(TakyonicError::Sql(format!(
-                "unsupported SET form: {other}"
-            ))),
+            other => Err(TakyonicError::Sql(format!("unsupported SET form: {other}"))),
         }
     }
 
@@ -1837,11 +1857,8 @@ impl LogicalPlanner {
                         };
                     }
                 }
-                plan = apply_limit_and_fetch(
-                    plan,
-                    query.limit_clause.as_ref(),
-                    query.fetch.as_ref(),
-                )?;
+                plan =
+                    apply_limit_and_fetch(plan, query.limit_clause.as_ref(), query.fetch.as_ref())?;
                 plan
             }
         };
@@ -1854,14 +1871,9 @@ impl LogicalPlanner {
         outer_columns: &[String],
     ) -> Result<LogicalPlan> {
         match expr {
-            SetExpr::Select(s) => Self::plan_select_body(
-                s.as_ref(),
-                ctes,
-                outer_columns,
-                None,
-                None,
-                None,
-            ),
+            SetExpr::Select(s) => {
+                Self::plan_select_body(s.as_ref(), ctes, outer_columns, None, None, None)
+            }
             SetExpr::Query(q) => Self::plan_query(q, ctes, outer_columns),
             SetExpr::SetOperation {
                 left,
@@ -1909,9 +1921,7 @@ impl LogicalPlanner {
         fetch_clause: Option<&Fetch>,
     ) -> Result<LogicalPlan> {
         if select.from.is_empty() {
-            return Err(TakyonicError::Sql(
-                "SELECT requires a FROM clause".into(),
-            ));
+            return Err(TakyonicError::Sql("SELECT requires a FROM clause".into()));
         }
         let from = &select.from[0];
 
@@ -2001,12 +2011,8 @@ impl LogicalPlanner {
 
         // WHERE — may contain IN/EXISTS/scalar subqueries.
         if let Some(selection) = &select.selection {
-            let (filters, predicate) = plan_where_ctx(
-                Some(selection),
-                ctes,
-                outer_columns,
-                &scope_for_subqueries,
-            )?;
+            let (filters, predicate) =
+                plan_where_ctx(Some(selection), ctes, outer_columns, &scope_for_subqueries)?;
             plan = match plan {
                 LogicalPlan::Select {
                     table,
@@ -2033,12 +2039,8 @@ impl LogicalPlanner {
             };
         }
 
-        let (group_exprs, aggr_exprs, has_agg, having) = plan_projection_aggregates_ctx(
-            select,
-            ctes,
-            outer_columns,
-            &scope_for_subqueries,
-        )?;
+        let (group_exprs, aggr_exprs, has_agg, having) =
+            plan_projection_aggregates_ctx(select, ctes, outer_columns, &scope_for_subqueries)?;
         let is_aggregate = has_agg || !group_exprs.is_empty();
         if is_aggregate {
             plan = LogicalPlan::Aggregate {
@@ -2225,17 +2227,16 @@ impl LogicalPlanner {
                         lateral_outer,
                         *with_ordinality,
                     ),
-                    "JSON_EACH"
-                    | "JSONB_EACH"
-                    | "JSON_EACH_TEXT"
-                    | "JSONB_EACH_TEXT" => plan_json_object_srf(
-                        &upper,
-                        &tf_args.args,
-                        alias.as_ref(),
-                        ctes,
-                        lateral_outer,
-                        *with_ordinality,
-                    ),
+                    "JSON_EACH" | "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT" => {
+                        plan_json_object_srf(
+                            &upper,
+                            &tf_args.args,
+                            alias.as_ref(),
+                            ctes,
+                            lateral_outer,
+                            *with_ordinality,
+                        )
+                    }
                     "REGEXP_SPLIT_TO_TABLE" => plan_regexp_text_srf(
                         "REGEXP_SPLIT_TO_TABLE",
                         &tf_args.args,
@@ -2328,10 +2329,7 @@ impl LogicalPlanner {
                             *with_ordinality,
                         )
                     }
-                    "JSON_EACH"
-                    | "JSONB_EACH"
-                    | "JSON_EACH_TEXT"
-                    | "JSONB_EACH_TEXT" => {
+                    "JSON_EACH" | "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT" => {
                         if !allow_correlated {
                             ensure_table_fn_args_are_literals(args, &upper)?;
                         }
@@ -2344,13 +2342,9 @@ impl LogicalPlanner {
                             *with_ordinality,
                         )
                     }
-                    "UNNEST" => plan_unnest_srf(
-                        args,
-                        alias.as_ref(),
-                        ctes,
-                        lateral_outer,
-                        *with_ordinality,
-                    ),
+                    "UNNEST" => {
+                        plan_unnest_srf(args, alias.as_ref(), ctes, lateral_outer, *with_ordinality)
+                    }
                     "REGEXP_SPLIT_TO_TABLE" => plan_regexp_text_srf(
                         "REGEXP_SPLIT_TO_TABLE",
                         args,
@@ -2445,8 +2439,7 @@ impl LogicalPlanner {
             } => {
                 if *with_offset && *with_ordinality {
                     return Err(TakyonicError::Sql(
-                        "UNNEST WITH OFFSET and WITH ORDINALITY together are not supported"
-                            .into(),
+                        "UNNEST WITH OFFSET and WITH ORDINALITY together are not supported".into(),
                     ));
                 }
                 if array_exprs.len() != 1 {
@@ -2454,12 +2447,8 @@ impl LogicalPlanner {
                         "UNNEST currently supports exactly one array argument".into(),
                     ));
                 }
-                let array = expr_to_expression_ctx(
-                    &array_exprs[0],
-                    ctes,
-                    lateral_outer,
-                    lateral_outer,
-                )?;
+                let array =
+                    expr_to_expression_ctx(&array_exprs[0], ctes, lateral_outer, lateral_outer)?;
                 if expr_needs_row_eval(&array) && lateral_outer.is_empty() {
                     return Err(TakyonicError::Sql(
                         "correlated LATERAL UNNEST arguments are not yet supported \
@@ -2698,7 +2687,8 @@ impl LogicalPlanner {
         let mut pk_from_columns: Vec<String> = Vec::new();
         for col in &create.columns {
             let col_name = col.name.value.clone();
-            let (data_type, is_serial) = expand_serial_sql_type(&canonicalize_sql_type(&col.data_type));
+            let (data_type, is_serial) =
+                expand_serial_sql_type(&canonicalize_sql_type(&col.data_type));
             if is_serial {
                 serial_columns.push(col_name.clone());
             }
@@ -2851,9 +2841,7 @@ impl LogicalPlanner {
                 }
                 AlterTableOperation::AlterColumn { column_name, op } => match op {
                     AlterColumnOperation::SetDataType {
-                        data_type,
-                        using,
-                        ..
+                        data_type, using, ..
                     } => {
                         if using.is_some() {
                             return Err(TakyonicError::Sql(
@@ -3021,6 +3009,11 @@ impl SqlEngine {
     pub fn plan(sql: &str) -> Result<LogicalPlan> {
         LogicalPlanner::plan(sql)
     }
+
+    /// Parse a simple-query script into one plan per statement.
+    pub fn plan_script(sql: &str) -> Result<Vec<LogicalPlan>> {
+        LogicalPlanner::plan_script(sql)
+    }
 }
 
 /// Translate WHERE into CBO filters (literals only) + full expression tree.
@@ -3039,8 +3032,7 @@ fn plan_where_ctx(
     match selection {
         None => Ok((Vec::new(), None)),
         Some(expr) => {
-            let predicate =
-                expr_to_expression_ctx(expr, ctes, outer_ref_scope, subquery_outer)?;
+            let predicate = expr_to_expression_ctx(expr, ctes, outer_ref_scope, subquery_outer)?;
             // Parameterized / subquery / complex WHERE: CBO gets no driving filter.
             let filters = if expression_has_subquery(&predicate) {
                 Vec::new()
@@ -3203,15 +3195,11 @@ fn expression_has_subquery(expr: &Expression) -> bool {
         | Expression::AtTimeZone {
             timestamp: left,
             time_zone: right,
-        } => {
-            expression_has_subquery(left) || expression_has_subquery(right)
-        }
+        } => expression_has_subquery(left) || expression_has_subquery(right),
         Expression::InList { expr, .. } => expression_has_subquery(expr),
         Expression::AggregateFunction { args, filter, .. } => {
             args.iter().any(expression_has_subquery)
-                || filter
-                    .as_ref()
-                    .is_some_and(|f| expression_has_subquery(f))
+                || filter.as_ref().is_some_and(|f| expression_has_subquery(f))
         }
         Expression::Array(items) => items.iter().any(expression_has_subquery),
         Expression::ArrayIndex { array, index } => {
@@ -3221,11 +3209,12 @@ fn expression_has_subquery(expr: &Expression) -> bool {
             when_then,
             else_result,
         } => {
-            when_then.iter().any(|(c, r)| {
-                expression_has_subquery(c) || expression_has_subquery(r)
-            }) || else_result
-                .as_ref()
-                .is_some_and(|e| expression_has_subquery(e))
+            when_then
+                .iter()
+                .any(|(c, r)| expression_has_subquery(c) || expression_has_subquery(r))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| expression_has_subquery(e))
         }
         Expression::IsNull { expr, .. } | Expression::IsBoolTest { expr, .. } => {
             expression_has_subquery(expr)
@@ -3236,9 +3225,7 @@ fn expression_has_subquery(expr: &Expression) -> bool {
             expression_has_subquery(left) || expression_has_subquery(right)
         }
         Expression::Coalesce(args) => args.iter().any(expression_has_subquery),
-        Expression::Cast { expr, .. } | Expression::Not { expr } => {
-            expression_has_subquery(expr)
-        }
+        Expression::Cast { expr, .. } | Expression::Not { expr } => expression_has_subquery(expr),
         Expression::ScalarFunction { args, .. } => args.iter().any(expression_has_subquery),
         Expression::Column(_)
         | Expression::OuterRef(_)
@@ -3283,8 +3270,12 @@ fn walk_plan_columns(plan: &LogicalPlan, f: &mut dyn FnMut(&str)) {
             walk_columns(predicate, f);
             walk_plan_columns(input, f);
         }
-        LogicalPlan::Join { left, right, on, .. }
-        | LogicalPlan::DistributedJoin { left, right, on, .. } => {
+        LogicalPlan::Join {
+            left, right, on, ..
+        }
+        | LogicalPlan::DistributedJoin {
+            left, right, on, ..
+        } => {
             walk_columns(on, f);
             walk_plan_columns(left, f);
             walk_plan_columns(right, f);
@@ -3419,8 +3410,7 @@ fn walk_columns(expr: &Expression, f: &mut dyn FnMut(&str)) {
             walk_columns(left, f);
             walk_columns(right, f);
         }
-        Expression::ScalarFunction { args, .. }
-        | Expression::Coalesce(args) => {
+        Expression::ScalarFunction { args, .. } | Expression::Coalesce(args) => {
             for a in args {
                 walk_columns(a, f);
             }
@@ -3773,10 +3763,9 @@ fn take_leading_ident(s: &str) -> Option<(&str, &str)> {
     let ident = &s[..i];
     let upper = ident.to_ascii_uppercase();
     match upper.as_str() {
-        "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS" | "EXCLUDE" | "BETWEEN" | "UNBOUNDED"
-        | "CURRENT" | "PRECEDING" | "FOLLOWING" | "AND" | "NO" | "OTHERS" | "GROUP" | "TIES" => {
-            None
-        }
+        "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS" | "EXCLUDE" | "BETWEEN"
+        | "UNBOUNDED" | "CURRENT" | "PRECEDING" | "FOLLOWING" | "AND" | "NO" | "OTHERS"
+        | "GROUP" | "TIES" => None,
         _ => Some((ident, &s[i..])),
     }
 }
@@ -3794,7 +3783,11 @@ fn try_parse_grant_role_membership(sql: &str) -> Option<(String, String)> {
     let body = &sql["GRANT ".len()..];
     let to_idx = body.to_ascii_uppercase().find(" TO ")?;
     let role = body[..to_idx].trim().to_string();
-    let member = body[to_idx + 4..].trim().trim_end_matches(';').trim().to_string();
+    let member = body[to_idx + 4..]
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
     // Reject if role looks like a privilege keyword.
     let role_up = role.to_ascii_uppercase();
     if matches!(
@@ -4097,7 +4090,9 @@ fn ast_privileges_to_rbac(privs: &AstPrivileges) -> Result<Vec<Privilege>> {
                 }
             }
             if out.is_empty() {
-                return Err(TakyonicError::Sql("GRANT/REVOKE requires privileges".into()));
+                return Err(TakyonicError::Sql(
+                    "GRANT/REVOKE requires privileges".into(),
+                ));
             }
             Ok(out)
         }
@@ -4533,8 +4528,7 @@ fn plan_projection_list_with_windows(
                     windows.push(call);
                     columns.push((name.clone(), Expression::Column(name)));
                 } else {
-                    let planned =
-                        expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer)?;
+                    let planned = expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer)?;
                     let name = projection_output_name(e, &planned)?;
                     columns.push((name, planned));
                 }
@@ -4602,12 +4596,14 @@ fn build_named_windows(defs: &[NamedWindowDefinition]) -> Result<HashMap<String,
                     spec.clone()
                 }
             }
-            NamedWindowExpr::NamedWindow(other) => map.get(&other.value).cloned().ok_or_else(|| {
-                TakyonicError::Sql(format!(
-                    "unknown window name `{}` in WINDOW `{name}`",
-                    other.value
-                ))
-            })?,
+            NamedWindowExpr::NamedWindow(other) => {
+                map.get(&other.value).cloned().ok_or_else(|| {
+                    TakyonicError::Sql(format!(
+                        "unknown window name `{}` in WINDOW `{name}`",
+                        other.value
+                    ))
+                })?
+            }
         };
         map.insert(name, spec);
     }
@@ -4624,11 +4620,7 @@ fn merge_window_spec(base: &WindowSpec, overlay: &WindowSpec) -> WindowSpec {
     } else {
         base_ex
     };
-    let partition_by = if over_pb.is_empty() {
-        base_pb
-    } else {
-        over_pb
-    };
+    let partition_by = if over_pb.is_empty() { base_pb } else { over_pb };
     WindowSpec {
         window_name: None,
         partition_by: reinject_exclude_partition(partition_by, exclude),
@@ -4779,17 +4771,11 @@ fn try_plan_window_call(
                 outer_ref_scope,
                 subquery_outer,
             )?);
-            let n_expr = function_arg_to_expression_ctx(
-                &args[1],
-                ctes,
-                outer_ref_scope,
-                subquery_outer,
-            )?;
+            let n_expr =
+                function_arg_to_expression_ctx(&args[1], ctes, outer_ref_scope, subquery_outer)?;
             offset = match &n_expr {
                 Expression::Literal(s) => s.parse::<i64>().map_err(|_| {
-                    TakyonicError::Sql(format!(
-                        "{upper} n must be an integer literal, got `{s}`"
-                    ))
+                    TakyonicError::Sql(format!("{upper} n must be an integer literal, got `{s}`"))
                 })?,
                 other => {
                     return Err(TakyonicError::Sql(format!(
@@ -4906,20 +4892,18 @@ fn try_plan_window_call(
         match &func.args {
             FunctionArguments::None => {}
             FunctionArguments::List(list) if list.args.is_empty() => {}
-            FunctionArguments::List(list) if list.args.len() == 1 => {
-                match &list.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                    | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {}
-                    other => {
-                        value = Some(function_arg_to_expression_ctx(
-                            other,
-                            ctes,
-                            outer_ref_scope,
-                            subquery_outer,
-                        )?);
-                    }
+            FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {}
+                other => {
+                    value = Some(function_arg_to_expression_ctx(
+                        other,
+                        ctes,
+                        outer_ref_scope,
+                        subquery_outer,
+                    )?);
                 }
-            }
+            },
             FunctionArguments::List(_) => {
                 return Err(TakyonicError::Sql(
                     "COUNT() OVER takes at most one argument".into(),
@@ -5023,9 +5007,9 @@ fn try_plan_window_call(
     }
     let resolved;
     let spec: &WindowSpec = match over {
-        WindowType::NamedWindow(ident) => named_windows.get(&ident.value).ok_or_else(|| {
-            TakyonicError::Sql(format!("unknown window name `{}`", ident.value))
-        })?,
+        WindowType::NamedWindow(ident) => named_windows
+            .get(&ident.value)
+            .ok_or_else(|| TakyonicError::Sql(format!("unknown window name `{}`", ident.value)))?,
         WindowType::WindowSpec(inline) => {
             if let Some(base_name) = &inline.window_name {
                 let base = named_windows.get(&base_name.value).ok_or_else(|| {
@@ -5314,8 +5298,7 @@ fn plan_projection_aggregates_ctx(
     outer_ref_scope: &[String],
     subquery_outer: &[String],
 ) -> Result<(Vec<Expression>, Vec<Expression>, bool, Option<Expression>)> {
-    let group_exprs =
-        plan_group_by_ctx(select, ctes, outer_ref_scope, subquery_outer)?;
+    let group_exprs = plan_group_by_ctx(select, ctes, outer_ref_scope, subquery_outer)?;
     let mut aggr_exprs = Vec::new();
     let mut has_agg = false;
 
@@ -5357,7 +5340,12 @@ fn plan_projection_aggregates_ctx(
     }
 
     let having = if let Some(h) = &select.having {
-        Some(expr_to_expression_ctx(h, ctes, outer_ref_scope, subquery_outer)?)
+        Some(expr_to_expression_ctx(
+            h,
+            ctes,
+            outer_ref_scope,
+            subquery_outer,
+        )?)
     } else {
         None
     };
@@ -5465,9 +5453,7 @@ fn plan_order_by_ctx(
     // `ORDER BY ALL [ASC|DESC …]` arrives as a single Identifier("ALL") expression.
     let all_opts = match &order_by.kind {
         OrderByKind::All(opts) => Some(opts),
-        OrderByKind::Expressions(exprs) if is_order_by_all_ident(exprs) => {
-            Some(&exprs[0].options)
-        }
+        OrderByKind::Expressions(exprs) if is_order_by_all_ident(exprs) => Some(&exprs[0].options),
         OrderByKind::Expressions(_) => None,
     };
     if let Some(opts) = all_opts {
@@ -5508,11 +5494,13 @@ fn plan_order_by_ctx(
 
 fn is_order_by_all_ident(exprs: &[OrderByExpr]) -> bool {
     match exprs {
-        [OrderByExpr {
-            expr: Expr::Identifier(id),
-            with_fill: None,
-            ..
-        }] if id.value.eq_ignore_ascii_case("ALL") => true,
+        [
+            OrderByExpr {
+                expr: Expr::Identifier(id),
+                with_fill: None,
+                ..
+            },
+        ] if id.value.eq_ignore_ascii_case("ALL") => true,
         _ => false,
     }
 }
@@ -5544,11 +5532,8 @@ fn expand_order_by_all(
         if matches!(expr, Expr::Function(f) if f.over.is_some()) {
             let name = match item {
                 SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                _ => projection_output_name(
-                    expr,
-                    &Expression::Column("window".into()),
-                )
-                .unwrap_or_else(|_| "window".into()),
+                _ => projection_output_name(expr, &Expression::Column("window".into()))
+                    .unwrap_or_else(|_| "window".into()),
             };
             out.push(SortExpr {
                 expr: Expression::Column(name),
@@ -6228,8 +6213,8 @@ fn function_to_expression_ctx(
         }
         let args = function_arg_list(func, ctes, outer_ref_scope, subquery_outer)?;
         match upper.as_str() {
-            "LOWER" | "UPPER" | "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
-            | "OCTET_LENGTH" | "BIT_LENGTH"
+            "LOWER" | "UPPER" | "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH"
+            | "BIT_LENGTH"
                 if args.len() != 1 =>
             {
                 return Err(TakyonicError::Sql(format!(
@@ -6269,9 +6254,7 @@ fn function_to_expression_ctx(
                 ));
             }
             "FORMAT" if args.is_empty() => {
-                return Err(TakyonicError::Sql(
-                    "FORMAT requires a format string".into(),
-                ));
+                return Err(TakyonicError::Sql("FORMAT requires a format string".into()));
             }
             "QUOTE_IDENT" | "QUOTE_LITERAL" | "QUOTE_NULLABLE" if args.len() != 1 => {
                 return Err(TakyonicError::Sql(format!(
@@ -6374,36 +6357,65 @@ fn function_to_expression_ctx(
             "PI" if !args.is_empty() => {
                 return Err(TakyonicError::Sql("PI takes no arguments".into()));
             }
-            "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP"
-            | "LOCALTIME" | "CLOCK_TIMESTAMP" | "TIMEOFDAY" | "STATEMENT_TIMESTAMP"
-            | "TRANSACTION_TIMESTAMP" | "CURRENT_USER" | "SESSION_USER" | "USER"
-            | "CURRENT_ROLE" | "CURRENT_SCHEMA" | "CURRENT_CATALOG" | "VERSION"
-            | "PG_BACKEND_PID" | "PG_IS_IN_RECOVERY" | "PG_JIT_AVAILABLE"
-            | "PG_RELOAD_CONF" | "PG_ROTATE_LOGFILE"
+            "NOW"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "LOCALTIMESTAMP"
+            | "LOCALTIME"
+            | "CLOCK_TIMESTAMP"
+            | "TIMEOFDAY"
+            | "STATEMENT_TIMESTAMP"
+            | "TRANSACTION_TIMESTAMP"
+            | "CURRENT_USER"
+            | "SESSION_USER"
+            | "USER"
+            | "CURRENT_ROLE"
+            | "CURRENT_SCHEMA"
+            | "CURRENT_CATALOG"
+            | "VERSION"
+            | "PG_BACKEND_PID"
+            | "PG_IS_IN_RECOVERY"
+            | "PG_JIT_AVAILABLE"
+            | "PG_RELOAD_CONF"
+            | "PG_ROTATE_LOGFILE"
             | "CURRENT_QUERY"
             | "PG_NOTIFICATION_QUEUE_USAGE"
             | "PG_LISTENING_CHANNELS"
             | "PG_ADVISORY_UNLOCK_ALL"
             | "GETDATABASEENCODING"
-            | "PG_CLIENT_ENCODING" | "GEN_RANDOM_UUID" | "PG_POSTMASTER_START_TIME"
+            | "PG_CLIENT_ENCODING"
+            | "GEN_RANDOM_UUID"
+            | "PG_POSTMASTER_START_TIME"
             | "PG_CONF_LOAD_TIME"
             | "LASTVAL"
-            | "TXID_CURRENT" | "PG_CURRENT_XACT_ID" | "INET_SERVER_ADDR" | "INET_SERVER_PORT"
-            | "INET_CLIENT_ADDR" | "INET_CLIENT_PORT"
-            | "PG_EXPORT_SNAPSHOT" | "PG_CURRENT_SNAPSHOT" | "TXID_CURRENT_SNAPSHOT"
-            | "PG_CURRENT_WAL_LSN" | "PG_CURRENT_WAL_INSERT_LSN"
+            | "TXID_CURRENT"
+            | "PG_CURRENT_XACT_ID"
+            | "INET_SERVER_ADDR"
+            | "INET_SERVER_PORT"
+            | "INET_CLIENT_ADDR"
+            | "INET_CLIENT_PORT"
+            | "PG_EXPORT_SNAPSHOT"
+            | "PG_CURRENT_SNAPSHOT"
+            | "TXID_CURRENT_SNAPSHOT"
+            | "PG_CURRENT_WAL_LSN"
+            | "PG_CURRENT_WAL_INSERT_LSN"
             | "PG_CURRENT_WAL_FLUSH_LSN"
-            | "PG_SWITCH_WAL" | "PG_SWITCH_XLOG"
-            | "PG_LAST_WAL_RECEIVE_LSN" | "PG_LAST_WAL_REPLAY_LSN"
-            | "PG_LAST_XACT_REPLAY_TIMESTAMP" | "PG_IS_WAL_REPLAY_PAUSED"
-            | "PG_WAL_REPLAY_PAUSE" | "PG_WAL_REPLAY_RESUME"
-            | "PG_IS_IN_BACKUP" | "PG_BACKUP_START_TIME"
-            | "PG_BACKUP_STOP" | "PG_STOP_BACKUP"
+            | "PG_SWITCH_WAL"
+            | "PG_SWITCH_XLOG"
+            | "PG_LAST_WAL_RECEIVE_LSN"
+            | "PG_LAST_WAL_REPLAY_LSN"
+            | "PG_LAST_XACT_REPLAY_TIMESTAMP"
+            | "PG_IS_WAL_REPLAY_PAUSED"
+            | "PG_WAL_REPLAY_PAUSE"
+            | "PG_WAL_REPLAY_RESUME"
+            | "PG_IS_IN_BACKUP"
+            | "PG_BACKUP_START_TIME"
+            | "PG_BACKUP_STOP"
+            | "PG_STOP_BACKUP"
                 if !args.is_empty() =>
             {
-                return Err(TakyonicError::Sql(format!(
-                    "{upper} takes no arguments"
-                )));
+                return Err(TakyonicError::Sql(format!("{upper} takes no arguments")));
             }
             "PG_BACKUP_START" | "PG_START_BACKUP" if !(1..=3).contains(&args.len()) => {
                 return Err(TakyonicError::Sql(format!(
@@ -6430,11 +6442,16 @@ fn function_to_expression_ctx(
                     "{upper} requires exactly one LSN argument"
                 )));
             }
-            "PG_TRY_ADVISORY_LOCK" | "PG_ADVISORY_LOCK" | "PG_ADVISORY_UNLOCK"
-            | "PG_TRY_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_LOCK_SHARED"
+            "PG_TRY_ADVISORY_LOCK"
+            | "PG_ADVISORY_LOCK"
+            | "PG_ADVISORY_UNLOCK"
+            | "PG_TRY_ADVISORY_LOCK_SHARED"
+            | "PG_ADVISORY_LOCK_SHARED"
             | "PG_ADVISORY_UNLOCK_SHARED"
-            | "PG_TRY_ADVISORY_XACT_LOCK" | "PG_ADVISORY_XACT_LOCK"
-            | "PG_TRY_ADVISORY_XACT_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_TRY_ADVISORY_XACT_LOCK"
+            | "PG_ADVISORY_XACT_LOCK"
+            | "PG_TRY_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_ADVISORY_XACT_LOCK_SHARED"
                 if !(1..=2).contains(&args.len()) =>
             {
                 return Err(TakyonicError::Sql(format!(
@@ -6601,7 +6618,8 @@ fn function_to_expression_ctx(
             }
             "SHOBJ_DESCRIPTION" if args.len() != 2 => {
                 return Err(TakyonicError::Sql(
-                    "SHOBJ_DESCRIPTION requires name, catalog (e.g. pg_authid / pg_database)".into(),
+                    "SHOBJ_DESCRIPTION requires name, catalog (e.g. pg_authid / pg_database)"
+                        .into(),
                 ));
             }
             "TO_REGCLASS" if args.len() != 1 => {
@@ -6610,9 +6628,7 @@ fn function_to_expression_ctx(
                 ));
             }
             "TO_REGROLE" if args.len() != 1 => {
-                return Err(TakyonicError::Sql(
-                    "TO_REGROLE requires a role name".into(),
-                ));
+                return Err(TakyonicError::Sql("TO_REGROLE requires a role name".into()));
             }
             "TO_REGNAMESPACE" if args.len() != 1 => {
                 return Err(TakyonicError::Sql(
@@ -6620,9 +6636,7 @@ fn function_to_expression_ctx(
                 ));
             }
             "TO_REGTYPE" if args.len() != 1 => {
-                return Err(TakyonicError::Sql(
-                    "TO_REGTYPE requires a type name".into(),
-                ));
+                return Err(TakyonicError::Sql("TO_REGTYPE requires a type name".into()));
             }
             "FORMAT_TYPE" if args.len() != 2 => {
                 return Err(TakyonicError::Sql(
@@ -6919,10 +6933,7 @@ fn function_to_expression_ctx(
             "ROW_TO_JSON" => {} // validated in plan_row_to_json
             _ => {}
         }
-        return Ok(Expression::ScalarFunction {
-            name: upper,
-            args,
-        });
+        return Ok(Expression::ScalarFunction { name: upper, args });
     }
     if !is_aggregate_fn(&upper) {
         return Err(TakyonicError::Sql(format!(
@@ -6949,10 +6960,7 @@ fn function_to_expression_ctx(
     let args = match &func.args {
         FunctionArguments::None => Vec::new(),
         FunctionArguments::List(list) => {
-            if matches!(
-                list.duplicate_treatment,
-                Some(DuplicateTreatment::Distinct)
-            ) {
+            if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
                 distinct = true;
             }
             for clause in &list.clauses {
@@ -6976,7 +6984,12 @@ fn function_to_expression_ctx(
             }
             let mut out = Vec::with_capacity(list.args.len());
             for arg in &list.args {
-                out.push(function_arg_to_expression_ctx(arg, ctes, outer_ref_scope, subquery_outer)?);
+                out.push(function_arg_to_expression_ctx(
+                    arg,
+                    ctes,
+                    outer_ref_scope,
+                    subquery_outer,
+                )?);
             }
             out
         }
@@ -7217,7 +7230,11 @@ fn expr_to_expression_ctx(
             let upper = ident.value.to_ascii_uppercase();
             if matches!(
                 upper.as_str(),
-                "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
+                "CURRENT_TIMESTAMP"
+                    | "CURRENT_DATE"
+                    | "CURRENT_TIME"
+                    | "LOCALTIMESTAMP"
+                    | "LOCALTIME"
                     | "CURRENT_ROLE"
             ) {
                 return Ok(Expression::ScalarFunction {
@@ -7270,16 +7287,36 @@ fn expr_to_expression_ctx(
             op: BinaryOperator::And,
             right,
         } => Ok(Expression::And {
-            left: Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?),
-            right: Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?),
+            left: Box::new(expr_to_expression_ctx(
+                left,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?),
+            right: Box::new(expr_to_expression_ctx(
+                right,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?),
         }),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Or,
             right,
         } => Ok(Expression::Or {
-            left: Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?),
-            right: Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?),
+            left: Box::new(expr_to_expression_ctx(
+                left,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?),
+            right: Box::new(expr_to_expression_ctx(
+                right,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?),
         }),
         Expr::BinaryOp {
             left,
@@ -7294,8 +7331,18 @@ fn expr_to_expression_ctx(
             })
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_e = Box::new(expr_to_expression_ctx(left, ctes, outer_ref_scope, subquery_outer)?);
-            let right_e = Box::new(expr_to_expression_ctx(right, ctes, outer_ref_scope, subquery_outer)?);
+            let left_e = Box::new(expr_to_expression_ctx(
+                left,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?);
+            let right_e = Box::new(expr_to_expression_ctx(
+                right,
+                ctes,
+                outer_ref_scope,
+                subquery_outer,
+            )?);
             if let Some(arith) = match op {
                 BinaryOperator::Plus => Some(ArithOp::Add),
                 BinaryOperator::Minus => {
@@ -7435,25 +7482,22 @@ fn expr_to_expression_ctx(
         Expr::Array(Array { elem, .. }) => {
             let mut items = Vec::with_capacity(elem.len());
             for e in elem {
-                items.push(expr_to_expression_ctx(e, ctes, outer_ref_scope, subquery_outer)?);
+                items.push(expr_to_expression_ctx(
+                    e,
+                    ctes,
+                    outer_ref_scope,
+                    subquery_outer,
+                )?);
             }
             Ok(Expression::Array(items))
         }
-        Expr::CompoundFieldAccess {
-            root,
-            access_chain,
-        } => {
-            let mut expr =
-                expr_to_expression_ctx(root, ctes, outer_ref_scope, subquery_outer)?;
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut expr = expr_to_expression_ctx(root, ctes, outer_ref_scope, subquery_outer)?;
             for access in access_chain {
                 match access {
                     AccessExpr::Subscript(Subscript::Index { index }) => {
-                        let idx = expr_to_expression_ctx(
-                            index,
-                            ctes,
-                            outer_ref_scope,
-                            subquery_outer,
-                        )?;
+                        let idx =
+                            expr_to_expression_ctx(index, ctes, outer_ref_scope, subquery_outer)?;
                         expr = Expression::ArrayIndex {
                             array: Box::new(expr),
                             index: Box::new(idx),
@@ -7468,7 +7512,9 @@ fn expr_to_expression_ctx(
             }
             Ok(expr)
         }
-        Expr::Function(func) => function_to_expression_ctx(func, ctes, outer_ref_scope, subquery_outer),
+        Expr::Function(func) => {
+            function_to_expression_ctx(func, ctes, outer_ref_scope, subquery_outer)
+        }
         Expr::InSubquery {
             expr: left,
             subquery,
@@ -7589,8 +7635,7 @@ fn expr_to_expression_ctx(
             };
             let mut when_then = Vec::with_capacity(conditions.len());
             if let Some(op) = operand {
-                let subject =
-                    expr_to_expression_ctx(op, ctes, outer_ref_scope, subquery_outer)?;
+                let subject = expr_to_expression_ctx(op, ctes, outer_ref_scope, subquery_outer)?;
                 for arm in conditions {
                     let when_val = expr_to_expression_ctx(
                         &arm.condition,
@@ -7598,12 +7643,8 @@ fn expr_to_expression_ctx(
                         outer_ref_scope,
                         subquery_outer,
                     )?;
-                    let then_e = expr_to_expression_ctx(
-                        &arm.result,
-                        ctes,
-                        outer_ref_scope,
-                        subquery_outer,
-                    )?;
+                    let then_e =
+                        expr_to_expression_ctx(&arm.result, ctes, outer_ref_scope, subquery_outer)?;
                     when_then.push((
                         Expression::BinaryOp {
                             left: Box::new(subject.clone()),
@@ -7622,12 +7663,7 @@ fn expr_to_expression_ctx(
                             outer_ref_scope,
                             subquery_outer,
                         )?,
-                        expr_to_expression_ctx(
-                            &arm.result,
-                            ctes,
-                            outer_ref_scope,
-                            subquery_outer,
-                        )?,
+                        expr_to_expression_ctx(&arm.result, ctes, outer_ref_scope, subquery_outer)?,
                     ));
                 }
             }
@@ -7922,8 +7958,7 @@ fn expr_to_expression_ctx(
         } => {
             if trim_characters.is_some() {
                 return Err(TakyonicError::Sql(
-                    "TRIM(... FROM ...) with character list syntax is not yet supported"
-                        .into(),
+                    "TRIM(... FROM ...) with character list syntax is not yet supported".into(),
                 ));
             }
             let side = match trim_where {
@@ -8069,7 +8104,9 @@ fn plan_values_clause(
     column_names: Option<&[String]>,
 ) -> Result<LogicalPlan> {
     if values.rows.is_empty() {
-        return Err(TakyonicError::Sql("VALUES requires at least one row".into()));
+        return Err(TakyonicError::Sql(
+            "VALUES requires at least one row".into(),
+        ));
     }
     let width = values.rows[0].len();
     if width == 0 {
@@ -8195,9 +8232,9 @@ fn plan_like_expr(
             ..
         }) => {
             let mut chars = s.chars();
-            let c = chars.next().ok_or_else(|| {
-                TakyonicError::Sql("ESCAPE requires a single character".into())
-            })?;
+            let c = chars
+                .next()
+                .ok_or_else(|| TakyonicError::Sql("ESCAPE requires a single character".into()))?;
             if chars.next().is_some() {
                 return Err(TakyonicError::Sql(
                     "ESCAPE requires a single character".into(),
@@ -8247,9 +8284,9 @@ fn plan_similar_to_expr(
             ..
         }) => {
             let mut chars = s.chars();
-            let c = chars.next().ok_or_else(|| {
-                TakyonicError::Sql("ESCAPE requires a single character".into())
-            })?;
+            let c = chars
+                .next()
+                .ok_or_else(|| TakyonicError::Sql("ESCAPE requires a single character".into()))?;
             if chars.next().is_some() {
                 return Err(TakyonicError::Sql(
                     "ESCAPE requires a single character".into(),
@@ -8354,9 +8391,8 @@ fn like_match_chars(hay: &[char], pat: &[char], escape: Option<char>) -> bool {
 pub fn sql_similar_to_match(text: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
     let posix = similar_to_posix(pattern, escape)?;
     let wrapped = format!("^(?:{posix})$");
-    let re = regex::Regex::new(&wrapped).map_err(|e| {
-        TakyonicError::Sql(format!("invalid SIMILAR TO pattern `{pattern}`: {e}"))
-    })?;
+    let re = regex::Regex::new(&wrapped)
+        .map_err(|e| TakyonicError::Sql(format!("invalid SIMILAR TO pattern `{pattern}`: {e}")))?;
     Ok(re.is_match(text))
 }
 
@@ -8452,10 +8488,12 @@ fn plan_has_outer_ref(plan: &LogicalPlan) -> bool {
         LogicalPlan::Filter { input, predicate } => {
             expr_has_outer_ref(predicate) || plan_has_outer_ref(input)
         }
-        LogicalPlan::Join { left, right, on, .. }
-        | LogicalPlan::DistributedJoin { left, right, on, .. } => {
-            expr_has_outer_ref(on) || plan_has_outer_ref(left) || plan_has_outer_ref(right)
+        LogicalPlan::Join {
+            left, right, on, ..
         }
+        | LogicalPlan::DistributedJoin {
+            left, right, on, ..
+        } => expr_has_outer_ref(on) || plan_has_outer_ref(left) || plan_has_outer_ref(right),
         LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::DistributedAggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -8521,9 +8559,7 @@ fn expr_has_outer_ref(expr: &Expression) -> bool {
         | Expression::AtTimeZone {
             timestamp: left,
             time_zone: right,
-        } => {
-            expr_has_outer_ref(left) || expr_has_outer_ref(right)
-        }
+        } => expr_has_outer_ref(left) || expr_has_outer_ref(right),
         Expression::InList { expr, .. } => expr_has_outer_ref(expr),
         Expression::InSubquery { expr, subquery, .. } => {
             expr_has_outer_ref(expr) || plan_has_outer_ref(subquery)
@@ -8636,7 +8672,9 @@ fn relation_is_lateral(factor: &TableFactor) -> bool {
 /// Table / alias names visible for OuterRef qualification in this FROM item.
 fn from_relation_scope_names(factor: &TableFactor) -> Vec<String> {
     match factor {
-        TableFactor::Table { name, alias, args, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             let mut names = Vec::new();
             if let Ok(table) = object_name_leaf(name) {
                 names.push(table);
@@ -8699,8 +8737,7 @@ fn plan_unnest_srf(
             "UNNEST currently supports exactly one array argument".into(),
         ));
     }
-    let array =
-        function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
+    let array = function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
     if expr_needs_row_eval(&array) && lateral_outer.is_empty() {
         return Err(TakyonicError::Sql(
             "correlated LATERAL UNNEST arguments are not yet supported \
@@ -8866,8 +8903,7 @@ fn plan_json_array_elements_srf(
             "{upper} requires exactly one json argument"
         )));
     }
-    let expr =
-        function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
+    let expr = function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
     if expr_needs_row_eval(&expr) && lateral_outer.is_empty() {
         return Err(TakyonicError::Sql(format!(
             "correlated LATERAL {upper} arguments are not yet supported \
@@ -8902,8 +8938,7 @@ fn plan_json_object_srf(
             "{upper} requires exactly one json argument"
         )));
     }
-    let expr =
-        function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
+    let expr = function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
     if expr_needs_row_eval(&expr) && lateral_outer.is_empty() {
         return Err(TakyonicError::Sql(format!(
             "correlated LATERAL {upper} arguments are not yet supported \
@@ -8973,10 +9008,8 @@ fn plan_regexp_text_srf(
             "{fn_name} requires string, pattern [, flags]"
         )));
     }
-    let string =
-        function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
-    let pattern =
-        function_arg_to_expression_ctx(&args[1], ctes, lateral_outer, lateral_outer)?;
+    let string = function_arg_to_expression_ctx(&args[0], ctes, lateral_outer, lateral_outer)?;
+    let pattern = function_arg_to_expression_ctx(&args[1], ctes, lateral_outer, lateral_outer)?;
     let flags = args
         .get(2)
         .map(|a| function_arg_to_expression_ctx(a, ctes, lateral_outer, lateral_outer))
@@ -9019,9 +9052,7 @@ fn ensure_table_fn_args_are_literals(args: &[FunctionArg], fn_name: &str) -> Res
         let expr = match arg {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-                return Err(TakyonicError::Sql(format!(
-                    "{fn_name} does not accept *"
-                )));
+                return Err(TakyonicError::Sql(format!("{fn_name} does not accept *")));
             }
             other => {
                 return Err(TakyonicError::Sql(format!(
@@ -9052,9 +9083,8 @@ fn expr_is_json_srf_literal(expr: &Expr) -> bool {
 fn json_doc_from_planned_expr(expr: &Expression, fn_name: &str) -> Result<String> {
     match expr {
         Expression::Literal(s) => {
-            let v: serde_json::Value = serde_json::from_str(s.trim()).map_err(|e| {
-                TakyonicError::Sql(format!("{fn_name}: invalid JSON literal: {e}"))
-            })?;
+            let v: serde_json::Value = serde_json::from_str(s.trim())
+                .map_err(|e| TakyonicError::Sql(format!("{fn_name}: invalid JSON literal: {e}")))?;
             Ok(v.to_string())
         }
         Expression::Cast {
@@ -9075,12 +9105,11 @@ pub fn materialize_json_array_elements(
     as_text: bool,
     ordinality_column: Option<&str>,
 ) -> Result<Vec<crate::schema::Record>> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let arr = v.as_array().ok_or_else(|| {
-        TakyonicError::Sql("jsonb_array_elements requires a JSON array".into())
-    })?;
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| TakyonicError::Sql("jsonb_array_elements requires a JSON array".into()))?;
     let mut rows = Vec::with_capacity(arr.len());
     for (i, elem) in arr.iter().enumerate() {
         let text = if as_text {
@@ -9105,12 +9134,11 @@ pub fn materialize_json_each(
     as_text: bool,
     ordinality_column: Option<&str>,
 ) -> Result<Vec<crate::schema::Record>> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let obj = v.as_object().ok_or_else(|| {
-        TakyonicError::Sql("json_each requires a JSON object".into())
-    })?;
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| TakyonicError::Sql("json_each requires a JSON object".into()))?;
     let mut rows = Vec::with_capacity(obj.len());
     for (i, (k, val)) in obj.iter().enumerate() {
         let value_text = if as_text {
@@ -9135,12 +9163,11 @@ pub fn materialize_json_object_keys(
     column: &str,
     ordinality_column: Option<&str>,
 ) -> Result<Vec<crate::schema::Record>> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let obj = v.as_object().ok_or_else(|| {
-        TakyonicError::Sql("jsonb_object_keys requires a JSON object".into())
-    })?;
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| TakyonicError::Sql("jsonb_object_keys requires a JSON object".into()))?;
     let mut rows = Vec::with_capacity(obj.len());
     for (i, k) in obj.keys().enumerate() {
         let mut row = crate::schema::Record::new().set(column, k.clone());
@@ -9241,9 +9268,7 @@ fn expr_as_i64_literal(expr: &Expression) -> Result<i64> {
                 ))
             })
         }
-        Expression::ScalarFunction { name, args }
-            if name == "NEGATE" && args.len() == 1 =>
-        {
+        Expression::ScalarFunction { name, args } if name == "NEGATE" && args.len() == 1 => {
             Ok(-expr_as_i64_literal(&args[0])?)
         }
         Expression::Cast { expr, target, .. }
@@ -9486,9 +9511,10 @@ fn canonicalize_sql_type(dt: &DataType) -> String {
         DataType::BigInt(_) | DataType::Int8(_) | DataType::Int64 => "BIGINT".into(),
         DataType::Boolean | DataType::Bool => "BOOL".into(),
         DataType::Text | DataType::String(_) => "TEXT".into(),
-        DataType::Varchar(_) | DataType::Nvarchar(_) | DataType::Char(_) | DataType::Character(_) => {
-            "TEXT".into()
-        }
+        DataType::Varchar(_)
+        | DataType::Nvarchar(_)
+        | DataType::Char(_)
+        | DataType::Character(_) => "TEXT".into(),
         DataType::Float(_) | DataType::Real | DataType::Float4 => "FLOAT".into(),
         DataType::Double(_) | DataType::Float8 | DataType::DoublePrecision => "DOUBLE".into(),
         other => {
@@ -9543,7 +9569,10 @@ fn expr_looks_like_sql_array(expr: &Expression) -> bool {
         Expression::ScalarFunction { name, .. }
             if matches!(
                 name.as_str(),
-                "ARRAY_CAT" | "ARRAY_CONTAINS" | "ARRAY_CONTAINED_BY" | "ARRAY_OVERLAP"
+                "ARRAY_CAT"
+                    | "ARRAY_CONTAINS"
+                    | "ARRAY_CONTAINED_BY"
+                    | "ARRAY_OVERLAP"
                     | "STRING_TO_ARRAY"
                     | "REGEXP_SPLIT_TO_ARRAY"
             ) =>
@@ -9682,9 +9711,8 @@ pub fn cast_sql_value(value: &Value, target: CastTarget, try_cast: bool) -> Resu
 
 /// `json -> key` / `json ->> key` (key may be text or integer array index).
 pub fn json_get(doc: &str, key: &Value, as_text: bool) -> Result<Value> {
-    let root: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let root: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     let child = match key {
         Value::Int(i) => {
             if *i < 0 {
@@ -9693,9 +9721,7 @@ pub fn json_get(doc: &str, key: &Value, as_text: bool) -> Result<Value> {
                 root.get(*i as usize).cloned()
             }
         }
-        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => {
-            root.get(*f as usize).cloned()
-        }
+        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 => root.get(*f as usize).cloned(),
         other => {
             let k = other.to_display();
             if let Ok(i) = k.parse::<usize>() {
@@ -9723,9 +9749,8 @@ pub fn json_get(doc: &str, key: &Value, as_text: bool) -> Result<Value> {
 
 /// `json_typeof` / `jsonb_typeof` type name.
 pub fn json_typeof(doc: &str) -> Result<String> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     Ok(match v {
         serde_json::Value::Null => "null".into(),
         serde_json::Value::Bool(_) => "boolean".into(),
@@ -9743,9 +9768,7 @@ pub fn parse_json_text_path(path: &str) -> Result<Vec<String>> {
         .strip_prefix('{')
         .and_then(|s| s.strip_suffix('}'))
         .ok_or_else(|| {
-            TakyonicError::Sql(format!(
-                "JSON path must look like '{{a,b}}', got `{path}`"
-            ))
+            TakyonicError::Sql(format!("JSON path must look like '{{a,b}}', got `{path}`"))
         })?;
     if inner.is_empty() {
         return Ok(Vec::new());
@@ -9759,9 +9782,8 @@ pub fn parse_json_text_path(path: &str) -> Result<Vec<String>> {
 
 /// `json #> path` / `json #>> path`.
 pub fn json_path_get(doc: &str, path: &str, as_text: bool) -> Result<Value> {
-    let mut cur: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut cur: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     for seg in parse_json_text_path(path)? {
         cur = if let Ok(i) = seg.parse::<usize>() {
             match cur.get(i) {
@@ -9789,9 +9811,8 @@ pub fn json_path_get(doc: &str, path: &str, as_text: bool) -> Result<Value> {
 
 /// `jsonb_path_exists(doc, '{a,b}')` — true when the text path resolves.
 pub fn json_path_exists(doc: &str, path: &str) -> Result<bool> {
-    let mut cur: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut cur: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     for seg in parse_json_text_path(path)? {
         let next = if let Ok(i) = seg.parse::<usize>() {
             cur.get(i).cloned()
@@ -9814,12 +9835,10 @@ pub fn json_extract_path(doc: &str, segments: &[String], as_text: bool) -> Resul
 
 /// Postgres-ish JSONB containment (`@>`): `haystack` contains `needle`.
 pub fn json_contains(haystack: &str, needle: &str) -> Result<bool> {
-    let hay: serde_json::Value = serde_json::from_str(haystack.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let need: serde_json::Value = serde_json::from_str(needle.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let hay: serde_json::Value = serde_json::from_str(haystack.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let need: serde_json::Value = serde_json::from_str(needle.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     Ok(json_value_contains(&hay, &need))
 }
 
@@ -9842,12 +9861,10 @@ fn json_value_contains(hay: &serde_json::Value, need: &serde_json::Value) -> boo
 /// Merge two JSON values (`||`): objects deep-merge shallowly (right wins keys);
 /// arrays concatenate; otherwise right replaces left.
 pub fn json_concat(left: &str, right: &str) -> Result<String> {
-    let mut l: serde_json::Value = serde_json::from_str(left.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let r: serde_json::Value = serde_json::from_str(right.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut l: serde_json::Value = serde_json::from_str(left.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let r: serde_json::Value = serde_json::from_str(right.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     match (&mut l, r) {
         (serde_json::Value::Object(lo), serde_json::Value::Object(ro)) => {
             for (k, v) in ro {
@@ -9884,9 +9901,8 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
 
 /// `json_array_length` / `jsonb_array_length` — length of a JSON array.
 pub fn json_array_length(doc: &str) -> Result<i64> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     match v {
         serde_json::Value::Array(arr) => Ok(arr.len() as i64),
         _ => Err(TakyonicError::Sql(
@@ -9944,11 +9960,7 @@ pub fn split_part(s: &str, delim: &str, field: i64) -> Result<String> {
         if idx < 0 {
             Ok(String::new())
         } else {
-            Ok(parts
-                .get(idx as usize)
-                .copied()
-                .unwrap_or("")
-                .to_string())
+            Ok(parts.get(idx as usize).copied().unwrap_or("").to_string())
         }
     }
 }
@@ -10030,19 +10042,16 @@ pub fn regexp_like(s: &str, pattern: &str, flags: Option<&str>) -> Result<bool> 
 
 /// Capture groups (or whole match) for each regexp match, as display arrays.
 /// Without `g`, at most one match row; with `g`, all non-overlapping matches.
-pub fn regexp_match_rows(
-    s: &str,
-    pattern: &str,
-    flags: Option<&str>,
-) -> Result<Vec<String>> {
+pub fn regexp_match_rows(s: &str, pattern: &str, flags: Option<&str>) -> Result<Vec<String>> {
     let (re, global) = compile_sql_regex(pattern, flags)?;
     let mut out = Vec::new();
     for caps in re.captures_iter(s) {
         let parts: Vec<String> = if caps.len() <= 1 {
-            vec![caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default()]
+            vec![
+                caps.get(0)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            ]
         } else {
             (1..caps.len())
                 .map(|i| {
@@ -10280,11 +10289,8 @@ pub fn encode_bytes(data: &str, format: &str) -> Result<String> {
 pub fn decode_bytes(data: &str, format: &str) -> Result<String> {
     let raw = match format.to_ascii_lowercase().as_str() {
         "hex" => hex_to_bytes(data)?,
-        "base64" => base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            data.trim(),
-        )
-        .map_err(|e| TakyonicError::Sql(format!("invalid base64: {e}")))?,
+        "base64" => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())
+            .map_err(|e| TakyonicError::Sql(format!("invalid base64: {e}")))?,
         other => {
             return Err(TakyonicError::Sql(format!(
                 "unsupported decode format `{other}` (hex, base64)"
@@ -10347,10 +10353,7 @@ pub fn translate(s: &str, from: &str, to: &str) -> String {
 }
 
 fn trim_chars_set(characters: Option<&str>) -> Vec<char> {
-    characters
-        .unwrap_or(" ")
-        .chars()
-        .collect()
+    characters.unwrap_or(" ").chars().collect()
 }
 
 fn char_in_set(c: char, set: &[char]) -> bool {
@@ -10361,7 +10364,10 @@ fn char_in_set(c: char, set: &[char]) -> bool {
 pub fn btrim(s: &str, characters: Option<&str>) -> String {
     let set = trim_chars_set(characters);
     let chars: Vec<char> = s.chars().collect();
-    let start = chars.iter().position(|c| !char_in_set(*c, &set)).unwrap_or(chars.len());
+    let start = chars
+        .iter()
+        .position(|c| !char_in_set(*c, &set))
+        .unwrap_or(chars.len());
     let end = chars
         .iter()
         .rposition(|c| !char_in_set(*c, &set))
@@ -10373,9 +10379,7 @@ pub fn btrim(s: &str, characters: Option<&str>) -> String {
 /// `ltrim(string [, characters])` — trim start (default: space).
 pub fn ltrim(s: &str, characters: Option<&str>) -> String {
     let set = trim_chars_set(characters);
-    s.chars()
-        .skip_while(|c| char_in_set(*c, &set))
-        .collect()
+    s.chars().skip_while(|c| char_in_set(*c, &set)).collect()
 }
 
 /// `rtrim(string [, characters])` — trim end (default: space).
@@ -10518,9 +10522,7 @@ pub fn log_num(args: &[f64]) -> Result<f64> {
         }
         [b, x] => {
             if *x <= 0.0 || *b <= 0.0 || *b == 1.0 {
-                return Err(TakyonicError::Sql(
-                    "invalid logarithm arguments".into(),
-                ));
+                return Err(TakyonicError::Sql("invalid logarithm arguments".into()));
             }
             Ok(x.log(*b))
         }
@@ -10557,9 +10559,7 @@ pub fn format_sql(fmt: &str, args: &[Value]) -> Result<String> {
                 let conv = chars[i];
                 i += 1;
                 if arg_i >= args.len() {
-                    return Err(TakyonicError::Sql(
-                        "format: too few arguments".into(),
-                    ));
+                    return Err(TakyonicError::Sql("format: too few arguments".into()));
                 }
                 let v = &args[arg_i];
                 arg_i += 1;
@@ -10683,19 +10683,16 @@ pub fn jsonb_build_array(elems: &[Value]) -> String {
 
 /// `jsonb_pretty(doc)` — indented JSON text.
 pub fn jsonb_pretty(doc: &str) -> Result<String> {
-    let v: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    serde_json::to_string_pretty(&v).map_err(|e| {
-        TakyonicError::Sql(format!("jsonb_pretty failed: {e}"))
-    })
+    let v: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    serde_json::to_string_pretty(&v)
+        .map_err(|e| TakyonicError::Sql(format!("jsonb_pretty failed: {e}")))
 }
 
 /// `jsonb - key` / `jsonb - index` — delete object key or array element.
 pub fn json_delete(doc: &str, key: &Value) -> Result<String> {
-    let mut root: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut root: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     match &mut root {
         serde_json::Value::Object(map) => {
             // Multi-key: ARRAY['a','b'] serializes as `{a,b}`-ish text or JSON array.
@@ -10720,12 +10717,9 @@ pub fn json_delete(doc: &str, key: &Value) -> Result<String> {
             let idx = match key {
                 Value::Int(i) => *i,
                 Value::Float(f) if f.fract() == 0.0 => *f as i64,
-                other => other
-                    .to_display()
-                    .parse::<i64>()
-                    .map_err(|_| TakyonicError::Sql(
-                        "json array `-` requires an integer index".into(),
-                    ))?,
+                other => other.to_display().parse::<i64>().map_err(|_| {
+                    TakyonicError::Sql("json array `-` requires an integer index".into())
+                })?,
             };
             let len = arr.len() as i64;
             let pos = if idx < 0 { len + idx } else { idx };
@@ -10740,9 +10734,8 @@ pub fn json_delete(doc: &str, key: &Value) -> Result<String> {
 
 /// `jsonb #- '{a,b}'` — delete at path.
 pub fn json_path_delete(doc: &str, path: &str) -> Result<String> {
-    let mut root: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut root: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     let segs = parse_json_text_path(path)?;
     if segs.is_empty() {
         return Ok(root.to_string());
@@ -10797,12 +10790,10 @@ pub fn jsonb_set(
     new_value: &str,
     create_missing: bool,
 ) -> Result<String> {
-    let mut root: serde_json::Value = serde_json::from_str(target.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let new_v: serde_json::Value = serde_json::from_str(new_value.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON new_value: {e}"))
-    })?;
+    let mut root: serde_json::Value = serde_json::from_str(target.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let new_v: serde_json::Value = serde_json::from_str(new_value.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON new_value: {e}")))?;
     let segs = parse_json_text_path(path)?;
     if segs.is_empty() {
         return Ok(new_v.to_string());
@@ -10823,12 +10814,10 @@ pub fn jsonb_insert(
     new_value: &str,
     insert_after: bool,
 ) -> Result<String> {
-    let mut root: serde_json::Value = serde_json::from_str(target.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
-    let new_v: serde_json::Value = serde_json::from_str(new_value.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON new_value: {e}"))
-    })?;
+    let mut root: serde_json::Value = serde_json::from_str(target.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
+    let new_v: serde_json::Value = serde_json::from_str(new_value.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON new_value: {e}")))?;
     let segs = parse_json_text_path(path)?;
     if segs.is_empty() {
         return Err(TakyonicError::Sql(
@@ -10876,9 +10865,7 @@ fn json_insert_at(
         match node {
             serde_json::Value::Object(map) => {
                 let child = map.get_mut(head).ok_or_else(|| {
-                    TakyonicError::Sql(format!(
-                        "jsonb_insert path element `{head}` does not exist"
-                    ))
+                    TakyonicError::Sql(format!("jsonb_insert path element `{head}` does not exist"))
                 })?;
                 json_insert_at(child, rest, new_v, insert_after)
             }
@@ -10889,9 +10876,7 @@ fn json_insert_at(
                     )
                 })?;
                 let child = arr.get_mut(i).ok_or_else(|| {
-                    TakyonicError::Sql(format!(
-                        "jsonb_insert path index `{i}` out of bounds"
-                    ))
+                    TakyonicError::Sql(format!("jsonb_insert path index `{i}` out of bounds"))
                 })?;
                 json_insert_at(child, rest, new_v, insert_after)
             }
@@ -10904,9 +10889,8 @@ fn json_insert_at(
 
 /// `jsonb_strip_nulls(doc)` — drop object fields whose value is JSON null.
 pub fn jsonb_strip_nulls(doc: &str) -> Result<String> {
-    let mut root: serde_json::Value = serde_json::from_str(doc.trim()).map_err(|e| {
-        TakyonicError::Sql(format!("invalid JSON document: {e}"))
-    })?;
+    let mut root: serde_json::Value = serde_json::from_str(doc.trim())
+        .map_err(|e| TakyonicError::Sql(format!("invalid JSON document: {e}")))?;
     strip_nulls_inplace(&mut root);
     Ok(root.to_string())
 }
@@ -11090,11 +11074,7 @@ pub fn pg_function_is_visible_oid(oid: u32) -> bool {
 
 /// Resolve a previously remembered `to_regproc` OID back to a function name.
 pub fn regproc_name_for_oid(oid: u32) -> Option<String> {
-    regproc_oid_map()
-        .lock()
-        .ok()?
-        .get(&oid)
-        .cloned()
+    regproc_oid_map().lock().ok()?.get(&oid).cloned()
 }
 
 /// Normalize operator identity (`pg_catalog.=(integer,integer)` → `=`).
@@ -11200,12 +11180,7 @@ pub fn pg_operator_is_visible_oid(oid: u32) -> bool {
 /// Normalize collation identity (`pg_catalog."C"` → `c` / keep `default`).
 pub fn collation_name_leaf(spec: &str) -> String {
     let s = spec.trim().trim_matches('"');
-    let leaf = s
-        .rsplit('.')
-        .next()
-        .unwrap_or(s)
-        .trim()
-        .trim_matches('"');
+    let leaf = s.rsplit('.').next().unwrap_or(s).trim().trim_matches('"');
     leaf.to_ascii_lowercase()
 }
 
@@ -11263,8 +11238,7 @@ pub fn pg_collation_is_visible_oid(oid: u32) -> bool {
         .unwrap_or(false)
 }
 
-static NEXT_ADVISORY_SESSION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_ADVISORY_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Allocate a unique session id for advisory-lock ownership.
 pub fn alloc_advisory_session_id() -> u64 {
@@ -11463,10 +11437,7 @@ pub fn pg_try_advisory_xact_lock(session_id: u64, key: i64) -> bool {
         return false;
     }
     if let Ok(mut g) = advisory_xact_owned().lock() {
-        *g.entry(session_id)
-            .or_default()
-            .entry(key)
-            .or_insert(0) += 1;
+        *g.entry(session_id).or_default().entry(key).or_insert(0) += 1;
     }
     true
 }
@@ -11488,10 +11459,7 @@ pub fn pg_try_advisory_xact_lock_shared(session_id: u64, key: i64) -> bool {
         return false;
     }
     if let Ok(mut g) = advisory_xact_shared_owned().lock() {
-        *g.entry(session_id)
-            .or_default()
-            .entry(key)
-            .or_insert(0) += 1;
+        *g.entry(session_id).or_default().entry(key).or_insert(0) += 1;
     }
     true
 }
@@ -11553,11 +11521,7 @@ pub fn pg_size_pretty(bytes: i64) -> String {
     } else {
         format!("{n} {}", UNITS[unit])
     };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if neg { format!("-{body}") } else { body }
 }
 
 /// `pg_size_bytes(text)` — parse a `pg_size_pretty`-style size string to bytes.
@@ -11583,9 +11547,9 @@ pub fn pg_size_bytes(text: &str) -> Result<i64> {
             "PG_SIZE_BYTES could not parse numeric size".into(),
         ));
     }
-    let n: f64 = num_str.parse().map_err(|_| {
-        TakyonicError::Sql("PG_SIZE_BYTES could not parse numeric size".into())
-    })?;
+    let n: f64 = num_str
+        .parse()
+        .map_err(|_| TakyonicError::Sql("PG_SIZE_BYTES could not parse numeric size".into()))?;
     if !n.is_finite() || n < 0.0 {
         return Err(TakyonicError::Sql(
             "PG_SIZE_BYTES size must be a non-negative finite number".into(),
@@ -11902,8 +11866,7 @@ pub fn pg_signal_backend(pid: i64) -> bool {
 }
 
 /// Synthetic WAL byte offset (shared by current/insert/flush LSN stubs).
-static WAL_LSN_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0x0100_0000);
+static WAL_LSN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x0100_0000);
 
 /// Format a byte offset as PostgreSQL `hi/lo` LSN text.
 pub fn format_wal_lsn(bytes: u64) -> String {
@@ -11974,8 +11937,7 @@ pub fn pg_switch_wal() -> String {
     }
 }
 
-static WAL_REPLAY_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static WAL_REPLAY_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `pg_is_wal_replay_paused()`.
 pub fn pg_is_wal_replay_paused() -> bool {
@@ -11992,8 +11954,7 @@ pub fn pg_wal_replay_resume() {
     WAL_REPLAY_PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-static IN_BACKUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static IN_BACKUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static BACKUP_START_TIME: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
@@ -12019,9 +11980,7 @@ pub fn pg_backup_start(label: &str) -> Result<String> {
         ));
     }
     if IN_BACKUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return Err(TakyonicError::Sql(
-            "a backup is already in progress".into(),
-        ));
+        return Err(TakyonicError::Sql("a backup is already in progress".into()));
     }
     if let Ok(mut g) = backup_start_time_slot().lock() {
         *g = Some(utc_now_timestamp());
@@ -12087,9 +12046,7 @@ fn utc_now_timestamp_frac() -> String {
 
 /// `pg_postmaster_start_time()` — process start timestamp (frozen at first call).
 pub fn pg_postmaster_start_time() -> String {
-    POSTMASTER_START
-        .get_or_init(utc_now_timestamp)
-        .clone()
+    POSTMASTER_START.get_or_init(utc_now_timestamp).clone()
 }
 
 /// `pg_conf_load_time()` — last config reload timestamp (starts at postmaster start).
@@ -12137,7 +12094,8 @@ struct SequenceRegistry {
 }
 
 fn sequence_registry() -> &'static std::sync::Mutex<SequenceRegistry> {
-    static REG: std::sync::OnceLock<std::sync::Mutex<SequenceRegistry>> = std::sync::OnceLock::new();
+    static REG: std::sync::OnceLock<std::sync::Mutex<SequenceRegistry>> =
+        std::sync::OnceLock::new();
     REG.get_or_init(|| {
         std::sync::Mutex::new(SequenceRegistry {
             sequences: std::collections::BTreeMap::new(),
@@ -12186,7 +12144,9 @@ fn persist_sequences_locked(g: &SequenceRegistry) -> Result<()> {
 
 /// Load durable sequences from `data_dir/SEQUENCES` and enable persistence.
 ///
-/// Replaces the in-memory registry contents (session maps are cleared). Call from
+/// Merges this directory's file into the process registry instead of replacing
+/// it. Unit tests open many engines in one process; a full replace drops another
+/// engine's sequences between statements. Call from
 /// [`crate::engine::TakyonicEngine::open`].
 pub fn load_sequences(data_dir: &std::path::Path) -> Result<()> {
     let path = data_dir.join(SEQUENCES_FILE);
@@ -12224,11 +12184,7 @@ pub fn load_sequences(data_dir: &std::path::Path) -> Result<()> {
                                 lineno + 1
                             ))
                         })?;
-                    let called: u8 = parts
-                        .next()
-                        .unwrap_or("0")
-                        .parse()
-                        .unwrap_or(0);
+                    let called: u8 = parts.next().unwrap_or("0").parse().unwrap_or(0);
                     let increment: i64 = parts.next().unwrap_or("1").parse().unwrap_or(1);
                     sequences.insert(
                         name.to_string(),
@@ -12272,11 +12228,11 @@ pub fn load_sequences(data_dir: &std::path::Path) -> Result<()> {
             }
         }
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
-    g.sequences = sequences;
-    g.owned = owned;
-    g.session_last.clear();
-    g.session_seen.clear();
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.sequences.extend(sequences);
+    g.owned.extend(owned);
     g.persist_dir = Some(data_dir.to_path_buf());
     Ok(())
 }
@@ -12315,7 +12271,9 @@ pub fn nextval(session_id: u64, name: &str) -> Result<i64> {
             "NEXTVAL requires a non-empty sequence name".into(),
         ));
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let out = {
         let seq = ensure_sequence(&mut g, &key);
         if seq.is_called {
@@ -12335,16 +12293,22 @@ pub fn nextval(session_id: u64, name: &str) -> Result<i64> {
 /// `currval(regclass)` — last `nextval` for this sequence in this session.
 pub fn currval(session_id: u64, name: &str) -> Result<i64> {
     let key = normalize_sequence_name(name);
-    let g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
-    let seen = g.session_seen.get(&session_id).is_some_and(|s| s.contains(&key));
+    let g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let seen = g
+        .session_seen
+        .get(&session_id)
+        .is_some_and(|s| s.contains(&key));
     if !seen {
         return Err(TakyonicError::Sql(format!(
             "currval of sequence \"{key}\" is not yet defined in this session"
         )));
     }
-    let seq = g.sequences.get(&key).ok_or_else(|| {
-        TakyonicError::Sql(format!("relation \"{key}\" does not exist"))
-    })?;
+    let seq = g
+        .sequences
+        .get(&key)
+        .ok_or_else(|| TakyonicError::Sql(format!("relation \"{key}\" does not exist")))?;
     if !seq.is_called {
         return Err(TakyonicError::Sql(format!(
             "currval of sequence \"{key}\" is not yet defined in this session"
@@ -12355,10 +12319,13 @@ pub fn currval(session_id: u64, name: &str) -> Result<i64> {
 
 /// `lastval()` — most recent `nextval` in this session.
 pub fn lastval(session_id: u64) -> Result<i64> {
-    let g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
-    g.session_last.get(&session_id).copied().ok_or_else(|| {
-        TakyonicError::Sql("lastval is not yet defined in this session".into())
-    })
+    let g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.session_last
+        .get(&session_id)
+        .copied()
+        .ok_or_else(|| TakyonicError::Sql("lastval is not yet defined in this session".into()))
 }
 
 /// `setval(regclass, value [, is_called])` — set sequence state; returns `value`.
@@ -12369,7 +12336,9 @@ pub fn setval(session_id: u64, name: &str, value: i64, is_called: bool) -> Resul
             "SETVAL requires a non-empty sequence name".into(),
         ));
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     {
         let seq = ensure_sequence(&mut g, &key);
         seq.last_value = value;
@@ -12392,11 +12361,11 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: i64, increment: i
         ));
     }
     if increment == 0 {
-        return Err(TakyonicError::Sql(
-            "INCREMENT must not be zero".into(),
-        ));
+        return Err(TakyonicError::Sql("INCREMENT must not be zero".into()));
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if g.sequences.contains_key(&key) {
         if if_not_exists {
             return Ok(());
@@ -12425,7 +12394,9 @@ pub fn drop_sequence(name: &str, if_exists: bool) -> Result<()> {
             "DROP SEQUENCE requires a non-empty name".into(),
         ));
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if g.sequences.remove(&key).is_none() && !if_exists {
         return Err(TakyonicError::Sql(format!(
             "sequence \"{key}\" does not exist"
@@ -12453,11 +12424,14 @@ pub fn alter_sequence(
     if let Some(0) = increment {
         return Err(TakyonicError::Sql("INCREMENT must not be zero".into()));
     }
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     {
-        let seq = g.sequences.get_mut(&key).ok_or_else(|| {
-            TakyonicError::Sql(format!("sequence \"{key}\" does not exist"))
-        })?;
+        let seq = g
+            .sequences
+            .get_mut(&key)
+            .ok_or_else(|| TakyonicError::Sql(format!("sequence \"{key}\" does not exist")))?;
         if let Some(v) = restart {
             seq.last_value = v;
             seq.is_called = false;
@@ -12487,9 +12461,10 @@ pub fn alter_sequence(
                     "relation \"{new_key}\" already exists"
                 )));
             }
-            let state = g.sequences.remove(&key).ok_or_else(|| {
-                TakyonicError::Sql(format!("sequence \"{key}\" does not exist"))
-            })?;
+            let state = g
+                .sequences
+                .remove(&key)
+                .ok_or_else(|| TakyonicError::Sql(format!("sequence \"{key}\" does not exist")))?;
             g.sequences.insert(new_key.clone(), state);
             for seq in g.owned.values_mut() {
                 if seq == &key {
@@ -12506,7 +12481,9 @@ pub fn alter_sequence(
 pub fn pg_get_serial_sequence(table: &str, column: &str) -> Option<String> {
     let table = normalize_sequence_name(table);
     let column = column.trim().trim_matches('"').to_ascii_lowercase();
-    let g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     g.owned
         .get(&(table, column))
         .map(|seq| format!("public.{seq}"))
@@ -12515,7 +12492,9 @@ pub fn pg_get_serial_sequence(table: &str, column: &str) -> Option<String> {
 /// Drop every sequence `OWNED BY` columns of `table` (DROP TABLE cleanup).
 pub fn drop_sequences_owned_by_table(table: &str) {
     let table = normalize_sequence_name(table);
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let seqs: Vec<String> = g
         .owned
         .iter()
@@ -12532,7 +12511,9 @@ pub fn drop_sequences_owned_by_table(table: &str) {
 pub fn drop_sequence_owned_by_column(table: &str, column: &str) {
     let table = normalize_sequence_name(table);
     let column = column.trim().trim_matches('"').to_ascii_lowercase();
-    let mut g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(seq) = g.owned.remove(&(table, column)) {
         g.sequences.remove(&seq);
     }
@@ -12567,10 +12548,7 @@ fn eval_default_sql(
     let trimmed = def_sql.trim();
     let upper = trimmed.to_ascii_uppercase();
     // Common defaults without a full re-parse.
-    if upper == "NOW()"
-        || upper == "CURRENT_TIMESTAMP"
-        || upper == "CURRENT_TIMESTAMP()"
-    {
+    if upper == "NOW()" || upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_TIMESTAMP()" {
         return Ok(utc_now_timestamp());
     }
     if upper == "CURRENT_DATE" || upper == "CURRENT_DATE()" {
@@ -12587,7 +12565,10 @@ fn eval_default_sql(
         }
     }
     // Literal: 'text' or number
-    if let Some(s) = trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+    if let Some(s) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
         return Ok(s.replace("''", "'"));
     }
     if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
@@ -12643,9 +12624,7 @@ pub fn fill_serial_defaults(
             continue;
         }
         if let Some(reg) = pg_get_serial_sequence(table, col) {
-            let seq = reg
-                .strip_prefix("public.")
-                .unwrap_or(reg.as_str());
+            let seq = reg.strip_prefix("public.").unwrap_or(reg.as_str());
             let v = nextval(session_id, seq)?;
             *record = record.clone().set(col.clone(), v.to_string());
         }
@@ -12661,7 +12640,9 @@ pub fn pg_sequence_last_value(name: &str) -> Result<Option<i64>> {
             "PG_SEQUENCE_LAST_VALUE requires a non-empty sequence name".into(),
         ));
     }
-    let g = sequence_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let g = sequence_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match g.sequences.get(&key) {
         None => Err(TakyonicError::Sql(format!(
             "relation \"{key}\" does not exist"
@@ -12736,19 +12717,17 @@ pub fn clear_guc_overlay() {
 }
 
 /// Drain overlay written by `set_config` during the last statement.
-pub fn take_guc_overlay() -> (std::collections::HashMap<String, String>, std::collections::HashSet<String>) {
+pub fn take_guc_overlay() -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashSet<String>,
+) {
     let values = GUC_OVERLAY.with(|o| std::mem::take(&mut *o.borrow_mut()));
     let local = GUC_LOCAL_KEYS.with(|o| std::mem::take(&mut *o.borrow_mut()));
     (values, local)
 }
 
 /// `set_config(name, value, is_local)` — set a writable GUC; returns the new value.
-pub fn set_config(
-    name: &str,
-    value: &str,
-    is_local: bool,
-    in_transaction: bool,
-) -> Result<String> {
+pub fn set_config(name: &str, value: &str, is_local: bool, in_transaction: bool) -> Result<String> {
     if is_local && !in_transaction {
         return Err(TakyonicError::Sql(
             "SET LOCAL can only be used in transaction blocks".into(),
@@ -13025,9 +13004,9 @@ pub fn zone_offset_secs_at(zone: &str, unix_utc: i64) -> Result<i64> {
             "unsupported time zone `{zone}` (use UTC/GMT, ±HH[:MM] offset, or an IANA name)"
         ))
     })?;
-    let lt = tz.find_local_time_type(unix_utc).map_err(|e| {
-        TakyonicError::Sql(format!("time zone `{zone}` lookup failed: {e}"))
-    })?;
+    let lt = tz
+        .find_local_time_type(unix_utc)
+        .map_err(|e| TakyonicError::Sql(format!("time zone `{zone}` lookup failed: {e}")))?;
     Ok(i64::from(lt.ut_offset()))
 }
 
@@ -13049,26 +13028,14 @@ pub fn local_wall_to_unix(
             "unsupported time zone `{zone}` (use UTC/GMT, ±HH[:MM] offset, or an IANA name)"
         ))
     })?;
-    let found = tz::DateTime::find(
-        y,
-        m as u8,
-        d as u8,
-        hh as u8,
-        mm as u8,
-        ss as u8,
-        0,
-        tz,
-    )
-    .map_err(|e| TakyonicError::Sql(format!("time zone `{zone}` local convert failed: {e}")))?;
+    let found = tz::DateTime::find(y, m as u8, d as u8, hh as u8, mm as u8, ss as u8, 0, tz)
+        .map_err(|e| TakyonicError::Sql(format!("time zone `{zone}` local convert failed: {e}")))?;
     // Prefer unique instant; on DST fold/gap take earliest (PG-ish).
-    let dt = found
-        .unique()
-        .or_else(|| found.earliest())
-        .ok_or_else(|| {
-            TakyonicError::Sql(format!(
-                "time zone `{zone}`: no local time for {y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}"
-            ))
-        })?;
+    let dt = found.unique().or_else(|| found.earliest()).ok_or_else(|| {
+        TakyonicError::Sql(format!(
+            "time zone `{zone}`: no local time for {y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}"
+        ))
+    })?;
     Ok(dt.unix_time())
 }
 
@@ -13299,20 +13266,13 @@ pub fn format_interval_secs(secs: i64) -> String {
         ));
     }
     if days > 0 {
-        parts.push(format!(
-            "{days} {}",
-            if days == 1 { "day" } else { "days" }
-        ));
+        parts.push(format!("{days} {}", if days == 1 { "day" } else { "days" }));
     }
     if hours > 0 || mins > 0 || secs_u > 0 || parts.is_empty() {
         parts.push(format!("{hours:02}:{mins:02}:{secs_u:02}"));
     }
     let body = parts.join(" ");
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if neg { format!("-{body}") } else { body }
 }
 
 /// `JUSTIFY_*` — validate interval and re-encode (display is always justified).
@@ -13382,9 +13342,7 @@ pub fn parse_interval_to_secs(text: &str, leading: Option<&DateTimeField>) -> Re
             ))
         })?;
         let unit = tokens.next().ok_or_else(|| {
-            TakyonicError::Sql(format!(
-                "INTERVAL '{text}' is missing a unit after `{tok}`"
-            ))
+            TakyonicError::Sql(format!("INTERVAL '{text}' is missing a unit after `{tok}`"))
         })?;
         let mult = match unit.trim_end_matches('s') {
             "second" | "sec" => 1,
@@ -13466,9 +13424,7 @@ pub fn days_in_month(y: i32, m: u32) -> u32 {
 }
 
 fn as_i32_component(label: &str, n: i64) -> Result<i32> {
-    i32::try_from(n).map_err(|_| {
-        TakyonicError::Sql(format!("MAKE_* {label} out of range: {n}"))
-    })
+    i32::try_from(n).map_err(|_| TakyonicError::Sql(format!("MAKE_* {label} out of range: {n}")))
 }
 
 /// `MAKE_DATE(year, month, day)` → `YYYY-MM-DD`.
@@ -13584,13 +13540,10 @@ pub fn age_secs(later: &str, earlier: &str) -> Result<i64> {
     let (y0, m0, d0, hh0, mm0, ss0) = parse_timestamp_parts(earlier).ok_or_else(|| {
         TakyonicError::Sql(format!("AGE argument is not a date/timestamp: `{earlier}`"))
     })?;
-    Ok(timestamp_to_unix(y1, m1, d1, hh1, mm1, ss1)
-        - timestamp_to_unix(y0, m0, d0, hh0, mm0, ss0))
+    Ok(timestamp_to_unix(y1, m1, d1, hh1, mm1, ss1) - timestamp_to_unix(y0, m0, d0, hh0, mm0, ss0))
 }
 
-const TO_CHAR_TOKENS: &[&str] = &[
-    "YYYY", "HH24", "HH12", "HH", "MM", "DD", "MI", "SS", "YY",
-];
+const TO_CHAR_TOKENS: &[&str] = &["YYYY", "HH24", "HH12", "HH", "MM", "DD", "MI", "SS", "YY"];
 
 fn next_format_piece(fmt: &str) -> Result<(&str, &str)> {
     if fmt.is_empty() {
@@ -13727,9 +13680,7 @@ pub fn to_number_text(src: &str, fmt: &str) -> Result<f64> {
     if !leftover.is_empty() {
         if leftover == "-" && !sign_from_template {
             sign = -1.0;
-        } else if leftover != "+"
-            && leftover.chars().any(|c| c.is_ascii_digit() || c == '.')
-        {
+        } else if leftover != "+" && leftover.chars().any(|c| c.is_ascii_digit() || c == '.') {
             return Err(TakyonicError::Sql(format!(
                 "TO_NUMBER leftover input `{leftover}` for `{src}` (format `{fmt}`)"
             )));
@@ -13754,9 +13705,7 @@ pub fn to_number_text(src: &str, fmt: &str) -> Result<f64> {
 /// Format a date/timestamp with a Postgres-ish template (`YYYY-MM-DD HH24:MI:SS`).
 pub fn to_char_timestamp(src: &str, fmt: &str) -> Result<String> {
     let (y, m, d, hh, mm, ss) = parse_timestamp_parts(src).ok_or_else(|| {
-        TakyonicError::Sql(format!(
-            "TO_CHAR source is not a date/timestamp: `{src}`"
-        ))
+        TakyonicError::Sql(format!("TO_CHAR source is not a date/timestamp: `{src}`"))
     })?;
     let mut out = String::new();
     let mut rest = fmt;
@@ -14100,11 +14049,13 @@ mod tests {
             } => {}
             other => panic!("expected ON CONFLICT (id) DO NOTHING RETURNING, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "INSERT INTO users (id, name) VALUES (1, 'Ada') \
+        assert!(
+            LogicalPlanner::plan(
+                "INSERT INTO users (id, name) VALUES (1, 'Ada') \
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -14142,8 +14093,7 @@ mod tests {
             LogicalPlan::Insert {
                 on_conflict:
                     Some(OnConflict::DoUpdate {
-                        selection: Some(_),
-                        ..
+                        selection: Some(_), ..
                     }),
                 ..
             } => {}
@@ -14153,8 +14103,7 @@ mod tests {
 
     #[test]
     fn parses_update_set_where() {
-        let plan =
-            LogicalPlanner::plan("UPDATE users SET age = 31 WHERE name = 'Ada'").unwrap();
+        let plan = LogicalPlanner::plan("UPDATE users SET age = 31 WHERE name = 'Ada'").unwrap();
         match plan {
             LogicalPlan::Update {
                 table,
@@ -14185,10 +14134,8 @@ mod tests {
 
     #[test]
     fn parses_update_returning() {
-        let plan = LogicalPlanner::plan(
-            "UPDATE users SET age = 32 WHERE id = 1 RETURNING id, age",
-        )
-        .unwrap();
+        let plan = LogicalPlanner::plan("UPDATE users SET age = 32 WHERE id = 1 RETURNING id, age")
+            .unwrap();
         match plan {
             LogicalPlan::Update {
                 returning: Some(Returning::List(cols)),
@@ -14346,9 +14293,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "COUNT".into(),
                         args: vec![Expression::Column("id".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
                 assert_eq!(
@@ -14356,9 +14303,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "SUM".into(),
                         args: vec![Expression::Column("salary".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14376,9 +14323,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "JSON_AGG".into(),
                         args: vec![Expression::Column("name".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14400,18 +14347,15 @@ mod tests {
                             Expression::Column("name".into()),
                             Expression::Column("id".into()),
                         ],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
             other => panic!("expected Aggregate for json_object_agg, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT json_object_agg(name) FROM employees"
-        )
-        .is_err());
+        assert!(LogicalPlanner::plan("SELECT json_object_agg(name) FROM employees").is_err());
 
         let string_agg = LogicalPlanner::plan(
             "SELECT department, string_agg(name, ',') FROM employees GROUP BY department",
@@ -14427,9 +14371,9 @@ mod tests {
                             Expression::Column("name".into()),
                             Expression::Literal(",".into()),
                         ],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14448,9 +14392,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "ARRAY_AGG".into(),
                         args: vec![Expression::Column("name".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14469,9 +14413,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "BOOL_AND".into(),
                         args: vec![Expression::Column("active".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14500,9 +14444,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "BIT_AND".into(),
                         args: vec![Expression::Column("flags".into())],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14510,10 +14454,9 @@ mod tests {
         }
         assert!(LogicalPlanner::plan("SELECT bit_or() FROM employees").is_err());
 
-        let filtered = LogicalPlanner::plan(
-            "SELECT COUNT(*) FILTER (WHERE salary > 100) FROM employees",
-        )
-        .unwrap();
+        let filtered =
+            LogicalPlanner::plan("SELECT COUNT(*) FILTER (WHERE salary > 100) FROM employees")
+                .unwrap();
         match filtered {
             LogicalPlan::Aggregate { aggr_exprs, .. } => {
                 match &aggr_exprs[0] {
@@ -14539,10 +14482,8 @@ mod tests {
             other => panic!("expected Aggregate for FILTER, got {other:?}"),
         }
 
-        let distinct_count = LogicalPlanner::plan(
-            "SELECT COUNT(DISTINCT department) FROM employees",
-        )
-        .unwrap();
+        let distinct_count =
+            LogicalPlanner::plan("SELECT COUNT(DISTINCT department) FROM employees").unwrap();
         match distinct_count {
             LogicalPlan::Aggregate { aggr_exprs, .. } => {
                 match &aggr_exprs[0] {
@@ -14569,8 +14510,8 @@ mod tests {
         }
         assert!(LogicalPlanner::plan("SELECT COUNT(DISTINCT *) FROM employees").is_err());
 
-        let stddev = LogicalPlanner::plan("SELECT stddev(salary), variance(salary) FROM employees")
-            .unwrap();
+        let stddev =
+            LogicalPlanner::plan("SELECT stddev(salary), variance(salary) FROM employees").unwrap();
         match stddev {
             LogicalPlan::Aggregate { aggr_exprs, .. } => {
                 assert!(matches!(
@@ -14641,10 +14582,9 @@ mod tests {
             }
             other => panic!("expected Aggregate for mode(color), got {other:?}"),
         }
-        let mode_wg = LogicalPlanner::plan(
-            "SELECT mode() WITHIN GROUP (ORDER BY color DESC) FROM items",
-        )
-        .unwrap();
+        let mode_wg =
+            LogicalPlanner::plan("SELECT mode() WITHIN GROUP (ORDER BY color DESC) FROM items")
+                .unwrap();
         match mode_wg {
             LogicalPlan::Aggregate { aggr_exprs, .. } => match &aggr_exprs[0] {
                 Expression::AggregateFunction {
@@ -14691,22 +14631,19 @@ mod tests {
         }
         assert!(LogicalPlanner::plan("SELECT percentile_cont(0.5) FROM nums").is_err());
 
-        let ordered_agg = LogicalPlanner::plan(
-            "SELECT string_agg(name, ',' ORDER BY name) FROM employees",
-        )
-        .unwrap();
+        let ordered_agg =
+            LogicalPlanner::plan("SELECT string_agg(name, ',' ORDER BY name) FROM employees")
+                .unwrap();
         match ordered_agg {
-            LogicalPlan::Aggregate { aggr_exprs, .. } => {
-                match &aggr_exprs[0] {
-                    Expression::AggregateFunction { name, order_by, .. } => {
-                        assert_eq!(name, "STRING_AGG");
-                        assert_eq!(order_by.len(), 1);
-                        assert!(order_by[0].asc);
-                        assert_eq!(order_by[0].expr, Expression::Column("name".into()));
-                    }
-                    other => panic!("expected ordered STRING_AGG, got {other:?}"),
+            LogicalPlan::Aggregate { aggr_exprs, .. } => match &aggr_exprs[0] {
+                Expression::AggregateFunction { name, order_by, .. } => {
+                    assert_eq!(name, "STRING_AGG");
+                    assert_eq!(order_by.len(), 1);
+                    assert!(order_by[0].asc);
+                    assert_eq!(order_by[0].expr, Expression::Column("name".into()));
                 }
-            }
+                other => panic!("expected ordered STRING_AGG, got {other:?}"),
+            },
             other => panic!("expected Aggregate for ORDER BY agg, got {other:?}"),
         }
 
@@ -14723,9 +14660,9 @@ mod tests {
                     Expression::AggregateFunction {
                         name: "COUNT".into(),
                         args: vec![],
-                                            filter: None,
-                                            distinct: false,
-                                            order_by: vec![],
+                        filter: None,
+                        distinct: false,
+                        order_by: vec![],
                     }
                 );
             }
@@ -14750,10 +14687,9 @@ mod tests {
             }
             other => panic!("expected Aggregate from GROUP BY ALL, got {other:?}"),
         }
-        let multi = LogicalPlanner::plan(
-            "SELECT department, city, COUNT(*) FROM employees GROUP BY ALL",
-        )
-        .unwrap();
+        let multi =
+            LogicalPlanner::plan("SELECT department, city, COUNT(*) FROM employees GROUP BY ALL")
+                .unwrap();
         match multi {
             LogicalPlan::Aggregate { group_exprs, .. } => {
                 assert_eq!(
@@ -14795,10 +14731,8 @@ mod tests {
 
     #[test]
     fn parses_bare_having_without_group_by() {
-        let plan = LogicalPlanner::plan(
-            "SELECT COUNT(*) FROM employees HAVING COUNT(*) > 1",
-        )
-        .unwrap();
+        let plan =
+            LogicalPlanner::plan("SELECT COUNT(*) FROM employees HAVING COUNT(*) > 1").unwrap();
         match plan {
             LogicalPlan::Filter { input, predicate } => {
                 match input.as_ref() {
@@ -14824,10 +14758,9 @@ mod tests {
             other => panic!("expected Filter(Aggregate), got {other:?}"),
         }
 
-        let having_only = LogicalPlanner::plan(
-            "SELECT COUNT(*) FROM employees HAVING SUM(salary) > 100",
-        )
-        .unwrap();
+        let having_only =
+            LogicalPlanner::plan("SELECT COUNT(*) FROM employees HAVING SUM(salary) > 100")
+                .unwrap();
         match having_only {
             LogicalPlan::Filter { input, .. } => match input.as_ref() {
                 LogicalPlan::Aggregate { aggr_exprs, .. } => {
@@ -14872,10 +14805,12 @@ mod tests {
             }
             other => panic!("expected Project(Window), got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary) FROM employees"
-        )
-        .is_ok());
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary) FROM employees"
+            )
+            .is_ok()
+        );
 
         match LogicalPlanner::plan(
             "SELECT ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary) AS rn FROM employees",
@@ -14983,10 +14918,12 @@ mod tests {
             },
             other => panic!("expected Project for NTH_VALUE, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT NTH_VALUE(salary, 0) OVER (ORDER BY salary) FROM employees"
-        )
-        .is_err());
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT NTH_VALUE(salary, 0) OVER (ORDER BY salary) FROM employees"
+            )
+            .is_err()
+        );
 
         let dist = LogicalPlanner::plan(
             "SELECT PERCENT_RANK() OVER (ORDER BY salary), CUME_DIST() OVER (ORDER BY salary) \
@@ -15058,16 +14995,20 @@ mod tests {
             },
             other => panic!("expected Project for RANGE frame, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT SUM(salary) OVER (\
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT SUM(salary) OVER (\
                ORDER BY salary RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees"
-        )
-        .is_ok());
-        assert!(LogicalPlanner::plan(
-            "SELECT SUM(salary) OVER (\
+            )
+            .is_ok()
+        );
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT SUM(salary) OVER (\
                ORDER BY salary, id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees"
-        )
-        .is_err());
+            )
+            .is_err()
+        );
 
         let groups = LogicalPlanner::plan(
             "SELECT SUM(salary) OVER (\
@@ -15120,10 +15061,7 @@ mod tests {
             },
             other => panic!("expected Project for refined named window, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT ROW_NUMBER() OVER missing FROM employees"
-        )
-        .is_err());
+        assert!(LogicalPlanner::plan("SELECT ROW_NUMBER() OVER missing FROM employees").is_err());
 
         let wag = LogicalPlanner::plan(
             "SELECT name, SUM(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
@@ -15141,10 +15079,10 @@ mod tests {
             },
             other => panic!("expected Project for SUM OVER, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT COUNT(*) OVER (PARTITION BY department) FROM employees"
-        )
-        .is_ok());
+        assert!(
+            LogicalPlanner::plan("SELECT COUNT(*) OVER (PARTITION BY department) FROM employees")
+                .is_ok()
+        );
 
         let stragg = LogicalPlanner::plan(
             "SELECT STRING_AGG(name, ',') OVER (PARTITION BY department ORDER BY id) FROM employees",
@@ -15161,10 +15099,10 @@ mod tests {
             },
             other => panic!("expected Project for STRING_AGG OVER, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT ARRAY_AGG(salary) OVER (ORDER BY id) FROM employees"
-        )
-        .is_ok());
+        assert!(
+            LogicalPlanner::plan("SELECT ARRAY_AGG(salary) OVER (ORDER BY id) FROM employees")
+                .is_ok()
+        );
 
         let bool_json = LogicalPlanner::plan(
             "SELECT BOOL_AND(active) OVER (PARTITION BY department), \
@@ -15213,10 +15151,12 @@ mod tests {
             },
             other => panic!("expected Project for FILTER window, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT ROW_NUMBER() FILTER (WHERE true) OVER (ORDER BY id) FROM employees"
-        )
-        .is_err());
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT ROW_NUMBER() FILTER (WHERE true) OVER (ORDER BY id) FROM employees"
+            )
+            .is_err()
+        );
 
         let bivar = LogicalPlanner::plan(
             "SELECT CORR(salary, id) OVER (PARTITION BY department), \
@@ -15298,10 +15238,12 @@ mod tests {
             },
             other => panic!("expected Project for IGNORE NULLS, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT SUM(salary) IGNORE NULLS OVER (ORDER BY id) FROM employees"
-        )
-        .is_err());
+        assert!(
+            LogicalPlanner::plan(
+                "SELECT SUM(salary) IGNORE NULLS OVER (ORDER BY id) FROM employees"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -15334,8 +15276,8 @@ mod tests {
             other => panic!("expected Limit, got {other:?}"),
         }
 
-        let off = LogicalPlanner::plan("SELECT * FROM users ORDER BY name ASC OFFSET 2 LIMIT 5")
-            .unwrap();
+        let off =
+            LogicalPlanner::plan("SELECT * FROM users ORDER BY name ASC OFFSET 2 LIMIT 5").unwrap();
         match off {
             LogicalPlan::Limit {
                 skip: 2,
@@ -15353,11 +15295,7 @@ mod tests {
             other => panic!("expected Limit with offset, got {other:?}"),
         }
 
-        match LogicalPlanner::plan(
-            "SELECT name FROM users ORDER BY age NULLS FIRST",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT name FROM users ORDER BY age NULLS FIRST").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Sort { exprs, .. } => {
                     assert!(exprs[0].asc);
@@ -15373,11 +15311,7 @@ mod tests {
             },
         }
 
-        match LogicalPlanner::plan(
-            "SELECT name FROM users ORDER BY age DESC NULLS LAST",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT name FROM users ORDER BY age DESC NULLS LAST").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Sort { exprs, .. } => {
                     assert!(!exprs[0].asc);
@@ -15509,10 +15443,8 @@ mod tests {
             other => panic!("expected CreateVectorIndex, got {other:?}"),
         }
 
-        match LogicalPlanner::plan(
-            "SELECT * FROM docs ORDER BY vec <-> ARRAY[0.1, 0.2] LIMIT 5",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT * FROM docs ORDER BY vec <-> ARRAY[0.1, 0.2] LIMIT 5")
+            .unwrap()
         {
             LogicalPlan::Limit {
                 fetch: Some(5),
@@ -15520,10 +15452,7 @@ mod tests {
                 ..
             } => match input.as_ref() {
                 LogicalPlan::Sort { exprs, .. } => {
-                    assert!(matches!(
-                        exprs[0].expr,
-                        Expression::VectorDistance { .. }
-                    ));
+                    assert!(matches!(exprs[0].expr, Expression::VectorDistance { .. }));
                 }
                 other => panic!("expected Sort over VectorDistance, got {other:?}"),
             },
@@ -15552,10 +15481,8 @@ mod tests {
 
     #[test]
     fn create_drop_table_parse() {
-        match LogicalPlanner::plan(
-            "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)")
+            .unwrap()
         {
             LogicalPlan::CreateTable {
                 name,
@@ -15579,10 +15506,8 @@ mod tests {
             other => panic!("expected CreateTable, got {other:?}"),
         }
 
-        match LogicalPlanner::plan(
-            "CREATE TABLE IF NOT EXISTS t (k INT, v TEXT, PRIMARY KEY (k))",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("CREATE TABLE IF NOT EXISTS t (k INT, v TEXT, PRIMARY KEY (k))")
+            .unwrap()
         {
             LogicalPlan::CreateTable {
                 name,
@@ -15615,10 +15540,8 @@ mod tests {
 
     #[test]
     fn parses_create_table_serial() {
-        match LogicalPlanner::plan(
-            "CREATE TABLE serials (id SERIAL PRIMARY KEY, name TEXT)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("CREATE TABLE serials (id SERIAL PRIMARY KEY, name TEXT)")
+            .unwrap()
         {
             LogicalPlan::CreateTable {
                 name,
@@ -15634,10 +15557,8 @@ mod tests {
             }
             other => panic!("expected CreateTable SERIAL, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "CREATE TABLE bigs (id BIGSERIAL PRIMARY KEY, note TEXT)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("CREATE TABLE bigs (id BIGSERIAL PRIMARY KEY, note TEXT)")
+            .unwrap()
         {
             LogicalPlan::CreateTable {
                 columns,
@@ -15654,10 +15575,8 @@ mod tests {
 
     #[test]
     fn parses_create_table_as_select() {
-        match LogicalPlanner::plan(
-            "CREATE TABLE copy AS SELECT id, name FROM users WHERE age > 20",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("CREATE TABLE copy AS SELECT id, name FROM users WHERE age > 20")
+            .unwrap()
         {
             LogicalPlan::CreateTableAs {
                 name,
@@ -15761,8 +15680,7 @@ mod tests {
             other => panic!("expected AlterTable, got {other:?}"),
         }
 
-        match LogicalPlanner::plan("ALTER TABLE items ALTER COLUMN qty TYPE BIGINT").unwrap()
-        {
+        match LogicalPlanner::plan("ALTER TABLE items ALTER COLUMN qty TYPE BIGINT").unwrap() {
             LogicalPlan::AlterTable { operations, .. } => match &operations[0] {
                 AlterTableOp::SetDataType { name, data_type } => {
                     assert_eq!(name, "qty");
@@ -15772,10 +15690,8 @@ mod tests {
             },
             other => panic!("expected AlterTable, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "ALTER TABLE items ALTER COLUMN qty SET DATA TYPE INTEGER",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("ALTER TABLE items ALTER COLUMN qty SET DATA TYPE INTEGER")
+            .unwrap()
         {
             LogicalPlan::AlterTable { operations, .. } => match &operations[0] {
                 AlterTableOp::SetDataType { data_type, .. } => {
@@ -15786,12 +15702,10 @@ mod tests {
             other => panic!("expected AlterTable, got {other:?}"),
         }
         assert!(
-            LogicalPlanner::plan(
-                "ALTER TABLE items ALTER COLUMN qty TYPE INT USING qty::int"
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("USING")
+            LogicalPlanner::plan("ALTER TABLE items ALTER COLUMN qty TYPE INT USING qty::int")
+                .unwrap_err()
+                .to_string()
+                .contains("USING")
         );
     }
 
@@ -15830,10 +15744,8 @@ mod tests {
             other => panic!("expected Distinct, got {other:?}"),
         }
 
-        match LogicalPlanner::plan(
-            "SELECT name FROM users UNION ALL SELECT name FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users UNION ALL SELECT name FROM users")
+            .unwrap()
         {
             LogicalPlan::Union {
                 all: true,
@@ -15843,9 +15755,7 @@ mod tests {
             other => panic!("expected Union ALL, got {other:?}"),
         }
 
-        match LogicalPlanner::plan("SELECT name FROM users UNION SELECT name FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT name FROM users UNION SELECT name FROM users").unwrap() {
             LogicalPlan::Union {
                 all: false,
                 op: SetOpKind::Union,
@@ -15860,7 +15770,10 @@ mod tests {
         .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
-                LogicalPlan::DistinctOn { exprs, input: inner } => {
+                LogicalPlan::DistinctOn {
+                    exprs,
+                    input: inner,
+                } => {
                     assert_eq!(exprs.len(), 1);
                     assert!(matches!(inner.as_ref(), LogicalPlan::Sort { .. }));
                 }
@@ -15876,10 +15789,8 @@ mod tests {
                 .contains("must match initial ORDER BY")
         );
 
-        match LogicalPlanner::plan(
-            "SELECT name FROM users INTERSECT SELECT name FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users INTERSECT SELECT name FROM users")
+            .unwrap()
         {
             LogicalPlan::Union {
                 op: SetOpKind::Intersect,
@@ -15939,10 +15850,8 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE name NOT SIMILAR TO '(A|B)%'",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE name NOT SIMILAR TO '(A|B)%'")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16024,11 +15933,12 @@ mod tests {
         match LogicalPlanner::plan("SELECT name FROM users WHERE name LIKE 'A%'").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
-                    predicate: Some(Expression::Like {
-                        case_insensitive: false,
-                        negated: false,
-                        ..
-                    }),
+                    predicate:
+                        Some(Expression::Like {
+                            case_insensitive: false,
+                            negated: false,
+                            ..
+                        }),
                     ..
                 } => {}
                 other => panic!("expected LIKE Select, got {other:?}"),
@@ -16038,10 +15948,11 @@ mod tests {
         match LogicalPlanner::plan("SELECT name FROM users WHERE name ILIKE '%ADA%'").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
-                    predicate: Some(Expression::Like {
-                        case_insensitive: true,
-                        ..
-                    }),
+                    predicate:
+                        Some(Expression::Like {
+                            case_insensitive: true,
+                            ..
+                        }),
                     ..
                 } => {}
                 other => panic!("expected ILIKE Select, got {other:?}"),
@@ -16062,55 +15973,52 @@ mod tests {
 
     #[test]
     fn parses_like_any() {
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE name LIKE ANY (ARRAY['A%', 'B%'])",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE name LIKE ANY (ARRAY['A%', 'B%'])")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
-                    predicate: Some(Expression::Like {
-                        any: true,
-                        case_insensitive: false,
-                        negated: false,
-                        ..
-                    }),
+                    predicate:
+                        Some(Expression::Like {
+                            any: true,
+                            case_insensitive: false,
+                            negated: false,
+                            ..
+                        }),
                     ..
                 } => {}
                 other => panic!("expected LIKE ANY, got {other:?}"),
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE name ILIKE ANY (ARRAY['%ada%'])",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE name ILIKE ANY (ARRAY['%ada%'])")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
-                    predicate: Some(Expression::Like {
-                        any: true,
-                        case_insensitive: true,
-                        ..
-                    }),
+                    predicate:
+                        Some(Expression::Like {
+                            any: true,
+                            case_insensitive: true,
+                            ..
+                        }),
                     ..
                 } => {}
                 other => panic!("expected ILIKE ANY, got {other:?}"),
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE name NOT LIKE ANY (ARRAY['%z'])",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE name NOT LIKE ANY (ARRAY['%z'])")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
-                    predicate: Some(Expression::Like {
-                        any: true,
-                        negated: true,
-                        ..
-                    }),
+                    predicate:
+                        Some(Expression::Like {
+                            any: true,
+                            negated: true,
+                            ..
+                        }),
                     ..
                 } => {}
                 other => panic!("expected NOT LIKE ANY, got {other:?}"),
@@ -16121,9 +16029,7 @@ mod tests {
 
     #[test]
     fn parses_between_as_range_predicate() {
-        match LogicalPlanner::plan("SELECT name FROM users WHERE age BETWEEN 20 AND 30")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT name FROM users WHERE age BETWEEN 20 AND 30").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
                     predicate: Some(Expression::And { left, right }),
@@ -16241,10 +16147,7 @@ mod tests {
 
     #[test]
     fn parses_is_distinct_from() {
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE age IS DISTINCT FROM 30",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE age IS DISTINCT FROM 30").unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16255,10 +16158,8 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE age IS NOT DISTINCT FROM NULL",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE age IS NOT DISTINCT FROM NULL")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16273,10 +16174,7 @@ mod tests {
 
     #[test]
     fn parses_any_all_quantified_cmp() {
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE age = ANY(ARRAY[10, 30])",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE age = ANY(ARRAY[10, 30])").unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16292,10 +16190,7 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE age > ALL(ARRAY[15, 20])",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE age > ALL(ARRAY[15, 20])").unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16330,11 +16225,7 @@ mod tests {
 
     #[test]
     fn parses_is_true_false_unknown() {
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE (age > 20) IS TRUE",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT name FROM users WHERE (age > 20) IS TRUE").unwrap() {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
                     predicate:
@@ -16349,10 +16240,8 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT name FROM users WHERE (age > 20) IS NOT UNKNOWN",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT name FROM users WHERE (age > 20) IS NOT UNKNOWN")
+            .unwrap()
         {
             LogicalPlan::Project { input, .. } => match input.as_ref() {
                 LogicalPlan::Select {
@@ -16405,9 +16294,11 @@ mod tests {
             cast_sql_value(&Value::String("42".into()), CastTarget::Int, false).unwrap(),
             Value::Int(42)
         );
-        assert!(            cast_sql_value(&Value::String("x".into()), CastTarget::Int, true)
-            .unwrap()
-            .is_null());
+        assert!(
+            cast_sql_value(&Value::String("x".into()), CastTarget::Int, true)
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
@@ -16454,8 +16345,7 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan("SELECT SUBSTRING(name FROM 1 FOR 2) AS s FROM users").unwrap()
-        {
+        match LogicalPlanner::plan("SELECT SUBSTRING(name FROM 1 FOR 2) AS s FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -16474,11 +16364,7 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT TRIM(BOTH 'x' FROM name) AS t FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT TRIM(BOTH 'x' FROM name) AS t FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => match &columns[0].1 {
                 Expression::ScalarFunction { name, args } => {
                     assert_eq!(name, "TRIM");
@@ -16760,8 +16646,7 @@ mod tests {
 
     #[test]
     fn parses_pg_typeof_and_encoding() {
-        match LogicalPlanner::plan("SELECT pg_typeof(1), getdatabaseencoding() FROM users")
-            .unwrap()
+        match LogicalPlanner::plan("SELECT pg_typeof(1), getdatabaseencoding() FROM users").unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -16783,10 +16668,7 @@ mod tests {
             Some("double precision")
         );
         assert_eq!(pg_typeof_value(&Value::Bool(true)), Some("boolean"));
-        assert_eq!(
-            pg_typeof_value(&Value::String("x".into())),
-            Some("text")
-        );
+        assert_eq!(pg_typeof_value(&Value::String("x".into())), Some("text"));
         assert_eq!(
             pg_typeof_value(&Value::String(encode_interval_secs(60))),
             Some("interval")
@@ -16960,10 +16842,7 @@ mod tests {
         assert_eq!(pg_advisory_unlock_all(b), 1);
         assert!(pg_try_advisory_lock(a, key));
         let _ = pg_advisory_unlock_all(a);
-        assert_eq!(
-            advisory_lock_key_pair(1, 2),
-            (1_i64 << 32) | 2
-        );
+        assert_eq!(advisory_lock_key_pair(1, 2), (1_i64 << 32) | 2);
     }
 
     #[test]
@@ -17182,11 +17061,7 @@ mod tests {
 
     #[test]
     fn parses_pg_describe_object() {
-        match LogicalPlanner::plan(
-            "SELECT pg_describe_object(1259, 1, 0) FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_describe_object(1259, 1, 0) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17200,11 +17075,7 @@ mod tests {
 
     #[test]
     fn parses_pg_identify_object() {
-        match LogicalPlanner::plan(
-            "SELECT pg_identify_object(1259, 1, 0) FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_identify_object(1259, 1, 0) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17218,10 +17089,8 @@ mod tests {
 
     #[test]
     fn parses_pg_size_pretty_and_client_encoding() {
-        match LogicalPlanner::plan(
-            "SELECT pg_size_pretty(1024), pg_client_encoding() FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT pg_size_pretty(1024), pg_client_encoding() FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -17254,9 +17123,7 @@ mod tests {
 
     #[test]
     fn parses_pg_size_bytes() {
-        match LogicalPlanner::plan("SELECT pg_size_bytes('1 GB') FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_size_bytes('1 GB') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17296,11 +17163,7 @@ mod tests {
 
     #[test]
     fn parses_current_role_and_gen_random_uuid() {
-        match LogicalPlanner::plan(
-            "SELECT CURRENT_ROLE, gen_random_uuid() FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT CURRENT_ROLE, gen_random_uuid() FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17322,11 +17185,7 @@ mod tests {
 
     #[test]
     fn parses_pg_sleep_and_column_size() {
-        match LogicalPlanner::plan(
-            "SELECT pg_sleep(0), pg_column_size('x') FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_sleep(0), pg_column_size('x') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17364,9 +17223,7 @@ mod tests {
             other => panic!("expected Listen, got {other:?}"),
         }
         match LogicalPlanner::plan("UNLISTEN alerts").unwrap() {
-            LogicalPlan::Unlisten {
-                channel: Some(ch),
-            } => assert_eq!(ch, "alerts"),
+            LogicalPlan::Unlisten { channel: Some(ch) } => assert_eq!(ch, "alerts"),
             other => panic!("expected Unlisten, got {other:?}"),
         }
         match LogicalPlanner::plan("UNLISTEN *").unwrap() {
@@ -17482,7 +17339,9 @@ mod tests {
         assert!(pg_signal_backend(std::process::id() as i64));
         assert!(!pg_signal_backend(0));
         assert!(!pg_signal_backend(-1));
-        assert!(!pg_signal_backend(i64::from(std::process::id()).saturating_add(1)));
+        assert!(!pg_signal_backend(
+            i64::from(std::process::id()).saturating_add(1)
+        ));
         assert_eq!(format_wal_lsn(0x0100_0000), "0/01000000");
         assert_eq!(parse_wal_lsn("0/01000000"), Some(0x0100_0000));
         assert_eq!(pg_wal_lsn_diff("0/01000010", "0/01000000"), Some(0x10));
@@ -17599,11 +17458,7 @@ mod tests {
 
     #[test]
     fn parses_create_drop_sequence() {
-        match LogicalPlanner::plan(
-            "CREATE SEQUENCE s1 START WITH 10 INCREMENT BY 2",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("CREATE SEQUENCE s1 START WITH 10 INCREMENT BY 2").unwrap() {
             LogicalPlan::CreateSequence {
                 name,
                 if_not_exists,
@@ -17686,10 +17541,8 @@ mod tests {
             }
             other => panic!("expected RENAME TO, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT pg_get_serial_sequence('users', 'id') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT pg_get_serial_sequence('users', 'id') FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -17776,37 +17629,39 @@ mod tests {
         }
         let name = format!("priv_seq_{}", alloc_advisory_session_id());
         create_sequence(&name, false, 1, 1).unwrap();
-        assert!(crate::rbac::has_sequence_privilege(
-            false,
-            &name,
-            &[crate::rbac::SequencePrivilege::Usage],
-            sequence_exists,
-        )
-        .unwrap());
-        assert!(crate::rbac::has_sequence_privilege(
-            true,
-            &name,
-            &[crate::rbac::SequencePrivilege::Update],
-            sequence_exists,
-        )
-        .unwrap());
-        assert!(crate::rbac::has_sequence_privilege(
-            false,
-            "missing_seq_xyz",
-            &[crate::rbac::SequencePrivilege::Usage],
-            sequence_exists,
-        )
-        .is_err());
+        assert!(
+            crate::rbac::has_sequence_privilege(
+                false,
+                &name,
+                &[crate::rbac::SequencePrivilege::Usage],
+                sequence_exists,
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::rbac::has_sequence_privilege(
+                true,
+                &name,
+                &[crate::rbac::SequencePrivilege::Update],
+                sequence_exists,
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::rbac::has_sequence_privilege(
+                false,
+                "missing_seq_xyz",
+                &[crate::rbac::SequencePrivilege::Usage],
+                sequence_exists,
+            )
+            .is_err()
+        );
         drop_sequence(&name, false).unwrap();
     }
 
     #[test]
     fn parses_txid_status() {
-        match LogicalPlanner::plan(
-            "SELECT txid_status(1), pg_xact_status(2) FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT txid_status(1), pg_xact_status(2) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -17960,11 +17815,7 @@ mod tests {
 
     #[test]
     fn parses_pg_switch_wal() {
-        match LogicalPlanner::plan(
-            "SELECT pg_switch_wal(), pg_switch_xlog() FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_switch_wal(), pg_switch_xlog() FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18073,11 +17924,7 @@ mod tests {
 
     #[test]
     fn parses_pg_create_restore_point() {
-        match LogicalPlanner::plan(
-            "SELECT pg_create_restore_point('rp1') FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT pg_create_restore_point('rp1') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18091,10 +17938,7 @@ mod tests {
 
     #[test]
     fn parses_pg_promote() {
-        match LogicalPlanner::plan(
-            "SELECT pg_promote(), pg_promote(true, 30) FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT pg_promote(), pg_promote(true, 30) FROM users").unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18145,7 +17989,14 @@ mod tests {
             Some("public".into())
         );
         assert_eq!(
-            current_setting_value("nope", "public", "repeatable read", "postgres", "postgres", "UTC"),
+            current_setting_value(
+                "nope",
+                "public",
+                "repeatable read",
+                "postgres",
+                "postgres",
+                "UTC"
+            ),
             None
         );
     }
@@ -18153,10 +18004,8 @@ mod tests {
     #[test]
     fn parses_set_config() {
         clear_guc_overlay();
-        match LogicalPlanner::plan(
-            "SELECT set_config('search_path', 'public', false) FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT set_config('search_path', 'public', false) FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18322,10 +18171,8 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT format_type(20, NULL), pg_get_userbyid(1) FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT format_type(20, NULL), pg_get_userbyid(1) FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18426,10 +18273,8 @@ mod tests {
             }
             other => panic!("expected Comment role, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT shobj_description('analyst', 'pg_authid') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT shobj_description('analyst', 'pg_authid') FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18509,24 +18354,30 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        assert!(crate::rbac::has_tablespace_privilege(
-            true,
-            "pg_default",
-            &[crate::rbac::TablespacePrivilege::Create]
-        )
-        .unwrap());
-        assert!(!crate::rbac::has_tablespace_privilege(
-            false,
-            "pg_default",
-            &[crate::rbac::TablespacePrivilege::Create]
-        )
-        .unwrap());
-        assert!(crate::rbac::has_tablespace_privilege(
-            true,
-            "missing_ts",
-            &[crate::rbac::TablespacePrivilege::Create]
-        )
-        .is_err());
+        assert!(
+            crate::rbac::has_tablespace_privilege(
+                true,
+                "pg_default",
+                &[crate::rbac::TablespacePrivilege::Create]
+            )
+            .unwrap()
+        );
+        assert!(
+            !crate::rbac::has_tablespace_privilege(
+                false,
+                "pg_default",
+                &[crate::rbac::TablespacePrivilege::Create]
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::rbac::has_tablespace_privilege(
+                true,
+                "missing_ts",
+                &[crate::rbac::TablespacePrivilege::Create]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -18679,9 +18530,7 @@ mod tests {
 
     #[test]
     fn parses_greatest_least_extract() {
-        match LogicalPlanner::plan("SELECT GREATEST(age, 25), LEAST(age, 25) FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT GREATEST(age, 25), LEAST(age, 25) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18722,17 +18571,18 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT '2026-01-15' + INTERVAL '1 day' AS d FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT '2026-01-15' + INTERVAL '1 day' AS d FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(columns[0].1, Expression::Arith { .. }));
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        assert_eq!(parse_interval_to_secs("1", Some(&DateTimeField::Day)).unwrap(), 86_400);
+        assert_eq!(
+            parse_interval_to_secs("1", Some(&DateTimeField::Day)).unwrap(),
+            86_400
+        );
         assert_eq!(parse_interval_to_secs("2 hours", None).unwrap(), 7_200);
         assert_eq!(parse_interval_to_secs("02:00:00", None).unwrap(), 7_200);
         assert_eq!(format_interval_secs(86_400), "1 day");
@@ -18746,10 +18596,8 @@ mod tests {
 
     #[test]
     fn parses_date_trunc() {
-        match LogicalPlanner::plan(
-            "SELECT DATE_TRUNC('day', '2026-08-02 15:30:45') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT DATE_TRUNC('day', '2026-08-02 15:30:45') FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18783,9 +18631,7 @@ mod tests {
 
     #[test]
     fn parses_make_date_time_timestamp() {
-        match LogicalPlanner::plan("SELECT MAKE_DATE(2026, 8, 2) FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT MAKE_DATE(2026, 8, 2) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18795,9 +18641,7 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan("SELECT MAKE_TIME(15, 30, 45) FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT MAKE_TIME(15, 30, 45) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18806,10 +18650,8 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT MAKE_TIMESTAMP(2026, 8, 2, 15, 30, 45) FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT MAKE_TIMESTAMP(2026, 8, 2, 15, 30, 45) FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18833,8 +18675,7 @@ mod tests {
 
     #[test]
     fn parses_make_interval() {
-        match LogicalPlanner::plan("SELECT MAKE_INTERVAL(0, 0, 0, 1, 2, 30, 0) FROM users")
-            .unwrap()
+        match LogicalPlanner::plan("SELECT MAKE_INTERVAL(0, 0, 0, 1, 2, 30, 0) FROM users").unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18845,9 +18686,7 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan("SELECT MAKE_INTERVAL(0, 0, 0, 1) FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT MAKE_INTERVAL(0, 0, 0, 1) FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18857,18 +18696,12 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        assert_eq!(
-            make_interval_secs(0, 0, 0, 1, 0, 0, 0.0),
-            86_400
-        );
+        assert_eq!(make_interval_secs(0, 0, 0, 1, 0, 0, 0.0), 86_400);
         assert_eq!(
             make_interval_secs(0, 0, 0, 0, 2, 30, 0.0),
             2 * 3600 + 30 * 60
         );
-        assert_eq!(
-            make_interval_secs(1, 0, 0, 0, 0, 0, 0.0),
-            365 * 86_400
-        );
+        assert_eq!(make_interval_secs(1, 0, 0, 0, 0, 0, 0.0), 365 * 86_400);
         assert_eq!(
             format_interval_secs(make_interval_secs(0, 0, 0, 1, 2, 0, 0.0)),
             "1 day 02:00:00"
@@ -18877,8 +18710,7 @@ mod tests {
 
     #[test]
     fn parses_justify_interval() {
-        match LogicalPlanner::plan("SELECT JUSTIFY_HOURS(INTERVAL '25 hours') FROM users")
-            .unwrap()
+        match LogicalPlanner::plan("SELECT JUSTIFY_HOURS(INTERVAL '25 hours') FROM users").unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18901,10 +18733,7 @@ mod tests {
             }
         }
         // Hours fold into days; days ≥ 30 fold into months.
-        assert_eq!(
-            format_interval_secs(25 * 3600),
-            "1 day 01:00:00"
-        );
+        assert_eq!(format_interval_secs(25 * 3600), "1 day 01:00:00");
         assert_eq!(format_interval_secs(40 * 86_400), "1 mon 10 days");
         assert_eq!(
             format_interval_secs(make_interval_secs(0, 1, 0, 0, 0, 0, 0.0)),
@@ -18918,9 +18747,7 @@ mod tests {
 
     #[test]
     fn parses_isfinite() {
-        match LogicalPlanner::plan("SELECT ISFINITE('2026-08-02') FROM users")
-            .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT ISFINITE('2026-08-02') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -18934,10 +18761,7 @@ mod tests {
         assert_eq!(is_finite_text("2026-08-02 15:30:45+00").unwrap(), true);
         assert_eq!(is_finite_text("infinity").unwrap(), false);
         assert_eq!(is_finite_text("-Infinity").unwrap(), false);
-        assert_eq!(
-            is_finite_text(&encode_interval_secs(86_400)).unwrap(),
-            true
-        );
+        assert_eq!(is_finite_text(&encode_interval_secs(86_400)).unwrap(), true);
         assert!(is_finite_text("not-a-timestamp").is_err());
     }
 
@@ -18948,10 +18772,7 @@ mod tests {
             extract_epoch_secs("2026-01-15 12:00:00+00").unwrap(),
             1_768_478_400.0
         );
-        assert_eq!(
-            extract_epoch_secs("1970-01-01 01:00:00+01").unwrap(),
-            0.0
-        );
+        assert_eq!(extract_epoch_secs("1970-01-01 01:00:00+01").unwrap(), 0.0);
         assert_eq!(
             extract_epoch_secs(&encode_interval_secs(86_400)).unwrap(),
             86_400.0
@@ -18959,10 +18780,8 @@ mod tests {
         assert_eq!(extract_epoch_secs("1 day").unwrap(), 86_400.0);
         assert!(extract_epoch_secs("infinity").unwrap().is_infinite());
         assert!(extract_epoch_secs("not-a-ts").is_err());
-        match LogicalPlanner::plan(
-            "SELECT EXTRACT(EPOCH FROM '1970-01-01 00:00:00') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT EXTRACT(EPOCH FROM '1970-01-01 00:00:00') FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -18977,34 +18796,18 @@ mod tests {
 
     #[test]
     fn overlaps_unit() {
-        assert!(periods_overlap(
-            "2001-02-16",
-            "2001-12-21",
-            "2001-10-30",
-            "2002-10-30"
-        )
-        .unwrap());
-        assert!(!periods_overlap(
-            "2001-02-16",
-            "2001-12-21",
-            "2002-01-01",
-            "2002-10-30"
-        )
-        .unwrap());
-        assert!(!periods_overlap(
-            "2001-01-01",
-            "2001-01-10",
-            "2001-01-10",
-            "2001-01-20"
-        )
-        .unwrap());
-        assert!(!periods_overlap(
-            "2001-02-16",
-            &encode_interval_secs(100 * 86_400),
-            "2001-10-30",
-            "2002-10-30"
-        )
-        .unwrap());
+        assert!(periods_overlap("2001-02-16", "2001-12-21", "2001-10-30", "2002-10-30").unwrap());
+        assert!(!periods_overlap("2001-02-16", "2001-12-21", "2002-01-01", "2002-10-30").unwrap());
+        assert!(!periods_overlap("2001-01-01", "2001-01-10", "2001-01-10", "2001-01-20").unwrap());
+        assert!(
+            !periods_overlap(
+                "2001-02-16",
+                &encode_interval_secs(100 * 86_400),
+                "2001-10-30",
+                "2002-10-30"
+            )
+            .unwrap()
+        );
         match LogicalPlanner::plan(
             "SELECT ('2001-02-16', '2001-12-21') OVERLAPS \
              ('2001-10-30', '2002-10-30') FROM users",
@@ -19024,10 +18827,8 @@ mod tests {
 
     #[test]
     fn parses_at_time_zone() {
-        match LogicalPlanner::plan(
-            "SELECT '2026-08-02 12:00:00+00' AT TIME ZONE '+03' FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT '2026-08-02 12:00:00+00' AT TIME ZONE '+03' FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(columns[0].1, Expression::AtTimeZone { .. }));
@@ -19038,7 +18839,10 @@ mod tests {
         assert_eq!(parse_zone_offset_secs("GMT").unwrap(), 0);
         assert_eq!(parse_zone_offset_secs("+03").unwrap(), 3 * 3600);
         assert_eq!(parse_zone_offset_secs("UTC-5").unwrap(), -5 * 3600);
-        assert_eq!(parse_zone_offset_secs("-05:30").unwrap(), -(5 * 3600 + 30 * 60));
+        assert_eq!(
+            parse_zone_offset_secs("-05:30").unwrap(),
+            -(5 * 3600 + 30 * 60)
+        );
         // Fixed-offset parser rejects IANA; full at_time_zone handles them.
         assert!(parse_zone_offset_secs("America/Denver").is_err());
         assert!(timezone_is_known("America/Denver"));
@@ -19087,16 +18891,17 @@ mod tests {
         );
         assert!(at_time_zone("2026-08-02 12:00:00+00", "NotA/RealZone").is_err());
         assert_eq!(normalize_timezone("utc").unwrap(), "UTC");
-        assert_eq!(normalize_timezone("Europe/Istanbul").unwrap(), "Europe/Istanbul");
+        assert_eq!(
+            normalize_timezone("Europe/Istanbul").unwrap(),
+            "Europe/Istanbul"
+        );
         assert!(normalize_timezone("NotA/RealZone").is_err());
     }
 
     #[test]
     fn parses_timezone_fn() {
-        match LogicalPlanner::plan(
-            "SELECT TIMEZONE('+03', '2026-08-02 12:00:00+00') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT TIMEZONE('+03', '2026-08-02 12:00:00+00') FROM users")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -19163,11 +18968,7 @@ mod tests {
 
     #[test]
     fn parses_age() {
-        match LogicalPlanner::plan(
-            "SELECT AGE('2026-08-02', '2026-08-01') FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT AGE('2026-08-02', '2026-08-01') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -19215,10 +19016,7 @@ mod tests {
 
     #[test]
     fn parses_to_date() {
-        match LogicalPlanner::plan(
-            "SELECT TO_DATE('2026-08-02', 'YYYY-MM-DD') FROM users",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT TO_DATE('2026-08-02', 'YYYY-MM-DD') FROM users").unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -19246,11 +19044,7 @@ mod tests {
 
     #[test]
     fn parses_to_number() {
-        match LogicalPlanner::plan(
-            "SELECT TO_NUMBER('1234.56', '9999.99') FROM users",
-        )
-        .unwrap()
-        {
+        match LogicalPlanner::plan("SELECT TO_NUMBER('1234.56', '9999.99') FROM users").unwrap() {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
                     columns[0].1,
@@ -19278,10 +19072,8 @@ mod tests {
             }
             other => panic!("expected Values, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT * FROM (VALUES (1, 'Ada'), (2, 'Bob')) AS t(id, name)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT * FROM (VALUES (1, 'Ada'), (2, 'Bob')) AS t(id, name)")
+            .unwrap()
         {
             LogicalPlan::SubqueryAlias { alias, input } => {
                 assert_eq!(alias, "t");
@@ -19320,8 +19112,7 @@ mod tests {
             }
             other => panic!("expected GenerateSeries, got {other:?}"),
         }
-        match LogicalPlanner::plan("SELECT * FROM generate_series(1, 10, 2) AS g(n)").unwrap()
-        {
+        match LogicalPlanner::plan("SELECT * FROM generate_series(1, 10, 2) AS g(n)").unwrap() {
             LogicalPlan::GenerateSeries {
                 start,
                 stop,
@@ -19391,10 +19182,10 @@ mod tests {
             }
             other => panic!("expected timestamp GenerateSeries, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            "SELECT * FROM generate_series('2026-01-01', '2026-01-03')"
-        )
-        .is_err());
+        assert!(
+            LogicalPlanner::plan("SELECT * FROM generate_series('2026-01-01', '2026-01-03')")
+                .is_err()
+        );
 
         let rows =
             materialize_generate_series(1, 5, 1, "generate_series", None, false, false).unwrap();
@@ -19403,8 +19194,7 @@ mod tests {
         assert_eq!(rows[4].get("generate_series"), Some("5"));
         let down = materialize_generate_series(5, 1, -2, "n", None, false, false).unwrap();
         assert_eq!(
-            down
-                .iter()
+            down.iter()
                 .map(|r| r.get("n").unwrap().to_string())
                 .collect::<Vec<_>>(),
             vec!["5", "3", "1"]
@@ -19416,16 +19206,9 @@ mod tests {
         assert_eq!(with_ord[2].get("ord"), Some("3"));
 
         let day0 = timestamp_to_unix(2026, 1, 1, 0, 0, 0);
-        let ts_rows = materialize_generate_series(
-            day0,
-            day0 + 2 * 86_400,
-            86_400,
-            "d",
-            None,
-            true,
-            true,
-        )
-        .unwrap();
+        let ts_rows =
+            materialize_generate_series(day0, day0 + 2 * 86_400, 86_400, "d", None, true, true)
+                .unwrap();
         assert_eq!(
             ts_rows
                 .iter()
@@ -19464,10 +19247,8 @@ mod tests {
             }
             other => panic!("expected Unnest, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT * FROM unnest(ARRAY[10, 20]) WITH ORDINALITY AS t(x, i)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT * FROM unnest(ARRAY[10, 20]) WITH ORDINALITY AS t(x, i)")
+            .unwrap()
         {
             LogicalPlan::Unnest {
                 column,
@@ -19492,10 +19273,8 @@ mod tests {
         assert_eq!(rows[0].get("unnest"), Some("10"));
         assert_eq!(rows[1].get("unnest"), Some("20"));
 
-        match LogicalPlanner::plan(
-            "SELECT * FROM UNNEST(ARRAY[10, 20, 30]) AS numbers WITH OFFSET",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT * FROM UNNEST(ARRAY[10, 20, 30]) AS numbers WITH OFFSET")
+            .unwrap()
         {
             LogicalPlan::Unnest {
                 column,
@@ -19559,10 +19338,8 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        match LogicalPlanner::plan(
-            "SELECT ARRAY[1,2] || ARRAY[3] FROM generate_series(1,1)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT ARRAY[1,2] || ARRAY[3] FROM generate_series(1,1)")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -19656,10 +19433,8 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         }
         // ARRAY @> still routes to array ops.
-        match LogicalPlanner::plan(
-            "SELECT ARRAY[1,2] @> ARRAY[1] FROM generate_series(1,1)",
-        )
-        .unwrap()
+        match LogicalPlanner::plan("SELECT ARRAY[1,2] @> ARRAY[1] FROM generate_series(1,1)")
+            .unwrap()
         {
             LogicalPlan::Project { columns, .. } => {
                 assert!(matches!(
@@ -19704,8 +19479,12 @@ mod tests {
         assert!(set.contains("\"b\":2") || set.contains("\"b\": 2"));
         assert!(json_contains(&set, r#"{"a":1}"#).unwrap());
         assert_eq!(
-            json_concat(r#"{"a":1}"#, r#"{"b":2}"#).unwrap().contains("\"b\":2")
-                || json_concat(r#"{"a":1}"#, r#"{"b":2}"#).unwrap().contains("\"b\": 2"),
+            json_concat(r#"{"a":1}"#, r#"{"b":2}"#)
+                .unwrap()
+                .contains("\"b\":2")
+                || json_concat(r#"{"a":1}"#, r#"{"b":2}"#)
+                    .unwrap()
+                    .contains("\"b\": 2"),
             true
         );
         let nested = jsonb_set(r#"{"a":{"b":1}}"#, "{a,b}", "9", true).unwrap();
@@ -19736,10 +19515,10 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
-        assert!(LogicalPlanner::plan(
-            r#"SELECT jsonb_build_object('a') FROM generate_series(1,1)"#
-        )
-        .is_err());
+        assert!(
+            LogicalPlanner::plan(r#"SELECT jsonb_build_object('a') FROM generate_series(1,1)"#)
+                .is_err()
+        );
 
         let obj = jsonb_build_object(&[
             (Value::String("a".into()), Value::Int(1)),
@@ -19805,9 +19584,7 @@ mod tests {
             json_path_get(&path, "{a,c}", false).unwrap(),
             Value::String("2".into())
         );
-        assert!(json_path_get(&path, "{a,b}", false)
-            .unwrap()
-            .is_null());
+        assert!(json_path_get(&path, "{a,b}", false).unwrap().is_null());
     }
 
     #[test]
@@ -19849,17 +19626,13 @@ mod tests {
             json_path_get(&stripped, "{c,e}", false).unwrap(),
             Value::String("2".into())
         );
-        assert!(json_path_get(&stripped, "{c,d}", false)
-            .unwrap()
-            .is_null());
+        assert!(json_path_get(&stripped, "{c,d}", false).unwrap().is_null());
     }
 
     #[test]
     fn parses_json_array_elements_and_each() {
-        match LogicalPlanner::plan(
-            r#"SELECT * FROM jsonb_array_elements('[1, 2, 3]'::jsonb)"#,
-        )
-        .unwrap()
+        match LogicalPlanner::plan(r#"SELECT * FROM jsonb_array_elements('[1, 2, 3]'::jsonb)"#)
+            .unwrap()
         {
             LogicalPlan::JsonArrayElements {
                 doc,
@@ -19884,10 +19657,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].get("value"), Some("1"));
 
-        match LogicalPlanner::plan(
-            r#"SELECT * FROM json_each('{"a":1,"b":true}'::json)"#,
-        )
-        .unwrap()
+        match LogicalPlanner::plan(r#"SELECT * FROM json_each('{"a":1,"b":true}'::json)"#).unwrap()
         {
             LogicalPlan::JsonEach {
                 doc,
@@ -19907,11 +19677,15 @@ mod tests {
             }
             other => panic!("expected JsonEach, got {other:?}"),
         }
-        let pairs = materialize_json_each(r#"{"a":1,"b":true}"#, "key", "value", false, None).unwrap();
+        let pairs =
+            materialize_json_each(r#"{"a":1,"b":true}"#, "key", "value", false, None).unwrap();
         assert_eq!(pairs.len(), 2);
         let mut map = std::collections::BTreeMap::new();
         for r in &pairs {
-            map.insert(r.get("key").unwrap().to_string(), r.get("value").unwrap().to_string());
+            map.insert(
+                r.get("key").unwrap().to_string(),
+                r.get("value").unwrap().to_string(),
+            );
         }
         assert_eq!(map.get("a").map(String::as_str), Some("1"));
         assert_eq!(map.get("b").map(String::as_str), Some("true"));
@@ -19924,14 +19698,18 @@ mod tests {
             LogicalPlan::Project { input, columns } => {
                 assert_eq!(columns[0].0, "x");
                 match input.as_ref() {
-                    LogicalPlan::JsonArrayElements { column, as_text, .. } => {
+                    LogicalPlan::JsonArrayElements {
+                        column, as_text, ..
+                    } => {
                         assert_eq!(column, "x");
                         assert!(*as_text);
                     }
                     other => panic!("expected JsonArrayElements under Project, got {other:?}"),
                 }
             }
-            LogicalPlan::JsonArrayElements { column, as_text, .. } => {
+            LogicalPlan::JsonArrayElements {
+                column, as_text, ..
+            } => {
                 assert_eq!(column, "x");
                 assert!(as_text);
             }
@@ -20038,11 +19816,7 @@ mod tests {
             "1,2"
         );
         assert_eq!(
-            array_to_string(
-                &[Value::Int(1), Value::Null, Value::Int(3)],
-                ",",
-                Some("?")
-            ),
+            array_to_string(&[Value::Int(1), Value::Null, Value::Int(3)], ",", Some("?")),
             "1,?,3"
         );
     }
@@ -20118,10 +19892,7 @@ mod tests {
             regexp_replace("foobarbaz", "b..", "X", Some("g")).unwrap(),
             "fooXX"
         );
-        assert_eq!(
-            regexp_replace("AaA", "a", "z", Some("i")).unwrap(),
-            "zaA"
-        );
+        assert_eq!(regexp_replace("AaA", "a", "z", Some("i")).unwrap(), "zaA");
         assert_eq!(
             regexp_replace("a1b2", "(\\d)", "[\\1]", Some("g")).unwrap(),
             "a[1]b[2]"
@@ -20147,10 +19918,8 @@ mod tests {
         assert!(!regexp_like("hello", "xyz", None).unwrap());
         assert!(regexp_like("Hello", "hello", Some("i")).unwrap());
 
-        match LogicalPlanner::plan(
-            r#"SELECT * FROM regexp_matches('foobarbaz', 'b(..)', 'g')"#,
-        )
-        .unwrap()
+        match LogicalPlanner::plan(r#"SELECT * FROM regexp_matches('foobarbaz', 'b(..)', 'g')"#)
+            .unwrap()
         {
             LogicalPlan::RegexpMatches {
                 string,
@@ -20340,10 +20109,7 @@ mod tests {
         assert!(!starts_with("hello", "lo"));
         assert!(ends_with("hello", "lo"));
         assert!(!ends_with("hello", "he"));
-        assert_eq!(
-            overlay("Txxxxas", "hom", 2, Some(4)).unwrap(),
-            "Thomas"
-        );
+        assert_eq!(overlay("Txxxxas", "hom", 2, Some(4)).unwrap(), "Thomas");
         assert_eq!(overlay("abcdef", "XY", 3, None).unwrap(), "abXYef");
         assert!(overlay("ab", "x", 0, None).is_err());
     }
@@ -20406,7 +20172,14 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         }
         assert_eq!(
-            concat_ws(",", &[Value::String("a".into()), Value::Null, Value::String("b".into())]),
+            concat_ws(
+                ",",
+                &[
+                    Value::String("a".into()),
+                    Value::Null,
+                    Value::String("b".into())
+                ]
+            ),
             "a,b"
         );
         assert_eq!(
@@ -20467,10 +20240,7 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         }
         assert_eq!(quote_nullable(&Value::Null), "NULL");
-        assert_eq!(
-            quote_nullable(&Value::String("hi".into())),
-            "'hi'"
-        );
+        assert_eq!(quote_nullable(&Value::String("hi".into())), "'hi'");
         assert_eq!(width_bucket(5.35, 0.024, 10.06, 5).unwrap(), 3);
         assert_eq!(width_bucket(-1.0, 0.0, 10.0, 5).unwrap(), 0);
         assert_eq!(width_bucket(10.0, 0.0, 10.0, 5).unwrap(), 6);
@@ -20677,17 +20447,17 @@ mod tests {
             json_extract_path(r#"{"a":{"b":"x"}}"#, &["a".into(), "b".into()], true).unwrap(),
             Value::String("x".into())
         );
-        assert!(json_extract_path(r#"{"a":1}"#, &["z".into()], false)
-            .unwrap()
-            .is_null());
+        assert!(
+            json_extract_path(r#"{"a":1}"#, &["z".into()], false)
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
     fn parses_jsonb_object_keys() {
-        match LogicalPlanner::plan(
-            r#"SELECT * FROM jsonb_object_keys('{"a":1,"b":2}'::jsonb)"#,
-        )
-        .unwrap()
+        match LogicalPlanner::plan(r#"SELECT * FROM jsonb_object_keys('{"a":1,"b":2}'::jsonb)"#)
+            .unwrap()
         {
             LogicalPlan::JsonObjectKeys {
                 doc,
@@ -20705,17 +20475,18 @@ mod tests {
         }
         let rows = materialize_json_object_keys(r#"{"b":2,"a":1}"#, "k", None).unwrap();
         assert_eq!(rows.len(), 2);
-        let mut keys: Vec<_> = rows.iter().map(|r| r.get("k").unwrap().to_string()).collect();
+        let mut keys: Vec<_> = rows
+            .iter()
+            .map(|r| r.get("k").unwrap().to_string())
+            .collect();
         keys.sort();
         assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn parses_regexp_split_to_table() {
-        match LogicalPlanner::plan(
-            r#"SELECT * FROM regexp_split_to_table('hello world', '\s+')"#,
-        )
-        .unwrap()
+        match LogicalPlanner::plan(r#"SELECT * FROM regexp_split_to_table('hello world', '\s+')"#)
+            .unwrap()
         {
             LogicalPlan::RegexpSplitToTable {
                 string,
@@ -20841,13 +20612,14 @@ mod tests {
         match plan {
             LogicalPlan::Select {
                 table,
-                predicate: Some(Expression::InSubquery {
-                    expr,
-                    subquery,
-                    value_column,
-                    negated,
-                    correlated,
-                }),
+                predicate:
+                    Some(Expression::InSubquery {
+                        expr,
+                        subquery,
+                        value_column,
+                        negated,
+                        correlated,
+                    }),
                 ..
             } => {
                 assert_eq!(table, "employees");
@@ -20916,11 +20688,12 @@ mod tests {
         .unwrap();
         match exists {
             LogicalPlan::Select {
-                predicate: Some(Expression::Exists {
-                    negated,
-                    correlated,
-                    ..
-                }),
+                predicate:
+                    Some(Expression::Exists {
+                        negated,
+                        correlated,
+                        ..
+                    }),
                 ..
             } => {
                 assert!(!negated);
@@ -21080,7 +20853,10 @@ mod tests {
 }
 
 fn normalize_guc_name(name: &str) -> String {
-    name.trim().trim_matches('"').to_ascii_lowercase().replace('-', "_")
+    name.trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('-', "_")
 }
 
 fn set_value_to_string(expr: &Expr) -> Result<String> {
@@ -21153,7 +20929,3 @@ fn transaction_isolation_name(level: &sqlparser::ast::TransactionIsolationLevel)
     };
     normalize_transaction_isolation(raw)
 }
-
-
-
-

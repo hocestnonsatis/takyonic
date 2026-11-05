@@ -3,9 +3,9 @@
 #[cfg(test)]
 mod mvcc_occ;
 #[cfg(test)]
-mod twopc;
-#[cfg(test)]
 mod simd_jit;
+#[cfg(test)]
+mod twopc;
 
 #[cfg(test)]
 mod tests {

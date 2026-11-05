@@ -58,6 +58,7 @@ tonic-build = "0.12"
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-postgres = "0.7"
 proptest = "1.6"
 
 [[bin]]

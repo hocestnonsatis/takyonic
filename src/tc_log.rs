@@ -49,7 +49,9 @@ impl TcDecisionRecord {
 
     fn decode_body(mut body: &[u8]) -> Result<Self> {
         if body.len() < 1 + 8 + 8 {
-            return Err(TakyonicError::Integrity("tc decision body truncated".into()));
+            return Err(TakyonicError::Integrity(
+                "tc decision body truncated".into(),
+            ));
         }
         let tag = body[0];
         body = &body[1..];
@@ -148,10 +150,7 @@ impl TcDecisionLog {
 
     /// Append one terminal decision and `sync_data`.
     pub fn append_decision(&mut self, record: &TcDecisionRecord) -> Result<()> {
-        if !matches!(
-            record.state,
-            TwopcState::Committed | TwopcState::Aborted
-        ) {
+        if !matches!(record.state, TwopcState::Committed | TwopcState::Aborted) {
             return Err(TakyonicError::Engine(
                 "tc log only accepts Committed/Aborted decisions".into(),
             ));

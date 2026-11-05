@@ -92,9 +92,9 @@ impl VectorValue {
             if t.is_empty() {
                 continue;
             }
-            let v: f32 = t.parse().map_err(|_| {
-                TakyonicError::Sql(format!("invalid vector component `{t}`"))
-            })?;
+            let v: f32 = t
+                .parse()
+                .map_err(|_| TakyonicError::Sql(format!("invalid vector component `{t}`")))?;
             data.push(v);
         }
         Ok(Self::new(data))

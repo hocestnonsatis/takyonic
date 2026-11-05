@@ -150,9 +150,7 @@ impl ObjectStorage for LocalFileBackend {
     fn read(&self, path: &str, offset: u64, size: usize) -> Result<Vec<u8>> {
         let p = self.resolve(path);
         if !p.exists() {
-            return Err(TakyonicError::Engine(format!(
-                "object not found: {path}"
-            )));
+            return Err(TakyonicError::Engine(format!("object not found: {path}")));
         }
         let mut f = fs::File::open(&p)?;
         let len = f.metadata()?.len();
@@ -219,9 +217,7 @@ impl ObjectStorage for LocalFileBackend {
     fn read_all(&self, path: &str) -> Result<Vec<u8>> {
         let p = self.resolve(path);
         if !p.exists() {
-            return Err(TakyonicError::Engine(format!(
-                "object not found: {path}"
-            )));
+            return Err(TakyonicError::Engine(format!("object not found: {path}")));
         }
         Ok(fs::read(p)?)
     }
@@ -363,9 +359,7 @@ impl ObjectStorage for InMemoryObjectStore {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let map = self.objects.read();
         let Some(data) = map.get(path) else {
-            return Err(TakyonicError::Engine(format!(
-                "object not found: {path}"
-            )));
+            return Err(TakyonicError::Engine(format!("object not found: {path}")));
         };
         if offset as usize >= data.len() {
             return Ok(Vec::new());
@@ -414,11 +408,7 @@ impl ObjectStorage for InMemoryObjectStore {
     }
 
     fn len(&self, path: &str) -> Result<Option<u64>> {
-        Ok(self
-            .objects
-            .read()
-            .get(path)
-            .map(|b| b.len() as u64))
+        Ok(self.objects.read().get(path).map(|b| b.len() as u64))
     }
 }
 
@@ -502,7 +492,9 @@ impl S3Backend {
         access_key: &str,
         secret_key: &str,
     ) -> Result<Self> {
-        use aws_sdk_s3::config::{BehaviorVersion, Builder as S3ConfigBuilder, Credentials, Region};
+        use aws_sdk_s3::config::{
+            BehaviorVersion, Builder as S3ConfigBuilder, Credentials, Region,
+        };
 
         let creds = Credentials::new(access_key, secret_key, None, None, "takyonic-minio");
         let conf = S3ConfigBuilder::new()
@@ -685,9 +677,7 @@ impl AwsS3Client {
                         .upload_id(upload_id)
                         .send()
                         .await;
-                    Err(TakyonicError::Engine(format!(
-                        "s3 complete_multipart: {e}"
-                    )))
+                    Err(TakyonicError::Engine(format!("s3 complete_multipart: {e}")))
                 }
             }
         })
@@ -828,8 +818,14 @@ mod tests {
         assert!(multipart_part_ranges(0, 8).is_empty());
         assert_eq!(multipart_part_ranges(10, 8), vec![(0, 8), (8, 10)]);
         assert_eq!(multipart_part_ranges(16, 8), vec![(0, 8), (8, 16)]);
-        assert!(prefer_multipart(AWS_S3_PUT_OBJECT_MAX_BYTES, AWS_S3_PUT_OBJECT_MAX_BYTES));
-        assert!(!prefer_multipart(AWS_S3_PUT_OBJECT_MAX_BYTES - 1, AWS_S3_PUT_OBJECT_MAX_BYTES));
+        assert!(prefer_multipart(
+            AWS_S3_PUT_OBJECT_MAX_BYTES,
+            AWS_S3_PUT_OBJECT_MAX_BYTES
+        ));
+        assert!(!prefer_multipart(
+            AWS_S3_PUT_OBJECT_MAX_BYTES - 1,
+            AWS_S3_PUT_OBJECT_MAX_BYTES
+        ));
     }
 
     #[test]
@@ -1055,7 +1051,8 @@ mod minio_tests {
         );
         let keys = blocking_list(Arc::clone(&s3), "pages/").await.unwrap();
         assert!(
-            keys.iter().any(|k| k == "pages/0" || k.ends_with("pages/0")),
+            keys.iter()
+                .any(|k| k == "pages/0" || k.ends_with("pages/0")),
             "list missing pages/0: {keys:?}"
         );
         blocking_delete(s3, "pages/0").await.unwrap();

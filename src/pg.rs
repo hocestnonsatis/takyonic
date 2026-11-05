@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -30,9 +31,9 @@ use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, METADATA_USER, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
-use pgwire::messages::response::CommandComplete;
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::response::{CommandComplete, TransactionStatus};
 use tracing::debug;
 
 use crate::client::TakyonicClient;
@@ -44,7 +45,7 @@ use crate::executor::{self, ExecutionContext, affected_row_count};
 use crate::partition::PartitionRouter;
 use crate::rbac::{AuthCatalog, AuthContext, AuthorizationManager, SharedAuthCatalog};
 use crate::schema::{ColumnSpec, Record};
-use crate::sql::{ctas_output_columns, Expression, LogicalPlan, Returning, SqlEngine, Value};
+use crate::sql::{Expression, LogicalPlan, Returning, SqlEngine, Value, ctas_output_columns};
 use crate::txn::Transaction;
 
 fn connect_remote_shard_blocking(
@@ -58,9 +59,7 @@ fn connect_remote_shard_blocking(
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| {
-                    crate::error::TakyonicError::Network(format!("tokio runtime: {e}"))
-                })?;
+                .map_err(|e| crate::error::TakyonicError::Network(format!("tokio runtime: {e}")))?;
             Ok(rt.block_on(connect)?)
         }
     }
@@ -211,7 +210,11 @@ impl SessionResult {
                 column_order: None,
             },
             LogicalPlan::CreateRole { can_login, .. } => Self {
-                tag: if *can_login { "CREATE USER" } else { "CREATE ROLE" },
+                tag: if *can_login {
+                    "CREATE USER"
+                } else {
+                    "CREATE ROLE"
+                },
                 affected: None,
                 rows: Vec::new(),
                 column_order: None,
@@ -424,6 +427,161 @@ fn remap_ctas_row(
     Ok(out)
 }
 
+/// Parameter OIDs for Extended Query `Describe`.
+///
+/// `tokio-postgres` prepares with an empty type list and trusts
+/// `ParameterDescription`. Count `$n` placeholders and prefer the target
+/// column's catalog type so the client can binary-encode `i64` / `i32` / text.
+fn described_param_types(
+    plan: &LogicalPlan,
+    specified: &[Option<Type>],
+    engine: &TakyonicEngine,
+) -> Vec<Type> {
+    let mut inferred: Vec<Option<Type>> = Vec::new();
+    collect_plan_params(plan, engine, &mut inferred);
+    let n = inferred.len().max(specified.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(Some(ty)) = specified.get(i) {
+            if *ty != Type::UNKNOWN {
+                out.push(ty.clone());
+                continue;
+            }
+        }
+        out.push(
+            inferred
+                .get(i)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::TEXT),
+        );
+    }
+    out
+}
+
+fn assign_param_type(inferred: &mut Vec<Option<Type>>, idx: usize, ty: Type) {
+    if inferred.len() <= idx {
+        inferred.resize(idx + 1, None);
+    }
+    if inferred[idx].is_none() {
+        inferred[idx] = Some(ty);
+    }
+}
+
+fn column_pg_type(engine: &TakyonicEngine, table: &str, column: &str) -> Type {
+    if let Ok(schema) = engine.table_schema(table) {
+        if let Some(col) = schema.columns.iter().find(|c| c.name == column) {
+            return catalog_type_to_pg(&col.data_type);
+        }
+    }
+    lookup_column_pg_type(engine, column)
+}
+
+fn note_expr_params(
+    expr: &Expression,
+    engine: &TakyonicEngine,
+    inferred: &mut Vec<Option<Type>>,
+    expected: Option<Type>,
+) {
+    match expr {
+        Expression::Parameter(idx) => {
+            assign_param_type(inferred, *idx, expected.unwrap_or(Type::TEXT));
+        }
+        Expression::BinaryOp { left, right, .. } => match (left.as_ref(), right.as_ref()) {
+            (Expression::Column(col), Expression::Parameter(idx))
+            | (Expression::Parameter(idx), Expression::Column(col)) => {
+                assign_param_type(inferred, *idx, lookup_column_pg_type(engine, col));
+            }
+            _ => {
+                note_expr_params(left, engine, inferred, None);
+                note_expr_params(right, engine, inferred, None);
+            }
+        },
+        Expression::And { left, right }
+        | Expression::Or { left, right }
+        | Expression::Arith { left, right, .. } => {
+            note_expr_params(left, engine, inferred, None);
+            note_expr_params(right, engine, inferred, None);
+        }
+        Expression::Not { expr }
+        | Expression::IsNull { expr, .. }
+        | Expression::Cast { expr, .. } => note_expr_params(expr, engine, inferred, None),
+        Expression::ScalarFunction { args, .. } | Expression::AggregateFunction { args, .. } => {
+            for arg in args {
+                note_expr_params(arg, engine, inferred, None);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_plan_params(
+    plan: &LogicalPlan,
+    engine: &TakyonicEngine,
+    inferred: &mut Vec<Option<Type>>,
+) {
+    match plan {
+        LogicalPlan::Insert {
+            table,
+            columns,
+            values,
+            query,
+            ..
+        } => {
+            for row in values {
+                for (col, expr) in columns.iter().zip(row.iter()) {
+                    let ty = column_pg_type(engine, table, col);
+                    note_expr_params(expr, engine, inferred, Some(ty));
+                }
+            }
+            if let Some(query) = query {
+                collect_plan_params(query, engine, inferred);
+            }
+        }
+        LogicalPlan::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            for (col, expr) in assignments {
+                let ty = column_pg_type(engine, table, col);
+                note_expr_params(expr, engine, inferred, Some(ty));
+            }
+            if let Some(pred) = selection {
+                note_expr_params(pred, engine, inferred, None);
+            }
+        }
+        LogicalPlan::Delete { selection, .. } => {
+            if let Some(pred) = selection {
+                note_expr_params(pred, engine, inferred, None);
+            }
+        }
+        LogicalPlan::Select { predicate, .. } => {
+            if let Some(pred) = predicate {
+                note_expr_params(pred, engine, inferred, None);
+            }
+        }
+        LogicalPlan::Project { input, columns } => {
+            collect_plan_params(input, engine, inferred);
+            for (_, expr) in columns {
+                note_expr_params(expr, engine, inferred, None);
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            collect_plan_params(input, engine, inferred);
+            note_expr_params(predicate, engine, inferred, None);
+        }
+        LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::DistinctOn { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Aggregate { input, .. } => collect_plan_params(input, engine, inferred),
+        _ => {}
+    }
+}
+
 /// Row-description fields for Extended Query Describe (no execution).
 fn describe_plan_fields(plan: &LogicalPlan, engine: &TakyonicEngine) -> Vec<FieldInfo> {
     describe_plan_columns(plan, engine)
@@ -439,10 +597,9 @@ fn describe_plan_columns(plan: &LogicalPlan, engine: &TakyonicEngine) -> Vec<(St
             .map(|(name, expr)| (name.clone(), expr_pg_type(expr, engine)))
             .collect(),
         LogicalPlan::Select { table, .. } => table_star_columns(engine, table),
-        LogicalPlan::Values { columns, .. } => columns
-            .iter()
-            .map(|c| (c.clone(), Type::VARCHAR))
-            .collect(),
+        LogicalPlan::Values { columns, .. } => {
+            columns.iter().map(|c| (c.clone(), Type::VARCHAR)).collect()
+        }
         LogicalPlan::GenerateSeries {
             column,
             ordinality_column,
@@ -672,22 +829,23 @@ fn expr_pg_type(expr: &Expression, engine: &TakyonicEngine) -> Type {
             HeuristicKind::Text => Type::VARCHAR,
         },
         Expression::Parameter(_) => Type::VARCHAR,
-        Expression::AggregateFunction { name, args, .. } => match name.to_ascii_lowercase().as_str() {
-            "count" => Type::INT8,
-            "sum" | "avg" => Type::FLOAT8,
-            "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop" | "var_samp"
-            | "corr" | "covar_pop" | "covar_samp"
-            | "regr_slope" | "regr_intercept" | "regr_r2"
-            | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy"
-            | "percentile_cont" | "percentile_disc" => Type::FLOAT8,
-            "regr_count" => Type::INT8,
-            "bit_and" | "bit_or" => Type::INT8,
-            "min" | "max" | "mode" if !args.is_empty() => expr_pg_type(&args[0], engine),
-            "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
-            | "string_agg" | "array_agg" => Type::VARCHAR,
-            "bool_and" | "bool_or" | "every" => Type::BOOL,
-            _ => Type::VARCHAR,
-        },
+        Expression::AggregateFunction { name, args, .. } => {
+            match name.to_ascii_lowercase().as_str() {
+                "count" => Type::INT8,
+                "sum" | "avg" => Type::FLOAT8,
+                "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop" | "var_samp"
+                | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept"
+                | "regr_r2" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy"
+                | "percentile_cont" | "percentile_disc" => Type::FLOAT8,
+                "regr_count" => Type::INT8,
+                "bit_and" | "bit_or" => Type::INT8,
+                "min" | "max" | "mode" if !args.is_empty() => expr_pg_type(&args[0], engine),
+                "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg"
+                | "string_agg" | "array_agg" => Type::VARCHAR,
+                "bool_and" | "bool_or" | "every" => Type::BOOL,
+                _ => Type::VARCHAR,
+            }
+        }
         Expression::Arith { .. } | Expression::VectorDistance { .. } => Type::FLOAT8,
         Expression::Array(_) => Type::VARCHAR,
         Expression::ArrayIndex { .. } => Type::VARCHAR,
@@ -738,86 +896,188 @@ fn expr_pg_type(expr: &Expression, engine: &TakyonicEngine) -> Type {
         Expression::NullIf { left, .. } => expr_pg_type(left, engine),
         Expression::ScalarFunction { name, args } => match name.as_str() {
             "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH"
-            | "STRPOS" | "POSITION" | "ASCII"
-            | "WIDTH_BUCKET" | "DIV" | "EXTRACT" | "DATE_PART" | "ARRAY_LENGTH" | "CARDINALITY"
-            | "JSON_ARRAY_LENGTH" | "JSONB_ARRAY_LENGTH" | "NUM_NONNULLS" | "NUM_NULLS" => {
-                Type::INT8
-            }
-            "ABS" | "NEGATE" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNC" | "SIGN" | "MOD"
-            | "POWER" | "POW" | "SQRT" | "CBRT" | "LN" | "LOG" | "EXP" | "PI" | "SIN" | "COS"
-            | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "RADIANS" | "DEGREES" | "TO_NUMBER"
-            | "RANDOM" | "PG_NOTIFICATION_QUEUE_USAGE" => {
-                Type::FLOAT8
-            }
+            | "STRPOS" | "POSITION" | "ASCII" | "WIDTH_BUCKET" | "DIV" | "EXTRACT"
+            | "DATE_PART" | "ARRAY_LENGTH" | "CARDINALITY" | "JSON_ARRAY_LENGTH"
+            | "JSONB_ARRAY_LENGTH" | "NUM_NONNULLS" | "NUM_NULLS" => Type::INT8,
+            "ABS"
+            | "NEGATE"
+            | "CEIL"
+            | "CEILING"
+            | "FLOOR"
+            | "ROUND"
+            | "TRUNC"
+            | "SIGN"
+            | "MOD"
+            | "POWER"
+            | "POW"
+            | "SQRT"
+            | "CBRT"
+            | "LN"
+            | "LOG"
+            | "EXP"
+            | "PI"
+            | "SIN"
+            | "COS"
+            | "TAN"
+            | "ASIN"
+            | "ACOS"
+            | "ATAN"
+            | "ATAN2"
+            | "RADIANS"
+            | "DEGREES"
+            | "TO_NUMBER"
+            | "RANDOM"
+            | "PG_NOTIFICATION_QUEUE_USAGE" => Type::FLOAT8,
             "ARRAY_CONTAINS" | "ARRAY_CONTAINED_BY" | "ARRAY_OVERLAP" | "JSON_CONTAINS"
             | "JSON_CONTAINED_BY" | "IS_JSON" | "JSON_IS_VALID" | "JSONB_PATH_EXISTS"
             | "JSON_PATH_EXISTS" | "REGEXP_LIKE" | "STARTS_WITH" | "ENDS_WITH" | "ISFINITE"
-            | "OVERLAPS" => {
-                Type::BOOL
-            }
-            "JSON_GET_TEXT" | "JSON_TYPEOF" | "JSONB_TYPEOF" | "JSON_PATH_GET_TEXT"
-            | "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => Type::VARCHAR,
+            | "OVERLAPS" => Type::BOOL,
+            "JSON_GET_TEXT"
+            | "JSON_TYPEOF"
+            | "JSONB_TYPEOF"
+            | "JSON_PATH_GET_TEXT"
+            | "JSONB_EXTRACT_PATH_TEXT"
+            | "JSON_EXTRACT_PATH_TEXT" => Type::VARCHAR,
             "JSON_GET" | "JSON_PATH_GET" | "JSON_CONCAT" | "JSONB_SET" | "JSON_SET"
-            | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH"
-            | "JSONB_BUILD_OBJECT" | "JSON_BUILD_OBJECT" | "JSONB_BUILD_ARRAY"
-            | "JSON_BUILD_ARRAY" | "JSONB_PRETTY" | "JSON_PRETTY" | "JSON_DELETE"
-            | "JSON_PATH_DELETE" | "JSONB_INSERT" | "JSON_INSERT" | "JSONB_STRIP_NULLS"
-            | "JSON_STRIP_NULLS" | "TO_JSON" | "TO_JSONB" | "ARRAY_TO_JSON" | "ROW_TO_JSON" => {
-                Type::VARCHAR
-            }
-            "DATE_TRUNC" | "AGE" | "TO_CHAR" | "TO_TIMESTAMP" | "TO_DATE" | "MAKE_DATE" | "MAKE_TIME"
-            | "MAKE_TIMESTAMP" | "MAKE_INTERVAL" | "TIMEZONE" | "DATE_BIN" | "JUSTIFY_HOURS"
-            | "JUSTIFY_DAYS" | "JUSTIFY_INTERVAL" | "ARRAY_CAT" | "STRING_TO_ARRAY"
-            | "ARRAY_TO_STRING" | "SPLIT_PART" | "REGEXP_SPLIT_TO_ARRAY" | "NOW"
-            | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP"
-            | "LOCALTIME" | "CLOCK_TIMESTAMP" | "TIMEOFDAY" | "STATEMENT_TIMESTAMP"
-            | "TRANSACTION_TIMESTAMP" | "CURRENT_USER" | "SESSION_USER" | "USER"
-            | "CURRENT_ROLE" | "CURRENT_SCHEMA" | "CURRENT_CATALOG" | "CURRENT_SCHEMAS"
-            | "VERSION" | "GEN_RANDOM_UUID" | "PG_POSTMASTER_START_TIME"
+            | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" | "JSONB_BUILD_OBJECT"
+            | "JSON_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSON_BUILD_ARRAY" | "JSONB_PRETTY"
+            | "JSON_PRETTY" | "JSON_DELETE" | "JSON_PATH_DELETE" | "JSONB_INSERT"
+            | "JSON_INSERT" | "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" | "TO_JSON" | "TO_JSONB"
+            | "ARRAY_TO_JSON" | "ROW_TO_JSON" => Type::VARCHAR,
+            "DATE_TRUNC"
+            | "AGE"
+            | "TO_CHAR"
+            | "TO_TIMESTAMP"
+            | "TO_DATE"
+            | "MAKE_DATE"
+            | "MAKE_TIME"
+            | "MAKE_TIMESTAMP"
+            | "MAKE_INTERVAL"
+            | "TIMEZONE"
+            | "DATE_BIN"
+            | "JUSTIFY_HOURS"
+            | "JUSTIFY_DAYS"
+            | "JUSTIFY_INTERVAL"
+            | "ARRAY_CAT"
+            | "STRING_TO_ARRAY"
+            | "ARRAY_TO_STRING"
+            | "SPLIT_PART"
+            | "REGEXP_SPLIT_TO_ARRAY"
+            | "NOW"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "LOCALTIMESTAMP"
+            | "LOCALTIME"
+            | "CLOCK_TIMESTAMP"
+            | "TIMEOFDAY"
+            | "STATEMENT_TIMESTAMP"
+            | "TRANSACTION_TIMESTAMP"
+            | "CURRENT_USER"
+            | "SESSION_USER"
+            | "USER"
+            | "CURRENT_ROLE"
+            | "CURRENT_SCHEMA"
+            | "CURRENT_CATALOG"
+            | "CURRENT_SCHEMAS"
+            | "VERSION"
+            | "GEN_RANDOM_UUID"
+            | "PG_POSTMASTER_START_TIME"
             | "PG_CONF_LOAD_TIME"
-            | "CURRENT_SETTING" => {
-                Type::VARCHAR
-            }
-            "PG_BACKEND_PID" | "TXID_CURRENT" | "PG_CURRENT_XACT_ID" | "PG_COLUMN_SIZE"
-            | "TO_REGCLASS" | "TO_REGROLE" | "TO_REGNAMESPACE" | "TO_REGTYPE"
-            | "TO_REGPROC" | "TO_REGPROCEDURE" | "TO_REGOPER" | "TO_REGOPERATOR"
+            | "CURRENT_SETTING" => Type::VARCHAR,
+            "PG_BACKEND_PID"
+            | "TXID_CURRENT"
+            | "PG_CURRENT_XACT_ID"
+            | "PG_COLUMN_SIZE"
+            | "TO_REGCLASS"
+            | "TO_REGROLE"
+            | "TO_REGNAMESPACE"
+            | "TO_REGTYPE"
+            | "TO_REGPROC"
+            | "TO_REGPROCEDURE"
+            | "TO_REGOPER"
+            | "TO_REGOPERATOR"
             | "TO_REGCOLLATION"
-            | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_TOTAL_RELATION_SIZE"
-            | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" | "PG_RELATION_IS_UPDATABLE"
-            | "PG_SNAPSHOT_XMIN" | "PG_SNAPSHOT_XMAX" | "PG_WAL_LSN_DIFF" | "PG_SIZE_BYTES"
-            | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_SEQUENCE_LAST_VALUE" => {
-                Type::INT8
-            }
-            "PG_IS_IN_RECOVERY" | "PG_TABLE_IS_VISIBLE" | "PG_TYPE_IS_VISIBLE"
-            | "PG_FUNCTION_IS_VISIBLE" | "PG_COLUMN_IS_UPDATABLE" | "PG_OPERATOR_IS_VISIBLE"
-            | "PG_COLLATION_IS_VISIBLE" | "PG_JIT_AVAILABLE" | "PG_TRY_ADVISORY_LOCK"
-            | "PG_ADVISORY_UNLOCK" | "PG_TRY_ADVISORY_LOCK_SHARED"
-            | "PG_ADVISORY_UNLOCK_SHARED" | "PG_TRY_ADVISORY_XACT_LOCK"
-            | "PG_TRY_ADVISORY_XACT_LOCK_SHARED" | "PG_RELOAD_CONF"
-            | "PG_ROTATE_LOGFILE" | "PG_VISIBLE_IN_SNAPSHOT" | "PG_CANCEL_BACKEND"
-            | "PG_TERMINATE_BACKEND" | "PG_IS_WAL_REPLAY_PAUSED" | "PG_IS_IN_BACKUP"
-            | "PG_PROMOTE" => {
-                Type::BOOL
-            }
-            "PG_TYPEOF" | "GETDATABASEENCODING" | "PG_CLIENT_ENCODING" | "PG_SIZE_PRETTY"
-            | "FORMAT_TYPE" | "PG_GET_USERBYID" | "PG_GET_INDEXDEF" | "PG_DESCRIBE_OBJECT"
-            | "PG_IDENTIFY_OBJECT" | "CURRENT_QUERY" | "TXID_STATUS" | "PG_XACT_STATUS"
-            | "PG_EXPORT_SNAPSHOT" | "PG_CURRENT_SNAPSHOT" | "TXID_CURRENT_SNAPSHOT"
-            | "PG_CURRENT_WAL_LSN" | "PG_CURRENT_WAL_INSERT_LSN"
-            | "PG_CURRENT_WAL_FLUSH_LSN" | "PG_WALFILE_NAME" | "PG_WALFILE_NAME_OFFSET"
-            | "PG_SWITCH_WAL" | "PG_SWITCH_XLOG" | "PG_LAST_WAL_RECEIVE_LSN"
-            | "PG_LAST_WAL_REPLAY_LSN" | "PG_LAST_XACT_REPLAY_TIMESTAMP"
-            | "PG_BACKUP_START_TIME" | "PG_BACKUP_START" | "PG_START_BACKUP"
-            | "PG_BACKUP_STOP" | "PG_STOP_BACKUP" | "PG_CREATE_RESTORE_POINT"
-            | "PG_LISTENING_CHANNELS" | "PG_GET_SERIAL_SEQUENCE" => {
-                Type::VARCHAR
-            }
-            "SETSEED" | "PG_SLEEP" | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED"
-            | "PG_ADVISORY_XACT_LOCK" | "PG_ADVISORY_XACT_LOCK_SHARED"
-            | "PG_ADVISORY_UNLOCK_ALL" | "PG_NOTIFY" | "PG_WAL_REPLAY_PAUSE"
-            | "PG_WAL_REPLAY_RESUME" => {
-                Type::VARCHAR
-            } // void; returned as NULL
+            | "PG_RELATION_SIZE"
+            | "PG_TABLE_SIZE"
+            | "PG_TOTAL_RELATION_SIZE"
+            | "PG_INDEXES_SIZE"
+            | "PG_DATABASE_SIZE"
+            | "PG_RELATION_IS_UPDATABLE"
+            | "PG_SNAPSHOT_XMIN"
+            | "PG_SNAPSHOT_XMAX"
+            | "PG_WAL_LSN_DIFF"
+            | "PG_SIZE_BYTES"
+            | "NEXTVAL"
+            | "CURRVAL"
+            | "LASTVAL"
+            | "SETVAL"
+            | "PG_SEQUENCE_LAST_VALUE" => Type::INT8,
+            "PG_IS_IN_RECOVERY"
+            | "PG_TABLE_IS_VISIBLE"
+            | "PG_TYPE_IS_VISIBLE"
+            | "PG_FUNCTION_IS_VISIBLE"
+            | "PG_COLUMN_IS_UPDATABLE"
+            | "PG_OPERATOR_IS_VISIBLE"
+            | "PG_COLLATION_IS_VISIBLE"
+            | "PG_JIT_AVAILABLE"
+            | "PG_TRY_ADVISORY_LOCK"
+            | "PG_ADVISORY_UNLOCK"
+            | "PG_TRY_ADVISORY_LOCK_SHARED"
+            | "PG_ADVISORY_UNLOCK_SHARED"
+            | "PG_TRY_ADVISORY_XACT_LOCK"
+            | "PG_TRY_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_RELOAD_CONF"
+            | "PG_ROTATE_LOGFILE"
+            | "PG_VISIBLE_IN_SNAPSHOT"
+            | "PG_CANCEL_BACKEND"
+            | "PG_TERMINATE_BACKEND"
+            | "PG_IS_WAL_REPLAY_PAUSED"
+            | "PG_IS_IN_BACKUP"
+            | "PG_PROMOTE" => Type::BOOL,
+            "PG_TYPEOF"
+            | "GETDATABASEENCODING"
+            | "PG_CLIENT_ENCODING"
+            | "PG_SIZE_PRETTY"
+            | "FORMAT_TYPE"
+            | "PG_GET_USERBYID"
+            | "PG_GET_INDEXDEF"
+            | "PG_DESCRIBE_OBJECT"
+            | "PG_IDENTIFY_OBJECT"
+            | "CURRENT_QUERY"
+            | "TXID_STATUS"
+            | "PG_XACT_STATUS"
+            | "PG_EXPORT_SNAPSHOT"
+            | "PG_CURRENT_SNAPSHOT"
+            | "TXID_CURRENT_SNAPSHOT"
+            | "PG_CURRENT_WAL_LSN"
+            | "PG_CURRENT_WAL_INSERT_LSN"
+            | "PG_CURRENT_WAL_FLUSH_LSN"
+            | "PG_WALFILE_NAME"
+            | "PG_WALFILE_NAME_OFFSET"
+            | "PG_SWITCH_WAL"
+            | "PG_SWITCH_XLOG"
+            | "PG_LAST_WAL_RECEIVE_LSN"
+            | "PG_LAST_WAL_REPLAY_LSN"
+            | "PG_LAST_XACT_REPLAY_TIMESTAMP"
+            | "PG_BACKUP_START_TIME"
+            | "PG_BACKUP_START"
+            | "PG_START_BACKUP"
+            | "PG_BACKUP_STOP"
+            | "PG_STOP_BACKUP"
+            | "PG_CREATE_RESTORE_POINT"
+            | "PG_LISTENING_CHANNELS"
+            | "PG_GET_SERIAL_SEQUENCE" => Type::VARCHAR,
+            "SETSEED"
+            | "PG_SLEEP"
+            | "PG_ADVISORY_LOCK"
+            | "PG_ADVISORY_LOCK_SHARED"
+            | "PG_ADVISORY_XACT_LOCK"
+            | "PG_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_ADVISORY_UNLOCK_ALL"
+            | "PG_NOTIFY"
+            | "PG_WAL_REPLAY_PAUSE"
+            | "PG_WAL_REPLAY_RESUME" => Type::VARCHAR, // void; returned as NULL
             "GREATEST" | "LEAST" => {
                 if let Some(first) = args.first() {
                     expr_pg_type(first, engine)
@@ -827,11 +1087,9 @@ fn expr_pg_type(expr: &Expression, engine: &TakyonicEngine) -> Type {
             }
             "LOWER" | "UPPER" | "TRIM" | "BTRIM" | "LTRIM" | "RTRIM" | "SUBSTRING" | "SUBSTR"
             | "CONCAT" | "CONCAT_WS" | "FORMAT" | "QUOTE_IDENT" | "QUOTE_LITERAL"
-            | "QUOTE_NULLABLE" | "REPLACE"
-            | "REGEXP_REPLACE" | "LPAD" | "RPAD" | "REPEAT" | "LEFT" | "RIGHT" | "REVERSE"
-            | "INITCAP" | "CHR" | "MD5" | "ENCODE" | "DECODE" | "OVERLAY" | "TRANSLATE" => {
-                Type::VARCHAR
-            }
+            | "QUOTE_NULLABLE" | "REPLACE" | "REGEXP_REPLACE" | "LPAD" | "RPAD" | "REPEAT"
+            | "LEFT" | "RIGHT" | "REVERSE" | "INITCAP" | "CHR" | "MD5" | "ENCODE" | "DECODE"
+            | "OVERLAY" | "TRANSLATE" => Type::VARCHAR,
             _ if !args.is_empty() => expr_pg_type(&args[0], engine),
             _ => Type::VARCHAR,
         },
@@ -859,6 +1117,9 @@ pub struct SessionState {
     pub portals: HashMap<String, BoundPlan>,
     /// Explicit transaction workspace when [`SessionTxnMode::InTransaction`].
     active_txn: Option<Transaction>,
+    /// Postgres-style aborted transaction: statements are rejected until
+    /// `ROLLBACK` / `COMMIT` (which discards the block).
+    txn_failed: bool,
     /// Authorization context after authentication (`current_user` + roles).
     auth: AuthContext,
     /// `search_path` GUC (comma-separated schema list).
@@ -909,6 +1170,7 @@ impl SessionState {
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
             active_txn: None,
+            txn_failed: false,
             auth,
             search_path: "public".into(),
             transaction_isolation: "repeatable read".into(),
@@ -952,11 +1214,7 @@ impl SessionState {
     }
 
     /// Dump table as TSV text (`COPY table TO STDOUT`).
-    pub fn copy_to_tsv(
-        &mut self,
-        table: &str,
-        columns: &[String],
-    ) -> crate::error::Result<String> {
+    pub fn copy_to_tsv(&mut self, table: &str, columns: &[String]) -> crate::error::Result<String> {
         copy_table_to_tsv(self, table, columns)
     }
 
@@ -1078,9 +1336,9 @@ impl SessionState {
             return shard_ids.iter().all(|id| map.contains_key(id));
         }
         shard_ids.iter().all(|id| {
-            workers.iter().any(|w| {
-                w.node_id == *id && w.address.parse::<SocketAddr>().is_ok()
-            })
+            workers
+                .iter()
+                .any(|w| w.node_id == *id && w.address.parse::<SocketAddr>().is_ok())
         })
     }
 
@@ -1115,9 +1373,7 @@ impl SessionState {
                     ))
                 })?;
             let sock: SocketAddr = addr.parse().map_err(|e| {
-                crate::error::TakyonicError::Config(format!(
-                    "bad twopc shard addr `{addr}`: {e}"
-                ))
+                crate::error::TakyonicError::Config(format!("bad twopc shard addr `{addr}`: {e}"))
             })?;
             let remote = connect_remote_shard_blocking(*id, sock)?;
             out.push(remote as Arc<dyn ShardParticipant>);
@@ -1234,6 +1490,14 @@ impl SessionState {
         }
     }
 
+    /// `true` after a statement error inside an explicit transaction.
+    ///
+    /// ReadyForQuery reports `E` until the block ends. Further statements
+    /// (except `COMMIT` / `ROLLBACK`) fail with SQLSTATE `25P02`.
+    pub fn txn_aborted(&self) -> bool {
+        self.txn_failed
+    }
+
     /// `Parse`: SQL → [`LogicalPlan`], store under `name`.
     pub fn parse(&mut self, name: impl Into<String>, sql: &str) -> crate::error::Result<()> {
         let plan = SqlEngine::plan(sql)?;
@@ -1257,10 +1521,8 @@ impl SessionState {
                     "prepared statement `{statement_name}` not found"
                 ))
             })?;
-        self.portals.insert(
-            portal_name.into(),
-            BoundPlan { plan, parameters },
-        );
+        self.portals
+            .insert(portal_name.into(), BoundPlan { plan, parameters });
         Ok(())
     }
 
@@ -1269,15 +1531,56 @@ impl SessionState {
     /// Catalog introspection (`pg_catalog` / `information_schema`, including
     /// psql `\dt`) is answered from the table catalog before planning.
     pub fn execute_sql(&mut self, sql: &str) -> crate::error::Result<SessionResult> {
+        if self.txn_failed && !is_txn_terminator(sql) {
+            return Err(aborted_txn_error());
+        }
         let tables = self.engine.list_table_schemas();
-        if let Some(result) = crate::pg_catalog::try_handle(sql, &tables, self.auth.user.as_str())
-        {
+        if let Some(result) = crate::pg_catalog::try_handle(sql, &tables, self.auth.user.as_str()) {
             return Ok(result);
         }
-        let plan = SqlEngine::plan(sql)?;
+        let plan = match SqlEngine::plan(sql) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.note_stmt_error();
+                return Err(e);
+            }
+        };
         self.current_query = Some(sql.to_string());
         let result = self.run_plan(&plan, Vec::new());
         self.current_query = None;
+        result
+    }
+
+    /// Run a simple-query script (`stmt; stmt; …`).
+    ///
+    /// One statement uses [`Self::execute_sql`] (catalog stubs included).
+    /// Several statements are planned and run in order; the first error stops
+    /// the script after earlier statements have already executed.
+    pub fn execute_simple_script(&mut self, sql: &str) -> crate::error::Result<Vec<SessionResult>> {
+        let plans = SqlEngine::plan_script(sql)?;
+        if plans.len() <= 1 {
+            return Ok(vec![self.execute_sql(sql)?]);
+        }
+        let mut out = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            out.push(self.run_plan(plan, Vec::new())?);
+        }
+        Ok(out)
+    }
+
+    fn note_stmt_error(&mut self) {
+        if self.active_txn.is_some() {
+            self.txn_failed = true;
+        }
+    }
+
+    fn finish_query_result(&self, plan: &LogicalPlan, rows: Vec<Record>) -> SessionResult {
+        let mut result = SessionResult::from_data_plan(plan, rows);
+        if result.column_order.is_none() {
+            if let Some(order) = star_scan_column_order(plan, self.engine.as_ref()) {
+                result.column_order = Some(order);
+            }
+        }
         result
     }
 
@@ -1297,9 +1600,13 @@ impl SessionState {
         params: Vec<Value>,
     ) -> crate::error::Result<SessionResult> {
         let result = self.run_plan_body(plan, params);
+        if result.is_err() {
+            self.note_stmt_error();
+        }
         // Transaction-scoped advisory locks release when not in an explicit txn
         // (COMMIT/ROLLBACK already cleared `active_txn`; auto-commit statements too).
         if self.active_txn.is_none() {
+            self.txn_failed = false;
             let _ = crate::sql::pg_advisory_xact_unlock_all(self.session_id);
         }
         result
@@ -1311,6 +1618,9 @@ impl SessionState {
         params: Vec<Value>,
     ) -> crate::error::Result<SessionResult> {
         self.authorize(plan)?;
+        if self.txn_failed && !matches!(plan, LogicalPlan::Commit | LogicalPlan::Rollback) {
+            return Err(aborted_txn_error());
+        }
         match plan {
             LogicalPlan::Begin => {
                 if self.active_txn.is_some() {
@@ -1326,6 +1636,13 @@ impl SessionState {
                 let txn = self.active_txn.take().ok_or_else(|| {
                     crate::error::TakyonicError::Sql("there is no transaction in progress".into())
                 })?;
+                // PostgreSQL: COMMIT of an aborted block discards it and reports ROLLBACK.
+                if self.txn_failed {
+                    txn.abort();
+                    self.txn_failed = false;
+                    self.restore_local_gucs();
+                    return Ok(SessionResult::command("ROLLBACK"));
+                }
                 match self.commit_active_txn(txn) {
                     Ok(()) => {
                         self.restore_local_gucs();
@@ -1342,6 +1659,7 @@ impl SessionState {
                     crate::error::TakyonicError::Sql("there is no transaction in progress".into())
                 })?;
                 txn.abort();
+                self.txn_failed = false;
                 self.restore_local_gucs();
                 Ok(SessionResult::command("ROLLBACK"))
             }
@@ -1351,25 +1669,23 @@ impl SessionState {
                 column,
                 if_not_exists,
                 vector,
-            } => {
-                match vector {
-                    Some(spec) => {
-                        self.engine.create_vector_index(
-                            name,
-                            table,
-                            column,
-                            *if_not_exists,
-                            spec.clone(),
-                        )?;
-                        Ok(SessionResult::command("CREATE VECTOR INDEX"))
-                    }
-                    None => {
-                        self.engine
-                            .create_index(name, table, column, *if_not_exists)?;
-                        Ok(SessionResult::command("CREATE INDEX"))
-                    }
+            } => match vector {
+                Some(spec) => {
+                    self.engine.create_vector_index(
+                        name,
+                        table,
+                        column,
+                        *if_not_exists,
+                        spec.clone(),
+                    )?;
+                    Ok(SessionResult::command("CREATE VECTOR INDEX"))
                 }
-            }
+                None => {
+                    self.engine
+                        .create_index(name, table, column, *if_not_exists)?;
+                    Ok(SessionResult::command("CREATE INDEX"))
+                }
+            },
             LogicalPlan::CreateTable {
                 name,
                 primary_key,
@@ -1377,12 +1693,8 @@ impl SessionState {
                 if_not_exists,
                 serial_columns,
             } => {
-                self.engine.create_table(
-                    name,
-                    primary_key,
-                    columns.clone(),
-                    *if_not_exists,
-                )?;
+                self.engine
+                    .create_table(name, primary_key, columns.clone(), *if_not_exists)?;
                 for col in serial_columns {
                     crate::sql::create_serial_sequence(name, col)?;
                 }
@@ -1493,8 +1805,7 @@ impl SessionState {
                     .iter()
                     .map(|c| ColumnSpec::new(c.clone(), "TEXT"))
                     .collect();
-                self.engine
-                    .create_table(name, &primary_key, specs, false)?;
+                self.engine.create_table(name, &primary_key, specs, false)?;
                 if !rows.is_empty() {
                     let mut txn = self.begin_txn()?;
                     for row in rows {
@@ -1549,8 +1860,7 @@ impl SessionState {
                 table,
                 grantee,
             } => {
-                self.engine
-                    .grant_privilege(grantee, table, privileges)?;
+                self.engine.grant_privilege(grantee, table, privileges)?;
                 Ok(SessionResult::command("GRANT"))
             }
             LogicalPlan::Revoke {
@@ -1558,8 +1868,7 @@ impl SessionState {
                 table,
                 grantee,
             } => {
-                self.engine
-                    .revoke_privilege(grantee, table, privileges)?;
+                self.engine.revoke_privilege(grantee, table, privileges)?;
                 Ok(SessionResult::command("REVOKE"))
             }
             LogicalPlan::GrantSchema {
@@ -1585,8 +1894,7 @@ impl SessionState {
                 table,
                 grantee,
             } => {
-                self.engine
-                    .grant_column_privilege(grantee, table, specs)?;
+                self.engine.grant_column_privilege(grantee, table, specs)?;
                 Ok(SessionResult::command("GRANT"))
             }
             LogicalPlan::RevokeColumn {
@@ -1594,8 +1902,7 @@ impl SessionState {
                 table,
                 grantee,
             } => {
-                self.engine
-                    .revoke_column_privilege(grantee, table, specs)?;
+                self.engine.revoke_column_privilege(grantee, table, specs)?;
                 Ok(SessionResult::command("REVOKE"))
             }
             LogicalPlan::GrantRole { role, member } => {
@@ -1636,14 +1943,16 @@ impl SessionState {
                 let stats = self.engine.vacuum_table(table)?;
                 Ok(SessionResult {
                     tag: "VACUUM",
-                    rows: vec![Record::new()
-                        .set("table", stats.table)
-                        .set("watermark", stats.watermark.to_string())
-                        .set("removed", stats.memtable_removed.to_string())
-                        .set("versions_before", stats.versions_before.to_string())
-                        .set("versions_after", stats.versions_after.to_string())
-                        .set("dead_heap", stats.dead_heap_versions.to_string())
-                        .set("dead_index", stats.dead_index_versions.to_string())],
+                    rows: vec![
+                        Record::new()
+                            .set("table", stats.table)
+                            .set("watermark", stats.watermark.to_string())
+                            .set("removed", stats.memtable_removed.to_string())
+                            .set("versions_before", stats.versions_before.to_string())
+                            .set("versions_after", stats.versions_after.to_string())
+                            .set("dead_heap", stats.dead_heap_versions.to_string())
+                            .set("dead_index", stats.dead_index_versions.to_string()),
+                    ],
                     affected: None,
                     column_order: None,
                 })
@@ -1725,7 +2034,9 @@ impl SessionState {
                         self.engine
                             .set_column_comment(table, col, comment.as_deref())?;
                     }
-                    "role" => self.engine.set_shared_comment("role", table, comment.as_deref())?,
+                    "role" => self
+                        .engine
+                        .set_shared_comment("role", table, comment.as_deref())?,
                     "database" => {
                         self.engine
                             .set_shared_comment("database", table, comment.as_deref())?
@@ -1793,7 +2104,7 @@ impl SessionState {
                 crate::sql::clear_guc_overlay();
                 if let Some(rows) = self.try_mpp_execute(other, params.clone())? {
                     self.apply_guc_overlay();
-                    return Ok(SessionResult::from_data_plan(other, rows));
+                    return Ok(self.finish_query_result(other, rows));
                 }
                 let ctx = self.execution_context(params);
                 let rows = if let Some(txn) = self.active_txn.as_mut() {
@@ -1804,7 +2115,7 @@ impl SessionState {
                     executor::execute_plan_autocommit(other, &ctx, self.begin_txn()?)?
                 };
                 self.apply_guc_overlay();
-                Ok(SessionResult::from_data_plan(other, rows))
+                Ok(self.finish_query_result(other, rows))
             }
         }
     }
@@ -1860,23 +2171,18 @@ impl SessionState {
                 group_exprs,
                 aggr_exprs,
             } => {
-                let Ok((table, group_col, agg)) =
-                    dist_agg_params(input, group_exprs, aggr_exprs)
+                let Ok((table, group_col, agg)) = dist_agg_params(input, group_exprs, aggr_exprs)
                 else {
                     // Unsupported shape → local Volcano (EXPLAIN stays local via
                     // [`maybe_distribute`] filter; this is a safety net).
                     return Ok(None);
                 };
                 let coord = self.engine.mpp_coordinator()?;
-                let rows =
-                    coord.execute_distributed_aggregate(&table, &group_col, agg)?;
+                let rows = coord.execute_distributed_aggregate(&table, &group_col, agg)?;
                 Ok(Some(rows))
             }
             LogicalPlan::DistributedJoin {
-                left,
-                right,
-                on,
-                ..
+                left, right, on, ..
             } => {
                 let (left_table, left_pred) = mpp_scan_source(left)?;
                 let (right_table, right_pred) = mpp_scan_source(right)?;
@@ -1891,9 +2197,7 @@ impl SessionState {
                 Ok(Some(rows))
             }
             LogicalPlan::Select {
-                table,
-                predicate,
-                ..
+                table, predicate, ..
             } => {
                 // Partitioned tables: RemoteWorker fetch via Coordinator (C2).
                 let schema = match self.engine.table_schema(table) {
@@ -1907,8 +2211,7 @@ impl SessionState {
                     return Ok(None);
                 }
                 let coord = self.engine.mpp_coordinator()?;
-                let rows =
-                    coord.execute_distributed_scan(table, predicate.as_ref())?;
+                let rows = coord.execute_distributed_scan(table, predicate.as_ref())?;
                 Ok(Some(rows))
             }
             LogicalPlan::Insert {
@@ -1937,8 +2240,7 @@ impl SessionState {
                     return Ok(None);
                 }
                 let ctx = self.execution_context(params);
-                let records =
-                    executor::materialize_insert_records(columns, values, &ctx)?;
+                let records = executor::materialize_insert_records(columns, values, &ctx)?;
                 let coord = self.engine.mpp_coordinator()?;
                 let n = coord.execute_insert_rows(table, records)?;
                 Ok(Some(vec![Record::new().set("rows", n.to_string())]))
@@ -1974,8 +2276,7 @@ impl SessionState {
     pub fn sync(&mut self) {
         self.portals.clear();
         self.prepared_statements.remove("");
-        self.prepared_statements
-            .remove(pgwire::api::DEFAULT_NAME);
+        self.prepared_statements.remove(pgwire::api::DEFAULT_NAME);
     }
 }
 
@@ -1991,9 +2292,9 @@ fn peel_mpp_explain(plan: &LogicalPlan) -> Option<String> {
             group_exprs.len(),
             aggr_exprs.len(),
         )),
-        LogicalPlan::DistributedJoin { distribution, .. } => Some(format!(
-            "DistributedJoin(distribution={distribution:?})"
-        )),
+        LogicalPlan::DistributedJoin { distribution, .. } => {
+            Some(format!("DistributedJoin(distribution={distribution:?})"))
+        }
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -2044,20 +2345,17 @@ fn dist_agg_params(
             )));
         }
     };
-    let (group_col, agg) = crate::mpp::extract_simple_agg(group_exprs, aggr_exprs)
-        .ok_or_else(|| {
+    let (group_col, agg) =
+        crate::mpp::extract_simple_agg(group_exprs, aggr_exprs).ok_or_else(|| {
             crate::error::TakyonicError::Sql(
-                "DistributedAggregate requires single GROUP BY col + SUM|COUNT|MIN|MAX|AVG"
-                    .into(),
+                "DistributedAggregate requires single GROUP BY col + SUM|COUNT|MIN|MAX|AVG".into(),
             )
         })?;
     Ok((table, group_col, agg))
 }
 
 /// Table + optional predicate for an MPP scan leaf (unwrap Project/Filter).
-fn mpp_scan_source(
-    plan: &LogicalPlan,
-) -> crate::error::Result<(String, Option<Expression>)> {
+fn mpp_scan_source(plan: &LogicalPlan) -> crate::error::Result<(String, Option<Expression>)> {
     match plan {
         LogicalPlan::Select {
             table, predicate, ..
@@ -2331,7 +2629,9 @@ impl TakyonicAuthSource {
 
     /// Catalog with the bootstrap `postgres` / `password` role (standalone tests).
     pub fn with_bootstrap_user() -> Self {
-        Self::new(Arc::new(parking_lot::RwLock::new(AuthCatalog::with_bootstrap())))
+        Self::new(Arc::new(parking_lot::RwLock::new(
+            AuthCatalog::with_bootstrap(),
+        )))
     }
 
     /// PBKDF2 iteration count advertised to SCRAM clients.
@@ -2388,6 +2688,38 @@ fn scram_startup_handler(
     let mut scram = ScramAuth::new(auth_source);
     scram.set_iterations(iterations);
     Arc::new(SASLAuthStartupHandler::new(params).with_scram(scram))
+}
+
+/// Assigns a unique backend pid before SCRAM finishes.
+///
+/// pgwire leaves `BackendKeyData` at `(0, 0)` unless the server sets it.
+/// Sessions are keyed by that pid, so every connection would share one
+/// transaction workspace and see each other's uncommitted writes.
+struct PidAssigningStartup {
+    inner: Arc<SASLAuthStartupHandler<DefaultServerParameterProvider>>,
+    next_pid: Arc<AtomicI32>,
+}
+
+#[async_trait]
+impl StartupHandler for PidAssigningStartup {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if client.pid_and_secret_key().0 == 0 {
+            let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
+            let secret = pid.wrapping_mul(0x5bd1_e995).wrapping_add(0x1234_5679);
+            let secret = if secret == 0 { 1 } else { secret };
+            client.set_pid_and_secret_key(pid, pgwire::messages::startup::SecretKey::I32(secret));
+        }
+        self.inner.on_startup(client, message).await
+    }
 }
 
 /// Parse SQL into a [`LogicalPlan`] for the extended query protocol.
@@ -2533,13 +2865,24 @@ fn session_result_to_response_with_hints(
     result: SessionResult,
     type_hints: &std::collections::HashMap<String, String>,
 ) -> PgWireResult<Response> {
+    session_result_to_response_formatted(result, type_hints, &[], None)
+}
+
+/// Like [`session_result_to_response_with_hints`], but extended-query callers
+/// pass the Describe column types and the Bind result-column format.
+///
+/// `tokio-postgres` asks for binary results and decodes them with the OIDs
+/// from `ParameterDescription` / `RowDescription`. Text bytes for an `INT4`
+/// column fail that decode.
+fn session_result_to_response_formatted(
+    result: SessionResult,
+    type_hints: &std::collections::HashMap<String, String>,
+    described: &[(String, Type)],
+    result_format: Option<&pgwire::api::portal::Format>,
+) -> PgWireResult<Response> {
     match result.tag {
         "COPY_IN" => {
-            let ncols = result
-                .affected
-                .map(|n| n as usize)
-                .unwrap_or(1)
-                .max(1);
+            let ncols = result.affected.map(|n| n as usize).unwrap_or(1).max(1);
             Ok(Response::CopyIn(CopyResponse::new(
                 0,
                 ncols,
@@ -2548,20 +2891,24 @@ fn session_result_to_response_with_hints(
         }
         "COPY_OUT" => {
             // Handled specially in SimpleQueryHandler (streams CopyData).
-            Ok(Response::Execution(Tag::new("COPY").with_rows(
-                result.affected.unwrap_or(0) as usize,
-            )))
+            Ok(Response::Execution(
+                Tag::new("COPY").with_rows(result.affected.unwrap_or(0) as usize),
+            ))
         }
         "SELECT" => encode_select_response(
             result.rows,
             type_hints,
             result.column_order.as_deref(),
+            described,
+            result_format,
         ),
         "INSERT" | "UPDATE" | "DELETE" if !result.rows.is_empty() => {
             let mut resp = encode_select_response(
                 result.rows,
                 type_hints,
                 result.column_order.as_deref(),
+                described,
+                result_format,
             )?;
             if let Response::Query(ref mut q) = resp {
                 let tag = match result.tag {
@@ -2583,6 +2930,10 @@ fn session_result_to_response_with_hints(
         "DELETE" => Ok(Response::Execution(
             Tag::new("DELETE").with_rows(result.affected.unwrap_or(0) as usize),
         )),
+        // pgwire promotes these to ReadyForQuery 'T' / 'I'. `Execution` would
+        // leave the session looking idle to psql and drivers.
+        "BEGIN" => Ok(Response::TransactionStart(Tag::new("BEGIN"))),
+        "COMMIT" | "ROLLBACK" => Ok(Response::TransactionEnd(Tag::new(result.tag))),
         other => Ok(Response::Execution(Tag::new(other))),
     }
 }
@@ -2606,6 +2957,33 @@ impl SimpleQueryHandler for TakyonicPgBackend {
         }
 
         let session = self.session_arc_for(client);
+        // Multiple statements are a script. A single statement (or anything the
+        // script parser rejects) goes through `execute_sql`, which answers
+        // pg_catalog stubs before planning.
+        let script = SqlEngine::plan_script(sql)
+            .ok()
+            .filter(|plans| plans.len() > 1);
+        if let Some(script) = script {
+            let hints = self.engine.column_type_hints();
+            let mut responses = Vec::with_capacity(script.len());
+            for plan in &script {
+                match session.lock().run_plan(plan, Vec::new()) {
+                    Ok(result) => {
+                        responses.push(session_result_to_response_with_hints(result, &hints)?);
+                    }
+                    Err(e) => {
+                        // Keep CommandComplete for earlier statements in this
+                        // simple-query message, then stop. pgwire turns
+                        // `Response::Error` into ErrorResponse and, after
+                        // `BEGIN`, ReadyForQuery status `E`.
+                        responses.push(Response::Error(Box::new(error_info(&e))));
+                        break;
+                    }
+                }
+            }
+            return Ok(responses);
+        }
+
         let result = session.lock().execute_sql(sql).map_err(sql_err)?;
         if result.tag == "COPY_OUT" {
             let tsv = result
@@ -2728,15 +3106,22 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
                 .map_err(sql_err)?;
         }
 
-        let types: Vec<Option<Type>> = message
+        let specified: Vec<Option<Type>> = message
             .type_oids
             .iter()
             .map(|oid| Type::from_oid(*oid))
             .collect();
         let plan = self
             .query_parser()
-            .parse_sql(client, &message.query, &types)
+            .parse_sql(client, &message.query, &specified)
             .await?;
+        // Clients such as tokio-postgres send an empty OID list and encode
+        // Bind parameters from the types we return in ParameterDescription.
+        // Persist that inference so binary INT4/INT8 values decode.
+        let types: Vec<Option<Type>> = described_param_types(&plan, &specified, &self.engine)
+            .into_iter()
+            .map(Some)
+            .collect();
         let stmt = StoredStatement::new(name, plan, types);
         client.portal_store().put_statement(Arc::new(stmt));
         client
@@ -2779,12 +3164,9 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
             .ok_or_else(|| PgWireError::StatementNotFound(statement_name.to_owned()))?;
 
         let format = bind_param_format(&message.parameter_format_codes);
-        let parameters = decode_bind_parameters(
-            &message.parameters,
-            &stored.parameter_types,
-            &format,
-        )
-        .map_err(sql_err)?;
+        let parameters =
+            decode_bind_parameters(&message.parameters, &stored.parameter_types, &format)
+                .map_err(sql_err)?;
 
         {
             let session = self.session_arc_for(client);
@@ -2815,7 +3197,12 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.session_arc_for(client).lock().sync();
+        {
+            let session = self.session_arc_for(client);
+            let mut guard = session.lock();
+            guard.sync();
+            publish_session_txn_status(client, &guard);
+        }
         client
             .send(PgWireBackendMessage::ReadyForQuery(
                 pgwire::messages::response::ReadyForQuery::new(client.transaction_status()),
@@ -2854,7 +3241,88 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
 
         let result = session.lock().run_plan(&plan, params).map_err(sql_err)?;
         let hints = self.engine.column_type_hints();
-        session_result_to_response_with_hints(result, &hints)
+        let described = describe_plan_columns(&plan, &self.engine);
+        session_result_to_response_formatted(
+            result,
+            &hints,
+            &described,
+            Some(&portal.result_column_format),
+        )
+    }
+
+    async fn on_describe<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Describe,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo
+            + pgwire::api::ClientPortalStore
+            + Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
+        use pgwire::messages::extendedquery::{
+            TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+        };
+
+        let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                let stmt = client
+                    .portal_store()
+                    .get_statement(name)
+                    .ok_or_else(|| PgWireError::StatementNotFound(name.to_owned()))?;
+                let described = self.do_describe_statement(client, &stmt).await?;
+                client
+                    .send(PgWireBackendMessage::ParameterDescription(
+                        ParameterDescription::new(
+                            described.parameters.iter().map(|t| t.oid()).collect(),
+                        ),
+                    ))
+                    .await?;
+                // `DescribeStatementResponse::is_no_data` is true only when
+                // parameters are empty too. An INSERT with `$n` placeholders
+                // and no RETURNING must still be NoData, not a 0-field
+                // RowDescription.
+                if described.fields.is_empty() {
+                    client
+                        .send(PgWireBackendMessage::NoData(NoData::new()))
+                        .await?;
+                } else {
+                    client
+                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                            described.fields.iter().map(Into::into).collect(),
+                        )))
+                        .await?;
+                }
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                let portal = client
+                    .portal_store()
+                    .get_portal(name)
+                    .ok_or_else(|| PgWireError::PortalNotFound(name.to_owned()))?;
+                let described = self.do_describe_portal(client, &portal).await?;
+                if described.fields.is_empty() {
+                    client
+                        .send(PgWireBackendMessage::NoData(NoData::new()))
+                        .await?;
+                } else {
+                    client
+                        .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                            described.fields.iter().map(Into::into).collect(),
+                        )))
+                        .await?;
+                }
+            }
+            _ => return Err(PgWireError::InvalidTargetType(message.target_type)),
+        }
+        Ok(())
     }
 
     async fn do_describe_statement<C>(
@@ -2865,11 +3333,8 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let param_types: Vec<Type> = stmt
-            .parameter_types
-            .iter()
-            .map(|t| t.clone().unwrap_or(Type::UNKNOWN))
-            .collect();
+        let param_types =
+            described_param_types(&stmt.statement, &stmt.parameter_types, &self.engine);
         let fields = describe_plan_fields(&stmt.statement, &self.engine);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -2888,23 +3353,136 @@ impl ExtendedQueryHandler for TakyonicPgBackend {
 }
 
 fn sql_err(e: crate::error::TakyonicError) -> PgWireError {
-    let sqlstate = match &e {
+    PgWireError::UserError(Box::new(error_info(&e)))
+}
+
+fn error_info(e: &crate::error::TakyonicError) -> ErrorInfo {
+    let msg = e.to_string();
+    let sqlstate = match e {
         crate::error::TakyonicError::PermissionDenied(_) => "42501",
+        crate::error::TakyonicError::Conflict(_) => "40001",
+        crate::error::TakyonicError::Sql(s) if s.contains("current transaction is aborted") => {
+            "25P02"
+        }
+        crate::error::TakyonicError::Sql(s) if s.starts_with("parse error") => "42601",
+        crate::error::TakyonicError::Sql(s) if s.contains("does not exist") => "42P01",
         _ => "XX000",
     };
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".into(),
-        sqlstate.into(),
-        e.to_string(),
-    )))
+    ErrorInfo::new("ERROR".into(), sqlstate.into(), msg)
+}
+
+/// Publish ReadyForQuery status from the session's transaction state.
+fn publish_session_txn_status<C: ClientInfo>(client: &mut C, session: &SessionState) {
+    let status = if session.txn_aborted() {
+        TransactionStatus::Error
+    } else if session.txn_mode() == SessionTxnMode::InTransaction {
+        TransactionStatus::Transaction
+    } else {
+        TransactionStatus::Idle
+    };
+    client.set_transaction_status(status);
+}
+
+fn aborted_txn_error() -> crate::error::TakyonicError {
+    crate::error::TakyonicError::Sql(
+        "current transaction is aborted, commands ignored until end of transaction block".into(),
+    )
+}
+
+/// `COMMIT` / `ROLLBACK` (and the `END` / `ABORT` aliases) end a transaction block.
+fn is_txn_terminator(sql: &str) -> bool {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let first = t.split_whitespace().next().unwrap_or("");
+    matches!(
+        first.to_ascii_uppercase().as_str(),
+        "COMMIT" | "ROLLBACK" | "END" | "ABORT"
+    )
+}
+
+/// Table column order for `SELECT *` (including Sort/Limit/Filter wrappers).
+fn star_scan_column_order(plan: &LogicalPlan, engine: &TakyonicEngine) -> Option<Vec<String>> {
+    let table = single_table_scan(plan)?;
+    let schema = engine.table_schema(&table).ok()?;
+    if schema.columns.is_empty() {
+        return Some(vec![schema.primary_key]);
+    }
+    Some(schema.columns.iter().map(|c| c.name.clone()).collect())
+}
+
+fn single_table_scan(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Select { table, .. } => Some(table.clone()),
+        LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::DistinctOn { input, .. } => single_table_scan(input),
+        _ => None,
+    }
+}
+
+fn encode_result_field(
+    encoder: &mut DataRowEncoder,
+    ty: &Type,
+    value: Option<&str>,
+) -> PgWireResult<()> {
+    let Some(s) = value else {
+        return match *ty {
+            Type::INT8 => encoder.encode_field(&None::<i64>),
+            Type::INT4 => encoder.encode_field(&None::<i32>),
+            Type::INT2 => encoder.encode_field(&None::<i16>),
+            Type::FLOAT8 => encoder.encode_field(&None::<f64>),
+            Type::FLOAT4 => encoder.encode_field(&None::<f32>),
+            Type::BOOL => encoder.encode_field(&None::<bool>),
+            _ => encoder.encode_field(&None::<&str>),
+        };
+    };
+    match *ty {
+        Type::INT8 => {
+            let n: i64 = s.parse().unwrap_or(0);
+            encoder.encode_field(&n)
+        }
+        Type::INT4 => {
+            let n = s.parse::<i64>().unwrap_or(0) as i32;
+            encoder.encode_field(&n)
+        }
+        Type::INT2 => {
+            let n = s.parse::<i64>().unwrap_or(0) as i16;
+            encoder.encode_field(&n)
+        }
+        Type::FLOAT8 => {
+            let n: f64 = s.parse().unwrap_or(0.0);
+            encoder.encode_field(&n)
+        }
+        Type::FLOAT4 => {
+            let n = s.parse::<f64>().unwrap_or(0.0) as f32;
+            encoder.encode_field(&n)
+        }
+        Type::BOOL => {
+            let b = matches!(s.to_ascii_lowercase().as_str(), "t" | "true" | "1");
+            encoder.encode_field(&b)
+        }
+        _ => encoder.encode_field(&s),
+    }
 }
 
 fn encode_select_response(
     rows: Vec<Record>,
     type_hints: &std::collections::HashMap<String, String>,
     column_order: Option<&[String]>,
+    described: &[(String, Type)],
+    result_format: Option<&pgwire::api::portal::Format>,
 ) -> PgWireResult<Response> {
-    let columns = infer_columns(&rows, type_hints, column_order);
+    let inferred = if described.is_empty() {
+        infer_columns(&rows, type_hints, column_order)
+    } else {
+        Vec::new()
+    };
+    let columns: &[(String, Type)] = if described.is_empty() {
+        inferred.as_slice()
+    } else {
+        described
+    };
     if columns.is_empty() {
         let schema = Arc::new(Vec::new());
         let stream = stream::iter(Vec::<PgWireResult<_>>::new());
@@ -2913,32 +3491,21 @@ fn encode_select_response(
 
     let fields: Vec<FieldInfo> = columns
         .iter()
-        .map(|(name, ty)| FieldInfo::new(name.clone(), None, None, ty.clone(), FieldFormat::Text))
+        .enumerate()
+        .map(|(i, (name, ty))| {
+            let format = result_format
+                .map(|fmt| fmt.format_for(i))
+                .unwrap_or(FieldFormat::Text);
+            FieldInfo::new(name.clone(), None, None, ty.clone(), format)
+        })
         .collect();
     let schema = Arc::new(fields);
 
     let mut encoded = Vec::with_capacity(rows.len());
     for record in &rows {
         let mut encoder = DataRowEncoder::new(schema.clone());
-        for (name, ty) in &columns {
-            match record.get(name) {
-                None => encoder.encode_field(&None::<&str>)?,
-                Some(s) => match *ty {
-                    Type::INT8 | Type::INT4 | Type::INT2 => {
-                        let n: i64 = s.parse().unwrap_or(0);
-                        encoder.encode_field(&n)?;
-                    }
-                    Type::FLOAT8 | Type::FLOAT4 => {
-                        let n: f64 = s.parse().unwrap_or(0.0);
-                        encoder.encode_field(&n)?;
-                    }
-                    Type::BOOL => {
-                        let b = matches!(s.to_ascii_lowercase().as_str(), "t" | "true" | "1");
-                        encoder.encode_field(&b)?;
-                    }
-                    _ => encoder.encode_field(&s)?,
-                },
-            }
+        for (name, ty) in columns {
+            encode_result_field(&mut encoder, ty, record.get(name))?;
         }
         encoded.push(encoder.finish());
     }
@@ -3054,9 +3621,9 @@ fn catalog_type_to_pg(data_type: &str) -> Type {
         "TIMESTAMP" | "TIMESTAMP_WITHOUT_TIME_ZONE" | "TIMESTAMP WITHOUT TIME ZONE" => {
             Type::TIMESTAMP
         }
-        "TIMESTAMPTZ"
-        | "TIMESTAMP_WITH_TIME_ZONE"
-        | "TIMESTAMP WITH TIME ZONE" => Type::TIMESTAMPTZ,
+        "TIMESTAMPTZ" | "TIMESTAMP_WITH_TIME_ZONE" | "TIMESTAMP WITH TIME ZONE" => {
+            Type::TIMESTAMPTZ
+        }
         "JSON" => Type::JSON,
         "JSONB" => Type::JSONB,
         "INTERVAL" => Type::INTERVAL,
@@ -3071,6 +3638,8 @@ pub struct TakyonicPgFactory {
     auth_source: Arc<dyn AuthSource>,
     params: Arc<DefaultServerParameterProvider>,
     iterations: usize,
+    /// Next PostgreSQL backend pid (`BackendKeyData`). Starts at 1; 0 is unset.
+    next_backend_pid: Arc<AtomicI32>,
 }
 
 impl TakyonicPgFactory {
@@ -3087,6 +3656,7 @@ impl TakyonicPgFactory {
             auth_source: Arc::new(auth),
             params: Arc::new(default_server_params(iterations)),
             iterations,
+            next_backend_pid: Arc::new(AtomicI32::new(1)),
         }
     }
 
@@ -3120,11 +3690,14 @@ impl PgWireServerHandlers for TakyonicPgFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         // New handler (and Mutex<SASLState>) per TCP session — never share
         // SASLAuthStartupHandler across concurrent connections.
-        scram_startup_handler(
-            Arc::clone(&self.auth_source),
-            Arc::clone(&self.params),
-            self.iterations,
-        )
+        Arc::new(PidAssigningStartup {
+            inner: scram_startup_handler(
+                Arc::clone(&self.auth_source),
+                Arc::clone(&self.params),
+                self.iterations,
+            ),
+            next_pid: Arc::clone(&self.next_backend_pid),
+        })
     }
 }
 
@@ -3136,9 +3709,8 @@ fn copy_table_to_file(
 ) -> crate::error::Result<u64> {
     let out = copy_table_to_tsv(session, table, columns)?;
     let n = out.lines().filter(|l| !l.is_empty()).count() as u64;
-    std::fs::write(path, out).map_err(|e| {
-        crate::error::TakyonicError::Engine(format!("COPY TO `{path}`: {e}"))
-    })?;
+    std::fs::write(path, out)
+        .map_err(|e| crate::error::TakyonicError::Engine(format!("COPY TO `{path}`: {e}")))?;
     Ok(n)
 }
 
@@ -3157,9 +3729,7 @@ fn copy_table_to_tsv(
     } else {
         columns.to_vec()
     };
-    let rows = session
-        .execute_sql(&format!("SELECT * FROM {table}"))?
-        .rows;
+    let rows = session.execute_sql(&format!("SELECT * FROM {table}"))?.rows;
     let mut out = String::new();
     for row in &rows {
         let mut fields = Vec::with_capacity(cols.len());
@@ -3179,9 +3749,8 @@ fn copy_table_from_file(
     columns: &[String],
     path: &str,
 ) -> crate::error::Result<u64> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        crate::error::TakyonicError::Engine(format!("COPY FROM `{path}`: {e}"))
-    })?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::TakyonicError::Engine(format!("COPY FROM `{path}`: {e}")))?;
     copy_table_from_tsv(session, table, columns, &text)
 }
 
@@ -3684,14 +4253,16 @@ mod tests {
                 self.inner.execute_fragment(fragment)
             }
         }
-        session.engine().set_mpp_dispatcher(Some(Arc::new(HitDispatch {
-            inner: Worker::new(
-                Arc::clone(session.engine()),
-                Arc::clone(&shuffle),
-                Arc::clone(session.engine().metrics()),
-            ),
-            contacted: Arc::clone(&contacted),
-        })));
+        session
+            .engine()
+            .set_mpp_dispatcher(Some(Arc::new(HitDispatch {
+                inner: Worker::new(
+                    Arc::clone(session.engine()),
+                    Arc::clone(&shuffle),
+                    Arc::clone(session.engine().metrics()),
+                ),
+                contacted: Arc::clone(&contacted),
+            })));
 
         let mut owners = std::collections::HashSet::new();
         for i in 0..30 {
@@ -3802,9 +4373,7 @@ mod tests {
         assert_eq!(session.txn_mode(), SessionTxnMode::InTransaction);
 
         let ins = session
-            .execute_sql(
-                "INSERT INTO users (id, name, age) VALUES (99, 'TxnTest', 50)",
-            )
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (99, 'TxnTest', 50)")
             .unwrap();
         assert_eq!(ins.tag, "INSERT");
         assert_eq!(ins.affected, Some(1));
@@ -3875,14 +4444,22 @@ mod tests {
     async fn auth_source_accepts_postgres_rejects_unknown() {
         let auth = TakyonicAuthSource::with_bootstrap_user();
         let ok = auth
-            .get_password(&LoginInfo::new(Some(BOOTSTRAP_USER), Some("postgres"), "127.0.0.1".into()))
+            .get_password(&LoginInfo::new(
+                Some(BOOTSTRAP_USER),
+                Some("postgres"),
+                "127.0.0.1".into(),
+            ))
             .await
             .unwrap();
         assert!(ok.salt().is_some());
         assert_eq!(ok.password().len(), 32);
 
         let err = auth
-            .get_password(&LoginInfo::new(Some("nope"), Some("postgres"), "127.0.0.1".into()))
+            .get_password(&LoginInfo::new(
+                Some("nope"),
+                Some("postgres"),
+                "127.0.0.1".into(),
+            ))
             .await
             .unwrap_err();
         assert!(matches!(err, PgWireError::InvalidPassword(_)));
@@ -3975,7 +4552,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(physical, crate::executor::PhysicalPlan::TopN { fetch: 1, .. }),
+            matches!(
+                physical,
+                crate::executor::PhysicalPlan::TopN { fetch: 1, .. }
+            ),
             "session path must see TopN plan, got {physical:?}"
         );
 
@@ -4095,11 +4675,13 @@ mod tests {
         assert_eq!(schema.columns.len(), 2);
         assert!(schema.columns.iter().all(|c| c.name != "qty"));
 
-        assert!(session
-            .execute_sql("ALTER TABLE items DROP COLUMN id")
-            .unwrap_err()
-            .to_string()
-            .contains("primary key"));
+        assert!(
+            session
+                .execute_sql("ALTER TABLE items DROP COLUMN id")
+                .unwrap_err()
+                .to_string()
+                .contains("primary key")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4186,11 +4768,13 @@ mod tests {
         assert_eq!(row.rows[0].get("qty"), Some("10"));
         assert_eq!(row.rows[0].get("note"), Some("a"));
 
-        assert!(session
-            .execute_sql("ALTER TABLE items ALTER COLUMN missing TYPE INT")
-            .unwrap_err()
-            .to_string()
-            .contains("does not exist"));
+        assert!(
+            session
+                .execute_sql("ALTER TABLE items ALTER COLUMN missing TYPE INT")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4199,9 +4783,7 @@ mod tests {
     fn session_select_projection_returns_only_named_columns() {
         let (mut session, root) = temp_session("proj");
         session
-            .execute_sql(
-                "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)",
-            )
+            .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)")
             .unwrap();
         session
             .execute_sql("INSERT INTO items (id, name, qty) VALUES (1, 'widget', 10)")
@@ -4215,9 +4797,7 @@ mod tests {
         assert_eq!(sel.rows[0].get("qty"), Some("10"));
         assert!(sel.rows[0].get("id").is_none(), "id must be projected away");
 
-        let aliased = session
-            .execute_sql("SELECT name AS n FROM items")
-            .unwrap();
+        let aliased = session.execute_sql("SELECT name AS n FROM items").unwrap();
         assert_eq!(aliased.rows[0].get("n"), Some("widget"));
         assert!(aliased.rows[0].get("name").is_none());
 
@@ -4238,9 +4818,7 @@ mod tests {
         let (mut session, root) = temp_session("create-table");
 
         let create = session
-            .execute_sql(
-                "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)",
-            )
+            .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)")
             .unwrap();
         assert_eq!(create.tag, "CREATE TABLE");
 
@@ -4266,6 +4844,107 @@ mod tests {
     }
 
     #[test]
+    fn describe_parameters_follow_column_types() {
+        let (mut session, root) = temp_session("desc-params");
+        session
+            .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty INT)")
+            .unwrap();
+        let insert =
+            SqlEngine::plan("INSERT INTO items (id, name, qty) VALUES ($1, $2, $3), ($4, $5, $6)")
+                .unwrap();
+        let types = described_param_types(&insert, &[], session.engine());
+        assert_eq!(
+            types,
+            vec![
+                Type::INT8,
+                Type::VARCHAR,
+                Type::INT4,
+                Type::INT8,
+                Type::VARCHAR,
+                Type::INT4,
+            ]
+        );
+        let select =
+            SqlEngine::plan("SELECT id, name FROM items WHERE qty >= $1 ORDER BY name LIMIT 2")
+                .unwrap();
+        let types = described_param_types(&select, &[], session.engine());
+        assert_eq!(types, vec![Type::INT4]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_select_star_uses_catalog_column_order_even_when_empty() {
+        let (mut session, root) = temp_session("star-order");
+        session
+            .execute_sql("CREATE TABLE widgets (qty INT, name TEXT, id BIGINT PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute_sql("INSERT INTO widgets (qty, name, id) VALUES (2, 'bolt', 1)")
+            .unwrap();
+        let sel = session
+            .execute_sql("SELECT * FROM widgets ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            sel.column_order.as_deref().map(|cols| cols.join(",")),
+            Some("qty,name,id".to_string())
+        );
+        assert_eq!(sel.rows[0].get("name"), Some("bolt"));
+        assert_eq!(sel.rows[0].get("qty"), Some("2"));
+
+        let empty = session
+            .execute_sql("SELECT * FROM widgets WHERE id = 99")
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        assert_eq!(
+            empty.column_order.as_deref().map(|cols| cols.join(",")),
+            Some("qty,name,id".to_string())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_script_and_aborted_transaction() {
+        let (mut session, root) = temp_session("script");
+        let results = session
+            .execute_simple_script(
+                "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT); \
+                 INSERT INTO items (id, name) VALUES (1, 'a'); \
+                 SELECT name FROM items WHERE id = 1",
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tag, "CREATE TABLE");
+        assert_eq!(results[2].rows[0].get("name"), Some("a"));
+
+        session
+            .execute_simple_script("BEGIN; INSERT INTO items (id, name) VALUES (2, 'b'); ROLLBACK")
+            .unwrap();
+        let gone = session
+            .execute_sql("SELECT name FROM items WHERE id = 2")
+            .unwrap();
+        assert!(gone.rows.is_empty());
+
+        session.execute_sql("BEGIN").unwrap();
+        assert!(session.execute_sql("SELECT * FROM missing_table").is_err());
+        assert!(session.txn_aborted());
+        let ignored = session.execute_sql("INSERT INTO items (id, name) VALUES (3, 'c')");
+        assert!(ignored.unwrap_err().to_string().contains("aborted"));
+        let ended = session.execute_sql("ROLLBACK").unwrap();
+        assert_eq!(ended.tag, "ROLLBACK");
+        assert!(!session.txn_aborted());
+        session
+            .execute_sql("INSERT INTO items (id, name) VALUES (3, 'c')")
+            .unwrap();
+        let row = session
+            .execute_sql("SELECT name FROM items WHERE id = 3")
+            .unwrap();
+        assert_eq!(row.rows[0].get("name"), Some("c"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_create_table_as_select_e2e() {
         let (mut session, root) = temp_session("ctas");
         session
@@ -4276,9 +4955,7 @@ mod tests {
             .unwrap();
 
         let create = session
-            .execute_sql(
-                "CREATE TABLE adults AS SELECT id, name FROM users WHERE age >= 25",
-            )
+            .execute_sql("CREATE TABLE adults AS SELECT id, name FROM users WHERE age >= 25")
             .unwrap();
         assert_eq!(create.tag, "CREATE TABLE");
 
@@ -4315,9 +4992,7 @@ mod tests {
     fn session_insert_select_e2e() {
         let (mut session, root) = temp_session("insert-select");
         session
-            .execute_sql(
-                "CREATE TABLE dest (id BIGINT PRIMARY KEY, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE dest (id BIGINT PRIMARY KEY, name TEXT)")
             .unwrap();
         session
             .execute_sql(
@@ -4327,9 +5002,7 @@ mod tests {
             .unwrap();
 
         let ins = session
-            .execute_sql(
-                "INSERT INTO dest (id, name) SELECT id, name FROM users WHERE age >= 25",
-            )
+            .execute_sql("INSERT INTO dest (id, name) SELECT id, name FROM users WHERE age >= 25")
             .unwrap();
         assert_eq!(ins.tag, "INSERT");
         assert_eq!(ins.affected, Some(2));
@@ -4410,7 +5083,14 @@ mod tests {
 
         let drop = session.execute_sql("DROP INDEX idx_dept").unwrap();
         assert_eq!(drop.tag, "DROP INDEX");
-        assert!(session.engine().table_schema("employees").unwrap().indexes.is_empty());
+        assert!(
+            session
+                .engine()
+                .table_schema("employees")
+                .unwrap()
+                .indexes
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4451,9 +5131,7 @@ mod tests {
                 )
                 .unwrap();
             session
-                .execute_sql(
-                    "UPDATE employees SET salary = 9500 WHERE id = 3",
-                )
+                .execute_sql("UPDATE employees SET salary = 9500 WHERE id = 3")
                 .unwrap();
             // Crash before graceful close / SST flush.
             engine.abandon_for_crash_test().unwrap();
@@ -4542,9 +5220,7 @@ mod tests {
             .register_table(TableSchema::new("employees", "id", vec![]))
             .unwrap();
 
-        let mut values = String::from(
-            "INSERT INTO employees (id, department, salary) VALUES ",
-        );
+        let mut values = String::from("INSERT INTO employees (id, department, salary) VALUES ");
         for i in 1..=1000 {
             if i > 1 {
                 values.push_str(", ");
@@ -4673,7 +5349,9 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         assert!(
-            dead_heap + dead_index > 0 || removed > 0 || versions_bloated > session.engine().table_version_count("items").unwrap(),
+            dead_heap + dead_index > 0
+                || removed > 0
+                || versions_bloated > session.engine().table_version_count("items").unwrap(),
             "VACUUM must identify or reclaim dead versions (dead_heap={dead_heap} dead_index={dead_index} removed={removed})"
         );
 
@@ -4791,7 +5469,9 @@ mod tests {
         let before = bpm.stats();
         let t0 = std::time::Instant::now();
         for _ in 0..3 {
-            let rows = session.execute_sql("SELECT * FROM items WHERE id = 1").unwrap();
+            let rows = session
+                .execute_sql("SELECT * FROM items WHERE id = 1")
+                .unwrap();
             assert_eq!(rows.rows.len(), 1);
         }
         let elapsed = t0.elapsed();
@@ -4813,9 +5493,12 @@ mod tests {
     #[test]
     fn decode_text_int_parameter() {
         let raw = vec![Some(bytes::Bytes::from_static(b"25"))];
-        let vals =
-            decode_bind_parameters(&raw, &[Some(Type::INT4)], &pgwire::api::portal::Format::UnifiedText)
-                .unwrap();
+        let vals = decode_bind_parameters(
+            &raw,
+            &[Some(Type::INT4)],
+            &pgwire::api::portal::Format::UnifiedText,
+        )
+        .unwrap();
         assert_eq!(vals, vec![Value::Int(25)]);
     }
 
@@ -4862,11 +5545,7 @@ mod tests {
             .execute_sql("SELECT SUM(salary * tax_rate) FROM employees WHERE age > 30")
             .unwrap();
         assert_eq!(result.rows.len(), 1);
-        let sum = result.rows[0]
-            .fields
-            .values()
-            .next()
-            .expect("sum value");
+        let sum = result.rows[0].fields.values().next().expect("sum value");
         assert_eq!(sum, "1100");
         let _ = fs::remove_dir_all(root);
     }
@@ -4901,9 +5580,7 @@ mod tests {
         }
 
         let create = session
-            .execute_sql(
-                "CREATE VECTOR INDEX idx_v ON docs(vec) WITH (DIMENSION=128, TYPE=HNSW)",
-            )
+            .execute_sql("CREATE VECTOR INDEX idx_v ON docs(vec) WITH (DIMENSION=128, TYPE=HNSW)")
             .unwrap();
         assert_eq!(create.tag, "CREATE VECTOR INDEX");
         assert!(session.engine().hnsw_index("idx_v").is_some());
@@ -4911,13 +5588,9 @@ mod tests {
 
         // Query near peak index 40 → expect doc3 first.
         let q = emb(40);
-        let array_lit = format!(
-            "ARRAY[{}]",
-            q.trim_start_matches('[').trim_end_matches(']')
-        );
-        let explain_sql = format!(
-            "EXPLAIN SELECT * FROM docs ORDER BY vec <-> {array_lit} LIMIT 5"
-        );
+        let array_lit = format!("ARRAY[{}]", q.trim_start_matches('[').trim_end_matches(']'));
+        let explain_sql =
+            format!("EXPLAIN SELECT * FROM docs ORDER BY vec <-> {array_lit} LIMIT 5");
         let explain = session.execute_sql(&explain_sql).unwrap();
         let plan_text = explain.rows[0].get("QUERY PLAN").unwrap_or("");
         assert!(
@@ -4925,9 +5598,7 @@ mod tests {
             "EXPLAIN must show VectorIndexScanExec, got:\n{plan_text}"
         );
 
-        let select_sql = format!(
-            "SELECT * FROM docs ORDER BY vec <-> {array_lit} LIMIT 2"
-        );
+        let select_sql = format!("SELECT * FROM docs ORDER BY vec <-> {array_lit} LIMIT 2");
         let result = session.execute_sql(&select_sql).unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0].get("id"), Some("3"));
@@ -5283,9 +5954,7 @@ mod tests {
     fn session_oid_obj_col_description_e2e() {
         let (mut session, root) = temp_session("oid-desc");
         session
-            .execute_sql(
-                "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, note TEXT)",
-            )
+            .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, note TEXT)")
             .unwrap();
         session
             .execute_sql("INSERT INTO items (id, name, note) VALUES (1, 'a', 'n')")
@@ -5502,12 +6171,11 @@ mod tests {
         assert_eq!(row.rows[0].get("none"), Some(""));
 
         let err = session
-            .execute_sql(
-                "SELECT shobj_description('x', 'pg_class') FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT shobj_description('x', 'pg_class') FROM users WHERE id = 1")
             .unwrap_err();
         assert!(
-            err.to_string().contains("unsupported shobj_description catalog"),
+            err.to_string()
+                .contains("unsupported shobj_description catalog"),
             "unexpected: {err}"
         );
 
@@ -5733,9 +6401,7 @@ mod tests {
         assert_eq!(row.rows[0].get("oid_d"), Some(""));
 
         let err = session
-            .execute_sql(
-                "SELECT pg_tablespace_location('no_such_ts') FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_tablespace_location('no_such_ts') FROM users WHERE id = 1")
             .unwrap_err();
         assert!(
             err.to_string().contains("does not exist"),
@@ -5798,9 +6464,7 @@ mod tests {
         admin
             .execute_sql("INSERT INTO employees (id, name) VALUES (1, 'Ada')")
             .unwrap();
-        admin
-            .execute_sql("CREATE ROLE analysts")
-            .unwrap();
+        admin.execute_sql("CREATE ROLE analysts").unwrap();
         admin
             .execute_sql("CREATE USER analyst WITH PASSWORD 'secret'")
             .unwrap();
@@ -5931,8 +6595,7 @@ mod tests {
         assert_eq!(ca.as_deref(), Some("10.0.0.5"));
         assert_eq!(cp, Some(50123));
 
-        let (sa2, sp2, _, _) =
-            net_info_from_endpoints(Some("0.0.0.0:5433".parse().unwrap()), peer);
+        let (sa2, sp2, _, _) = net_info_from_endpoints(Some("0.0.0.0:5433".parse().unwrap()), peer);
         assert_eq!(sa2, None);
         assert_eq!(sp2, Some(5433));
 
@@ -5992,17 +6655,18 @@ WHERE c.relkind IN ('r','p','')
 ORDER BY 1,2;"#;
         let dt = session.execute_sql(dt_sql).unwrap();
         assert_eq!(dt.tag, "SELECT");
-        let names: Vec<_> = dt
-            .rows
-            .iter()
-            .filter_map(|r| r.get("Name"))
-            .collect();
+        let names: Vec<_> = dt.rows.iter().filter_map(|r| r.get("Name")).collect();
         assert!(
             names.contains(&"items") && names.contains(&"users"),
             "expected items+users in \\dt rows, got {names:?}"
         );
-        assert_eq!(dt.rows.iter().find(|r| r.get("Name") == Some("items"))
-            .and_then(|r| r.get("Type")), Some("table"));
+        assert_eq!(
+            dt.rows
+                .iter()
+                .find(|r| r.get("Name") == Some("items"))
+                .and_then(|r| r.get("Type")),
+            Some("table")
+        );
 
         let info = session
             .execute_sql(
@@ -6010,7 +6674,9 @@ ORDER BY 1,2;"#;
             )
             .unwrap();
         assert!(
-            info.rows.iter().any(|r| r.get("table_name") == Some("items")),
+            info.rows
+                .iter()
+                .any(|r| r.get("table_name") == Some("items")),
             "information_schema.tables missing items: {info:?}"
         );
 
@@ -6162,11 +6828,7 @@ ORDER BY a.attnum;"#;
             ))
             .unwrap();
         let n = session
-            .copy_from_tsv(
-                &table,
-                &[],
-                "1\tAda\n2\tGrace\n",
-            )
+            .copy_from_tsv(&table, &[], "1\tAda\n2\tGrace\n")
             .unwrap();
         assert_eq!(n, 2);
 
@@ -6175,9 +6837,7 @@ ORDER BY a.attnum;"#;
             .execute_sql(&format!("COPY {table} FROM STDIN"))
             .unwrap();
         assert_eq!(arm.tag, "COPY_IN");
-        session
-            .append_copy_in_data(b"3\tLin\n")
-            .unwrap();
+        session.append_copy_in_data(b"3\tLin\n").unwrap();
         let n2 = session.finish_copy_in().unwrap();
         assert_eq!(n2, 1);
 
@@ -6247,14 +6907,10 @@ ORDER BY a.attnum;"#;
             .execute_sql("CREATE TABLE orders (order_id BIGINT PRIMARY KEY, user_id BIGINT)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)",
-            )
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2), (30, 99)",
-            )
+            .execute_sql("INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2), (30, 99)")
             .unwrap();
 
         let result = session
@@ -6300,9 +6956,7 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2), (30, 99)",
-            )
+            .execute_sql("INSERT INTO orders (order_id, user_id) VALUES (10, 1), (20, 2), (30, 99)")
             .unwrap();
 
         let result = session
@@ -6485,9 +7139,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(like_any.rows[1].get("name"), Some("Bob"));
 
         let ilike_any = session
-            .execute_sql(
-                "SELECT name FROM users WHERE name ILIKE ANY (ARRAY['%ADA%']) ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE name ILIKE ANY (ARRAY['%ADA%']) ORDER BY id")
             .unwrap();
         assert_eq!(ilike_any.rows.len(), 2);
         assert_eq!(ilike_any.rows[0].get("name"), Some("Ada"));
@@ -6523,18 +7175,14 @@ ORDER BY a.attnum;"#;
         assert_eq!(similar.rows[1].get("name"), Some("Ann"));
 
         let alt = session
-            .execute_sql(
-                "SELECT name FROM users WHERE name SIMILAR TO '(B|C)%' ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE name SIMILAR TO '(B|C)%' ORDER BY id")
             .unwrap();
         assert_eq!(alt.rows.len(), 2);
         assert_eq!(alt.rows[0].get("name"), Some("Bob"));
         assert_eq!(alt.rows[1].get("name"), Some("Cy"));
 
         let not_sim = session
-            .execute_sql(
-                "SELECT name FROM users WHERE name NOT SIMILAR TO 'A%' ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE name NOT SIMILAR TO 'A%' ORDER BY id")
             .unwrap();
         assert_eq!(not_sim.rows.len(), 2);
         assert_eq!(not_sim.rows[0].get("name"), Some("Bob"));
@@ -6611,9 +7259,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(upd.rows[0].get("age"), Some("31"));
 
         let star = session
-            .execute_sql(
-                "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 20) RETURNING *",
-            )
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 20) RETURNING *")
             .unwrap();
         assert_eq!(star.tag, "INSERT");
         assert_eq!(star.affected, Some(1));
@@ -6756,9 +7402,7 @@ ORDER BY a.attnum;"#;
 
         // Join VALUES against a real table.
         session
-            .execute_sql(
-                "INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)",
-            )
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)")
             .unwrap();
         let joined = session
             .execute_sql(
@@ -6890,35 +7534,27 @@ ORDER BY a.attnum;"#;
             .unwrap();
 
         let any_eq = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age = ANY(ARRAY[10, 30]) ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age = ANY(ARRAY[10, 30]) ORDER BY id")
             .unwrap();
         assert_eq!(any_eq.rows.len(), 2);
         assert_eq!(any_eq.rows[0].get("name"), Some("Ada"));
         assert_eq!(any_eq.rows[1].get("name"), Some("Cy"));
 
         let some = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age = SOME(ARRAY[30]) ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age = SOME(ARRAY[30]) ORDER BY id")
             .unwrap();
         assert_eq!(some.rows.len(), 1);
         assert_eq!(some.rows[0].get("name"), Some("Ada"));
 
         // > ALL — only Ada (30 > 15 and 30 > 20); Cy fails 10 > 15
         let all_gt = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age > ALL(ARRAY[15, 20]) ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age > ALL(ARRAY[15, 20]) ORDER BY id")
             .unwrap();
         assert_eq!(all_gt.rows.len(), 1);
         assert_eq!(all_gt.rows[0].get("name"), Some("Ada"));
 
         let any_gt = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age > ANY(ARRAY[20, 25]) ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age > ANY(ARRAY[20, 25]) ORDER BY id")
             .unwrap();
         assert_eq!(any_gt.rows.len(), 1);
         assert_eq!(any_gt.rows[0].get("name"), Some("Ada"));
@@ -6938,11 +7574,7 @@ ORDER BY a.attnum;"#;
                  ORDER BY id",
             )
             .unwrap();
-        let names: Vec<_> = not_all
-            .rows
-            .iter()
-            .filter_map(|r| r.get("name"))
-            .collect();
+        let names: Vec<_> = not_all.rows.iter().filter_map(|r| r.get("name")).collect();
         assert_eq!(names, vec!["Cy"], "got {names:?}");
 
         let _ = fs::remove_dir_all(root);
@@ -6959,9 +7591,7 @@ ORDER BY a.attnum;"#;
             .unwrap();
 
         let rows = session
-            .execute_sql(
-                "SELECT DISTINCT ON (name) name, age FROM users ORDER BY name, age",
-            )
+            .execute_sql("SELECT DISTINCT ON (name) name, age FROM users ORDER BY name, age")
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         assert_eq!(rows.rows[0].get("name"), Some("Ada"));
@@ -7029,9 +7659,7 @@ ORDER BY a.attnum;"#;
         assert!(names.contains(&"Cy"));
 
         let only = session
-            .execute_sql(
-                "SELECT name FROM users ORDER BY age, id FETCH FIRST 2 ROWS ONLY",
-            )
+            .execute_sql("SELECT name FROM users ORDER BY age, id FETCH FIRST 2 ROWS ONLY")
             .unwrap();
         assert_eq!(only.rows.len(), 2);
 
@@ -7064,8 +7692,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT name FROM users ORDER BY age NULLS LAST, id")
             .unwrap();
         assert_eq!(
-            last
-                .rows
+            last.rows
                 .iter()
                 .filter_map(|r| r.get("name"))
                 .collect::<Vec<_>>(),
@@ -7085,9 +7712,7 @@ ORDER BY a.attnum;"#;
     fn session_truncate_table_e2e() {
         let (mut session, root) = temp_session("truncate");
         session
-            .execute_sql(
-                "INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)",
-            )
+            .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30), (2, 'Bob', 20)")
             .unwrap();
 
         let trunc = session.execute_sql("TRUNCATE TABLE users").unwrap();
@@ -7115,26 +7740,20 @@ ORDER BY a.attnum;"#;
             .unwrap();
 
         let both_null = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age IS NOT DISTINCT FROM NULL ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age IS NOT DISTINCT FROM NULL ORDER BY id")
             .unwrap();
         assert_eq!(both_null.rows.len(), 1);
         assert_eq!(both_null.rows[0].get("name"), Some("Bob"));
 
         let dist = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age IS DISTINCT FROM 30 ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age IS DISTINCT FROM 30 ORDER BY id")
             .unwrap();
         assert_eq!(dist.rows.len(), 2);
         assert_eq!(dist.rows[0].get("name"), Some("Bob"));
         assert_eq!(dist.rows[1].get("name"), Some("Cy"));
 
         let eqish = session
-            .execute_sql(
-                "SELECT name FROM users WHERE age IS NOT DISTINCT FROM 30 ORDER BY id",
-            )
+            .execute_sql("SELECT name FROM users WHERE age IS NOT DISTINCT FROM 30 ORDER BY id")
             .unwrap();
         assert_eq!(eqish.rows.len(), 1);
         assert_eq!(eqish.rows[0].get("name"), Some("Ada"));
@@ -7163,12 +7782,7 @@ ORDER BY a.attnum;"#;
         let by_name: std::collections::BTreeMap<_, _> = searched
             .rows
             .iter()
-            .filter_map(|r| {
-                Some((
-                    r.get("name")?.to_string(),
-                    r.get("band")?.to_string(),
-                ))
-            })
+            .filter_map(|r| Some((r.get("name")?.to_string(), r.get("band")?.to_string())))
             .collect();
         assert_eq!(by_name.get("Ada").map(String::as_str), Some("senior"));
         assert_eq!(by_name.get("Bob").map(String::as_str), Some("junior"));
@@ -7242,9 +7856,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(dcolon.rows[0].get("n"), Some("20"));
 
         let nullif = session
-            .execute_sql(
-                "SELECT NULLIF(name, 'Ada') AS n FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT NULLIF(name, 'Ada') AS n FROM users WHERE id = 1")
             .unwrap();
         assert!(
             nullif.rows[0].get("n").unwrap_or("").is_empty(),
@@ -7252,9 +7864,7 @@ ORDER BY a.attnum;"#;
         );
 
         let keep = session
-            .execute_sql(
-                "SELECT NULLIF(name, 'Ada') AS n FROM users WHERE id = 2",
-            )
+            .execute_sql("SELECT NULLIF(name, 'Ada') AS n FROM users WHERE id = 2")
             .unwrap();
         assert_eq!(keep.rows[0].get("n"), Some("Bob"));
 
@@ -7338,9 +7948,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("p"), Some("2"));
 
         let bob = session
-            .execute_sql(
-                "SELECT STRPOS(name, 'o') AS s FROM users WHERE id = 2",
-            )
+            .execute_sql("SELECT STRPOS(name, 'o') AS s FROM users WHERE id = 2")
             .unwrap();
         assert_eq!(bob.rows[0].get("s"), Some("2"));
 
@@ -7395,7 +8003,10 @@ ORDER BY a.attnum;"#;
         let d = now.rows[0].get("d").unwrap();
         assert!(t.len() >= 19, "NOW() too short: {t}");
         assert_eq!(d.len(), 10);
-        assert!(t.starts_with(d), "NOW should start with CURRENT_DATE: {t} vs {d}");
+        assert!(
+            t.starts_with(d),
+            "NOW should start with CURRENT_DATE: {t} vs {d}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7425,7 +8036,10 @@ ORDER BY a.attnum;"#;
         let d = row.rows[0].get("d").unwrap();
         let t = row.rows[0].get("t").unwrap();
         assert_eq!(n, s, "NOW should equal STATEMENT_TIMESTAMP");
-        assert_eq!(s, x, "STATEMENT_TIMESTAMP should equal TRANSACTION_TIMESTAMP");
+        assert_eq!(
+            s, x,
+            "STATEMENT_TIMESTAMP should equal TRANSACTION_TIMESTAMP"
+        );
         assert!(c.len() >= 19, "CLOCK_TIMESTAMP too short: {c}");
         assert!(n.starts_with(d), "NOW vs CURRENT_DATE: {n} / {d}");
         assert!(t.contains(':'), "CURRENT_TIME unexpected: {t}");
@@ -7516,10 +8130,7 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         assert_eq!(multi.rows[0].get("s"), Some("[myschema,public]"));
-        assert_eq!(
-            multi.rows[0].get("i"),
-            Some("[pg_catalog,myschema,public]")
-        );
+        assert_eq!(multi.rows[0].get("i"), Some("[pg_catalog,myschema,public]"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7557,9 +8168,7 @@ ORDER BY a.attnum;"#;
             .unwrap();
 
         let row = session
-            .execute_sql(
-                "SELECT pg_jit_available() AS jit FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_jit_available() AS jit FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(row.rows[0].get("jit"), Some("true"));
 
@@ -7693,9 +8302,11 @@ ORDER BY a.attnum;"#;
                 .tag,
             "CREATE SEQUENCE"
         );
-        assert!(session
-            .execute_sql(&format!("CREATE SEQUENCE {seq}"))
-            .is_err());
+        assert!(
+            session
+                .execute_sql(&format!("CREATE SEQUENCE {seq}"))
+                .is_err()
+        );
         session
             .execute_sql(&format!("CREATE SEQUENCE IF NOT EXISTS {seq}"))
             .unwrap();
@@ -7718,9 +8329,11 @@ ORDER BY a.attnum;"#;
         session
             .execute_sql(&format!("DROP SEQUENCE IF EXISTS {seq}"))
             .unwrap();
-        assert!(session
-            .execute_sql(&format!("DROP SEQUENCE {seq}"))
-            .is_err());
+        assert!(
+            session
+                .execute_sql(&format!("DROP SEQUENCE {seq}"))
+                .is_err()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7750,10 +8363,7 @@ ORDER BY a.attnum;"#;
                  FROM users WHERE id = 1",
             ))
             .unwrap();
-        assert_eq!(
-            row.rows[0].get("s"),
-            Some(format!("public.{seq}").as_str())
-        );
+        assert_eq!(row.rows[0].get("s"), Some(format!("public.{seq}").as_str()));
         assert_eq!(row.rows[0].get("miss"), Some(""));
 
         let row = session
@@ -7774,7 +8384,9 @@ ORDER BY a.attnum;"#;
             .unwrap();
         assert_eq!(row.rows[0].get("s"), Some(""));
 
-        session.execute_sql(&format!("DROP SEQUENCE {seq}")).unwrap();
+        session
+            .execute_sql(&format!("DROP SEQUENCE {seq}"))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7847,9 +8459,7 @@ ORDER BY a.attnum;"#;
                 ))
                 .unwrap();
             session
-                .execute_sql(&format!(
-                    "INSERT INTO {table} (name) VALUES ('a'), ('b')"
-                ))
+                .execute_sql(&format!("INSERT INTO {table} (name) VALUES ('a'), ('b')"))
                 .unwrap();
             let rows = session
                 .execute_sql(&format!("SELECT id FROM {table} ORDER BY id"))
@@ -7906,9 +8516,7 @@ ORDER BY a.attnum;"#;
             .unwrap();
         assert_eq!(rows.rows[0].get("label"), Some("x"));
         let err = session
-            .execute_sql(&format!(
-                "INSERT INTO {table} (id, email) VALUES (2, NULL)"
-            ))
+            .execute_sql(&format!("INSERT INTO {table} (id, email) VALUES (2, NULL)"))
             .unwrap_err();
         assert!(
             err.to_string().contains("not-null") || err.to_string().contains("null value"),
@@ -7980,9 +8588,7 @@ ORDER BY a.attnum;"#;
             .unwrap();
 
         let rows = session
-            .execute_sql(&format!(
-                "SELECT id, name FROM {table} ORDER BY id"
-            ))
+            .execute_sql(&format!("SELECT id, name FROM {table} ORDER BY id"))
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         assert_eq!(rows.rows[0].get("id"), Some("1"));
@@ -8032,9 +8638,7 @@ ORDER BY a.attnum;"#;
             .execute_sql(&format!("INSERT INTO {table} (id, name) VALUES (1, 'a')"))
             .unwrap();
         let row = session
-            .execute_sql(&format!(
-                "SELECT sid, name FROM {table} WHERE id = 1"
-            ))
+            .execute_sql(&format!("SELECT sid, name FROM {table} WHERE id = 1"))
             .unwrap();
         assert_eq!(row.rows[0].get("sid"), Some("1"));
         assert_eq!(row.rows[0].get("name"), Some("a"));
@@ -8067,9 +8671,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("v"), Some(""));
 
         session
-            .execute_sql(&format!(
-                "SELECT nextval('{seq}') FROM users WHERE id = 1"
-            ))
+            .execute_sql(&format!("SELECT nextval('{seq}') FROM users WHERE id = 1"))
             .unwrap();
         let row = session
             .execute_sql(&format!(
@@ -8087,7 +8689,9 @@ ORDER BY a.attnum;"#;
             .unwrap();
         assert_eq!(row.rows[0].get("v"), Some("2"));
 
-        session.execute_sql(&format!("DROP SEQUENCE {seq}")).unwrap();
+        session
+            .execute_sql(&format!("DROP SEQUENCE {seq}"))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8114,7 +8718,9 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("n"), Some("5"));
         assert!(crate::sql::pg_sequence_last_value(&seq).is_err());
 
-        session.execute_sql(&format!("DROP SEQUENCE {seq2}")).unwrap();
+        session
+            .execute_sql(&format!("DROP SEQUENCE {seq2}"))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8141,13 +8747,17 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("su"), Some("true"));
         assert_eq!(row.rows[0].get("allp"), Some("true"));
 
-        assert!(session
-            .execute_sql(
-                "SELECT has_sequence_privilege('no_such_seq', 'USAGE') FROM users WHERE id = 1"
-            )
-            .is_err());
+        assert!(
+            session
+                .execute_sql(
+                    "SELECT has_sequence_privilege('no_such_seq', 'USAGE') FROM users WHERE id = 1"
+                )
+                .is_err()
+        );
 
-        session.execute_sql(&format!("DROP SEQUENCE {seq}")).unwrap();
+        session
+            .execute_sql(&format!("DROP SEQUENCE {seq}"))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8180,10 +8790,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("INSERT INTO users (id, name, age) VALUES (1, 'Ada', 30)")
             .unwrap();
 
-        assert_eq!(
-            session.execute_sql("LISTEN alerts").unwrap().tag,
-            "LISTEN"
-        );
+        assert_eq!(session.execute_sql("LISTEN alerts").unwrap().tag, "LISTEN");
         let row = session
             .execute_sql("SELECT pg_listening_channels() AS chans FROM users WHERE id = 1")
             .unwrap();
@@ -8228,10 +8835,7 @@ ORDER BY a.attnum;"#;
 
         session.execute_sql("LISTEN alerts").unwrap();
         assert_eq!(
-            session
-                .execute_sql("NOTIFY alerts, 'hello'")
-                .unwrap()
-                .tag,
+            session.execute_sql("NOTIFY alerts, 'hello'").unwrap().tag,
             "NOTIFY"
         );
 
@@ -8322,10 +8926,7 @@ ORDER BY a.attnum;"#;
         let f = row.rows[0].get("f").unwrap();
         assert_eq!(f.len(), 24, "walfile name should be 24 hex chars: {f}");
         assert!(f.chars().all(|c| c.is_ascii_hexdigit()), "hex: {f}");
-        assert_eq!(
-            row.rows[0].get("fo"),
-            Some("000000010000000000000001,16")
-        );
+        assert_eq!(row.rows[0].get("fo"), Some("000000010000000000000001,16"));
         assert_eq!(row.rows[0].get("miss"), Some(""));
 
         let _ = fs::remove_dir_all(root);
@@ -8405,9 +9006,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT pg_wal_replay_resume() FROM users WHERE id = 1")
             .unwrap();
         let off = session
-            .execute_sql(
-                "SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(off.rows[0].get("p"), Some("false"));
 
@@ -8415,9 +9014,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT pg_wal_replay_pause() FROM users WHERE id = 1")
             .unwrap();
         let on = session
-            .execute_sql(
-                "SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(on.rows[0].get("p"), Some("true"));
 
@@ -8425,9 +9022,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT pg_wal_replay_resume() FROM users WHERE id = 1")
             .unwrap();
         let again = session
-            .execute_sql(
-                "SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_is_wal_replay_paused() AS p FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(again.rows[0].get("p"), Some("false"));
 
@@ -8463,9 +9058,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(start.rows[0].get("b"), Some("true"));
 
         let during = session
-            .execute_sql(
-                "SELECT pg_backup_start_time() AS t FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_backup_start_time() AS t FROM users WHERE id = 1")
             .unwrap();
         assert!(!during.rows[0].get("t").unwrap().is_empty());
 
@@ -8603,9 +9196,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("ty_oid"), Some("true"));
         assert_eq!(row.rows[0].get("ty_miss"), Some("false"));
 
-        session
-            .execute_sql("SET search_path TO myschema")
-            .unwrap();
+        session.execute_sql("SET search_path TO myschema").unwrap();
         let hidden = session
             .execute_sql(
                 "SELECT pg_table_is_visible('users') AS t, \
@@ -8673,12 +9264,10 @@ ORDER BY a.attnum;"#;
         let (mut session, root) = temp_session("col-updatable");
         session
             .engine()
-            .register_table(
-                TableSchema::new("items", "id", vec![]).with_columns(vec![
-                    ColumnSpec::new("id", "BIGINT"),
-                    ColumnSpec::new("name", "TEXT"),
-                ]),
-            )
+            .register_table(TableSchema::new("items", "id", vec![]).with_columns(vec![
+                ColumnSpec::new("id", "BIGINT"),
+                ColumnSpec::new("name", "TEXT"),
+            ]))
             .unwrap();
         session
             .execute_sql("INSERT INTO items (id, name) VALUES (1, 'Ada')")
@@ -8746,12 +9335,10 @@ ORDER BY a.attnum;"#;
         let (mut session, root) = temp_session("describe-object");
         session
             .engine()
-            .register_table(
-                TableSchema::new("items", "id", vec![]).with_columns(vec![
-                    ColumnSpec::new("id", "BIGINT"),
-                    ColumnSpec::new("name", "TEXT"),
-                ]),
-            )
+            .register_table(TableSchema::new("items", "id", vec![]).with_columns(vec![
+                ColumnSpec::new("id", "BIGINT"),
+                ColumnSpec::new("name", "TEXT"),
+            ]))
             .unwrap();
         session
             .execute_sql("INSERT INTO items (id, name) VALUES (1, 'Ada')")
@@ -8788,12 +9375,10 @@ ORDER BY a.attnum;"#;
         let (mut session, root) = temp_session("identify-object");
         session
             .engine()
-            .register_table(
-                TableSchema::new("items", "id", vec![]).with_columns(vec![
-                    ColumnSpec::new("id", "BIGINT"),
-                    ColumnSpec::new("name", "TEXT"),
-                ]),
-            )
+            .register_table(TableSchema::new("items", "id", vec![]).with_columns(vec![
+                ColumnSpec::new("id", "BIGINT"),
+                ColumnSpec::new("name", "TEXT"),
+            ]))
             .unwrap();
         session
             .execute_sql("INSERT INTO items (id, name) VALUES (1, 'Ada')")
@@ -8888,29 +9473,21 @@ ORDER BY a.attnum;"#;
         admin
             .execute_sql("CREATE USER peer WITH PASSWORD 'secret'")
             .unwrap();
-        admin
-            .execute_sql("GRANT SELECT ON users TO peer")
-            .unwrap();
+        admin.execute_sql("GRANT SELECT ON users TO peer").unwrap();
 
         let got = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(got.rows[0].get("ok"), Some("true"));
 
         let mut peer = SessionState::as_user(Arc::clone(admin.engine()), "peer").unwrap();
         let blocked = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(blocked.rows[0].get("ok"), Some("false"));
 
         let pair = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(7, 8) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(7, 8) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(pair.rows[0].get("ok"), Some("true"));
 
@@ -8918,9 +9495,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT pg_advisory_unlock_all() FROM users WHERE id = 1")
             .unwrap();
         let free = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(9001) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(free.rows[0].get("ok"), Some("true"));
         peer.execute_sql("SELECT pg_advisory_unlock_all() FROM users WHERE id = 1")
@@ -8938,43 +9513,31 @@ ORDER BY a.attnum;"#;
         admin
             .execute_sql("CREATE USER peer WITH PASSWORD 'secret'")
             .unwrap();
-        admin
-            .execute_sql("GRANT SELECT ON users TO peer")
-            .unwrap();
+        admin.execute_sql("GRANT SELECT ON users TO peer").unwrap();
 
         let got = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_lock_shared(9002) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock_shared(9002) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(got.rows[0].get("ok"), Some("true"));
 
         let mut peer = SessionState::as_user(Arc::clone(admin.engine()), "peer").unwrap();
         let also = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_lock_shared(9002) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock_shared(9002) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(also.rows[0].get("ok"), Some("true"));
 
         let excl = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(9002) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(9002) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(excl.rows[0].get("ok"), Some("false"));
 
         admin
-            .execute_sql(
-                "SELECT pg_advisory_unlock_shared(9002) FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_advisory_unlock_shared(9002) FROM users WHERE id = 1")
             .unwrap();
         peer.execute_sql("SELECT pg_advisory_unlock_all() FROM users WHERE id = 1")
             .unwrap();
         let free = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_lock(9002) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_lock(9002) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(free.rows[0].get("ok"), Some("true"));
         admin
@@ -8993,38 +9556,28 @@ ORDER BY a.attnum;"#;
         admin
             .execute_sql("CREATE USER peer WITH PASSWORD 'secret'")
             .unwrap();
-        admin
-            .execute_sql("GRANT SELECT ON users TO peer")
-            .unwrap();
+        admin.execute_sql("GRANT SELECT ON users TO peer").unwrap();
 
         admin.execute_sql("BEGIN").unwrap();
         let got = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(got.rows[0].get("ok"), Some("true"));
 
         let mut peer = SessionState::as_user(Arc::clone(admin.engine()), "peer").unwrap();
         let blocked = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(blocked.rows[0].get("ok"), Some("false"));
 
         admin.execute_sql("COMMIT").unwrap();
         let free = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(free.rows[0].get("ok"), Some("true"));
         // Auto-commit releases xact lock after the statement.
         let again = admin
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9100) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(again.rows[0].get("ok"), Some("true"));
 
@@ -9040,9 +9593,7 @@ ORDER BY a.attnum;"#;
         admin
             .execute_sql("CREATE USER peer WITH PASSWORD 'secret'")
             .unwrap();
-        admin
-            .execute_sql("GRANT SELECT ON users TO peer")
-            .unwrap();
+        admin.execute_sql("GRANT SELECT ON users TO peer").unwrap();
 
         admin.execute_sql("BEGIN").unwrap();
         let got = admin
@@ -9061,18 +9612,14 @@ ORDER BY a.attnum;"#;
         assert_eq!(also.rows[0].get("ok"), Some("true"));
 
         let excl = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9101) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9101) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(excl.rows[0].get("ok"), Some("false"));
 
         admin.execute_sql("COMMIT").unwrap();
         // Peer auto-commit already released its shared xact lock; admin released on COMMIT.
         let free = peer
-            .execute_sql(
-                "SELECT pg_try_advisory_xact_lock(9101) AS ok FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT pg_try_advisory_xact_lock(9101) AS ok FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(free.rows[0].get("ok"), Some("true"));
 
@@ -9141,7 +9688,10 @@ ORDER BY a.attnum;"#;
             v.starts_with("PostgreSQL 16.0 (Takyonic "),
             "VERSION banner unexpected: {v}"
         );
-        assert!(v.contains(env!("CARGO_PKG_VERSION")), "missing crate version: {v}");
+        assert!(
+            v.contains(env!("CARGO_PKG_VERSION")),
+            "missing crate version: {v}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9208,12 +9758,11 @@ ORDER BY a.attnum;"#;
         assert_eq!(sp.rows[0].get("sp"), Some("myschema, public"));
 
         let err = session
-            .execute_sql(
-                "SELECT set_config('search_path', 'tmp', true) FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT set_config('search_path', 'tmp', true) FROM users WHERE id = 1")
             .unwrap_err();
         assert!(
-            err.to_string().contains("SET LOCAL can only be used in transaction blocks"),
+            err.to_string()
+                .contains("SET LOCAL can only be used in transaction blocks"),
             "unexpected: {err}"
         );
 
@@ -9514,9 +10063,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("t"), Some("2026-01-15 08:00:00+00"));
 
         let scaled = session
-            .execute_sql(
-                "SELECT (INTERVAL '1' DAY * 2) AS two FROM users WHERE id = 1",
-            )
+            .execute_sql("SELECT (INTERVAL '1' DAY * 2) AS two FROM users WHERE id = 1")
             .unwrap();
         assert_eq!(scaled.rows[0].get("two"), Some("2 days"));
 
@@ -9543,7 +10090,10 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("h"), Some("2026-08-02 15:00:00+00"));
         assert_eq!(row.rows[0].get("m"), Some("2026-08-01 00:00:00+00"));
         let y = row.rows[0].get("y").unwrap();
-        assert!(y.ends_with("-01-01 00:00:00+00"), "unexpected year trunc: {y}");
+        assert!(
+            y.ends_with("-01-01 00:00:00+00"),
+            "unexpected year trunc: {y}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9727,8 +10277,14 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("local_as"), Some("2026-08-02 12:00:00+00"));
         assert_eq!(row.rows[0].get("utc_z"), Some("2026-08-02 12:00:00"));
         assert_eq!(row.rows[0].get("istanbul"), Some("2026-08-02 15:00:00"));
-        assert_eq!(row.rows[0].get("denver_winter"), Some("2026-01-15 05:00:00"));
-        assert_eq!(row.rows[0].get("denver_summer"), Some("2026-07-15 06:00:00"));
+        assert_eq!(
+            row.rows[0].get("denver_winter"),
+            Some("2026-01-15 05:00:00")
+        );
+        assert_eq!(
+            row.rows[0].get("denver_summer"),
+            Some("2026-07-15 06:00:00")
+        );
 
         let err = session
             .execute_sql(
@@ -9968,9 +10524,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(filtered.rows.len(), 3);
 
         let ord = session
-            .execute_sql(
-                "SELECT n, ord FROM generate_series(10, 12) WITH ORDINALITY AS t(n, ord)",
-            )
+            .execute_sql("SELECT n, ord FROM generate_series(10, 12) WITH ORDINALITY AS t(n, ord)")
             .unwrap();
         assert_eq!(ord.rows.len(), 3);
         assert_eq!(ord.rows[0].get("n"), Some("10"));
@@ -10020,16 +10574,12 @@ ORDER BY a.attnum;"#;
         assert_eq!(aliased.rows[1].get("x"), Some("Di"));
 
         let filtered = session
-            .execute_sql(
-                "SELECT unnest FROM unnest(ARRAY[1, 2, 3, 4]) WHERE unnest > 2",
-            )
+            .execute_sql("SELECT unnest FROM unnest(ARRAY[1, 2, 3, 4]) WHERE unnest > 2")
             .unwrap();
         assert_eq!(filtered.rows.len(), 2);
 
         let ord = session
-            .execute_sql(
-                "SELECT x, i FROM unnest(ARRAY[10, 20, 30]) WITH ORDINALITY AS t(x, i)",
-            )
+            .execute_sql("SELECT x, i FROM unnest(ARRAY[10, 20, 30]) WITH ORDINALITY AS t(x, i)")
             .unwrap();
         assert_eq!(ord.rows.len(), 3);
         assert_eq!(ord.rows[0].get("x"), Some("10"));
@@ -10047,9 +10597,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(offset.rows[2].get("offset"), Some("2"));
 
         let named = session
-            .execute_sql(
-                "SELECT x, off FROM UNNEST(ARRAY['a', 'b']) AS t(x) WITH OFFSET AS off",
-            )
+            .execute_sql("SELECT x, off FROM UNNEST(ARRAY['a', 'b']) AS t(x) WITH OFFSET AS off")
             .unwrap();
         assert_eq!(named.rows[0].get("x"), Some("a"));
         assert_eq!(named.rows[0].get("off"), Some("0"));
@@ -10140,9 +10688,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(row.rows[0].get("t"), Some("object"));
 
         let missing = session
-            .execute_sql(
-                "SELECT ('{\"a\":1}'::json ->> 'z') AS z FROM generate_series(1, 1)",
-            )
+            .execute_sql("SELECT ('{\"a\":1}'::json ->> 'z') AS z FROM generate_series(1, 1)")
             .unwrap();
         assert_eq!(missing.rows[0].get("z"), Some(""));
 
@@ -10169,9 +10715,7 @@ ORDER BY a.attnum;"#;
 
         // Regression: SQL ARRAY @> still works.
         let arr = session
-            .execute_sql(
-                "SELECT (ARRAY[1, 2, 3] @> ARRAY[2]) AS ok FROM generate_series(1, 1)",
-            )
+            .execute_sql("SELECT (ARRAY[1, 2, 3] @> ARRAY[2]) AS ok FROM generate_series(1, 1)")
             .unwrap();
         assert_eq!(arr.rows[0].get("ok"), Some("true"));
 
@@ -10191,9 +10735,15 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         let set = row.rows[0].get("set").unwrap();
-        assert!(set.contains("\"a\":1") && set.contains("\"b\":2"), "unexpected set: {set}");
+        assert!(
+            set.contains("\"a\":1") && set.contains("\"b\":2"),
+            "unexpected set: {set}"
+        );
         let cat = row.rows[0].get("cat").unwrap();
-        assert!(cat.contains("\"a\":1") && cat.contains("\"b\":2"), "unexpected cat: {cat}");
+        assert!(
+            cat.contains("\"a\":1") && cat.contains("\"b\":2"),
+            "unexpected cat: {cat}"
+        );
         assert_eq!(
             row.rows[0].get("nested").map(|s| {
                 // extract via another query would be heavy; just check substring
@@ -10218,7 +10768,10 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         let obj = row.rows[0].get("obj").unwrap();
-        assert!(obj.contains("\"a\":1") && obj.contains("\"b\":true"), "obj={obj}");
+        assert!(
+            obj.contains("\"a\":1") && obj.contains("\"b\":true"),
+            "obj={obj}"
+        );
         assert_eq!(row.rows[0].get("arr"), Some(r#"[1,"x",null]"#));
         let nest = row.rows[0].get("nest").unwrap();
         assert!(nest.contains("\"k\":2"), "nest={nest}");
@@ -10240,12 +10793,21 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         let pretty = row.rows[0].get("pretty").unwrap();
-        assert!(pretty.contains('\n') && pretty.contains("\"a\""), "pretty={pretty}");
+        assert!(
+            pretty.contains('\n') && pretty.contains("\"a\""),
+            "pretty={pretty}"
+        );
         let del = row.rows[0].get("del").unwrap();
-        assert!(del.contains("\"b\":2") && !del.contains("\"a\""), "del={del}");
+        assert!(
+            del.contains("\"b\":2") && !del.contains("\"a\""),
+            "del={del}"
+        );
         assert_eq!(row.rows[0].get("adel"), Some("[10,30]"));
         let pdel = row.rows[0].get("pdel").unwrap();
-        assert!(pdel.contains("\"c\":2") && !pdel.contains("\"b\""), "pdel={pdel}");
+        assert!(
+            pdel.contains("\"c\":2") && !pdel.contains("\"b\""),
+            "pdel={pdel}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10263,10 +10825,16 @@ ORDER BY a.attnum;"#;
             )
             .unwrap();
         let ins = row.rows[0].get("ins").unwrap();
-        assert!(ins.contains("[1,9,2]") || (ins.contains('9') && ins.contains('1')), "ins={ins}");
+        assert!(
+            ins.contains("[1,9,2]") || (ins.contains('9') && ins.contains('1')),
+            "ins={ins}"
+        );
         assert_eq!(row.rows[0].get("after"), Some("[1,2,9]"));
         let strip = row.rows[0].get("strip").unwrap();
-        assert!(strip.contains("\"a\":1") && !strip.contains("\"b\""), "strip={strip}");
+        assert!(
+            strip.contains("\"a\":1") && !strip.contains("\"b\""),
+            "strip={strip}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10298,15 +10866,9 @@ ORDER BY a.attnum;"#;
     fn session_json_agg_e2e() {
         let (mut session, root) = temp_session("json-agg");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)")
             .unwrap();
-        for (id, dept, name) in [
-            (1, "Eng", "Ada"),
-            (2, "Eng", "Di"),
-            (3, "Sales", "Bob"),
-        ] {
+        for (id, dept, name) in [(1, "Eng", "Ada"), (2, "Eng", "Di"), (3, "Sales", "Bob")] {
             session
                 .execute_sql(&format!(
                     "INSERT INTO emp (id, department, name) VALUES ({id}, '{dept}', '{name}')"
@@ -10315,9 +10877,7 @@ ORDER BY a.attnum;"#;
         }
 
         let rows = session
-            .execute_sql(
-                "SELECT department, json_agg(name) FROM emp GROUP BY department",
-            )
+            .execute_sql("SELECT department, json_agg(name) FROM emp GROUP BY department")
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         let mut by_dept = std::collections::BTreeMap::new();
@@ -10339,7 +10899,10 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT jsonb_agg(id) FROM emp")
             .unwrap();
         let ids = global.rows[0].get("jsonb_agg(id)").unwrap();
-        assert!(ids.starts_with('[') && ids.contains('1') && ids.contains('3'), "ids={ids}");
+        assert!(
+            ids.starts_with('[') && ids.contains('1') && ids.contains('3'),
+            "ids={ids}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10348,15 +10911,9 @@ ORDER BY a.attnum;"#;
     fn session_json_object_agg_e2e() {
         let (mut session, root) = temp_session("json-object-agg");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)")
             .unwrap();
-        for (id, dept, name) in [
-            (1, "Eng", "Ada"),
-            (2, "Eng", "Di"),
-            (3, "Sales", "Bob"),
-        ] {
+        for (id, dept, name) in [(1, "Eng", "Ada"), (2, "Eng", "Di"), (3, "Sales", "Bob")] {
             session
                 .execute_sql(&format!(
                     "INSERT INTO emp (id, department, name) VALUES ({id}, '{dept}', '{name}')"
@@ -10401,15 +10958,9 @@ ORDER BY a.attnum;"#;
     fn session_string_agg_array_agg_e2e() {
         let (mut session, root) = temp_session("string-array-agg");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)")
             .unwrap();
-        for (id, dept, name) in [
-            (1, "Eng", "Ada"),
-            (2, "Eng", "Di"),
-            (3, "Sales", "Bob"),
-        ] {
+        for (id, dept, name) in [(1, "Eng", "Ada"), (2, "Eng", "Di"), (3, "Sales", "Bob")] {
             session
                 .execute_sql(&format!(
                     "INSERT INTO emp (id, department, name) VALUES ({id}, '{dept}', '{name}')"
@@ -10418,9 +10969,7 @@ ORDER BY a.attnum;"#;
         }
 
         let rows = session
-            .execute_sql(
-                "SELECT department, string_agg(name, ',') FROM emp GROUP BY department",
-            )
+            .execute_sql("SELECT department, string_agg(name, ',') FROM emp GROUP BY department")
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         let mut by_dept = std::collections::BTreeMap::new();
@@ -10431,16 +10980,11 @@ ORDER BY a.attnum;"#;
             );
         }
         let eng = by_dept.get("Eng").unwrap();
-        assert!(
-            (eng == "Ada,Di" || eng == "Di,Ada"),
-            "eng names={eng}"
-        );
+        assert!((eng == "Ada,Di" || eng == "Di,Ada"), "eng names={eng}");
         assert_eq!(by_dept.get("Sales").map(String::as_str), Some("Bob"));
 
         let arrays = session
-            .execute_sql(
-                "SELECT department, array_agg(name) FROM emp GROUP BY department",
-            )
+            .execute_sql("SELECT department, array_agg(name) FROM emp GROUP BY department")
             .unwrap();
         let mut arr_by = std::collections::BTreeMap::new();
         for r in &arrays.rows {
@@ -10460,7 +11004,10 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT string_agg(id, '|') FROM emp")
             .unwrap();
         let ids = global.rows[0].get("string_agg(id)").unwrap();
-        assert!(ids.contains('1') && ids.contains('2') && ids.contains('3'), "ids={ids}");
+        assert!(
+            ids.contains('1') && ids.contains('2') && ids.contains('3'),
+            "ids={ids}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10469,9 +11016,7 @@ ORDER BY a.attnum;"#;
     fn session_bool_and_or_e2e() {
         let (mut session, root) = temp_session("bool-and-or");
         session
-            .execute_sql(
-                "CREATE TABLE flags (id BIGINT PRIMARY KEY, grp TEXT, ok BOOLEAN)",
-            )
+            .execute_sql("CREATE TABLE flags (id BIGINT PRIMARY KEY, grp TEXT, ok BOOLEAN)")
             .unwrap();
         for (id, grp, ok) in [
             (1, "A", "true"),
@@ -10488,9 +11033,7 @@ ORDER BY a.attnum;"#;
         }
 
         let rows = session
-            .execute_sql(
-                "SELECT grp, bool_and(ok), bool_or(ok) FROM flags GROUP BY grp",
-            )
+            .execute_sql("SELECT grp, bool_and(ok), bool_or(ok) FROM flags GROUP BY grp")
             .unwrap();
         assert_eq!(rows.rows.len(), 3);
         let mut by = std::collections::BTreeMap::new();
@@ -10503,9 +11046,18 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by.get("A").map(|(a, o)| (a.as_str(), o.as_str())), Some(("true", "true")));
-        assert_eq!(by.get("B").map(|(a, o)| (a.as_str(), o.as_str())), Some(("false", "true")));
-        assert_eq!(by.get("C").map(|(a, o)| (a.as_str(), o.as_str())), Some(("false", "false")));
+        assert_eq!(
+            by.get("A").map(|(a, o)| (a.as_str(), o.as_str())),
+            Some(("true", "true"))
+        );
+        assert_eq!(
+            by.get("B").map(|(a, o)| (a.as_str(), o.as_str())),
+            Some(("false", "true"))
+        );
+        assert_eq!(
+            by.get("C").map(|(a, o)| (a.as_str(), o.as_str())),
+            Some(("false", "false"))
+        );
 
         let every = session
             .execute_sql("SELECT every(ok) FROM flags WHERE grp = 'A'")
@@ -10529,9 +11081,7 @@ ORDER BY a.attnum;"#;
     fn session_bit_and_or_e2e() {
         let (mut session, root) = temp_session("bit-and-or");
         session
-            .execute_sql(
-                "CREATE TABLE bits (id BIGINT PRIMARY KEY, grp TEXT, flags BIGINT)",
-            )
+            .execute_sql("CREATE TABLE bits (id BIGINT PRIMARY KEY, grp TEXT, flags BIGINT)")
             .unwrap();
         for (id, grp, flags) in [
             (1, "A", 0b111),
@@ -10547,9 +11097,7 @@ ORDER BY a.attnum;"#;
         }
 
         let rows = session
-            .execute_sql(
-                "SELECT grp, bit_and(flags), bit_or(flags) FROM bits GROUP BY grp",
-            )
+            .execute_sql("SELECT grp, bit_and(flags), bit_or(flags) FROM bits GROUP BY grp")
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         let mut by = std::collections::BTreeMap::new();
@@ -10562,8 +11110,14 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by.get("A").map(|(a, o)| (a.as_str(), o.as_str())), Some(("5", "7")));
-        assert_eq!(by.get("B").map(|(a, o)| (a.as_str(), o.as_str())), Some(("0", "6")));
+        assert_eq!(
+            by.get("A").map(|(a, o)| (a.as_str(), o.as_str())),
+            Some(("5", "7"))
+        );
+        assert_eq!(
+            by.get("B").map(|(a, o)| (a.as_str(), o.as_str())),
+            Some(("0", "6"))
+        );
 
         let global = session
             .execute_sql("SELECT bit_and(flags), bit_or(flags) FROM bits")
@@ -10578,9 +11132,7 @@ ORDER BY a.attnum;"#;
     fn session_aggregate_filter_e2e() {
         let (mut session, root) = temp_session("agg-filter");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, salary BIGINT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, salary BIGINT)")
             .unwrap();
         for (id, dept, salary) in [
             (1, "Eng", 120),
@@ -10612,13 +11164,17 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by.get("Eng").map(|(a, b)| (a.as_str(), b.as_str())), Some(("1", "2")));
-        assert_eq!(by.get("Sales").map(|(a, b)| (a.as_str(), b.as_str())), Some(("1", "2")));
+        assert_eq!(
+            by.get("Eng").map(|(a, b)| (a.as_str(), b.as_str())),
+            Some(("1", "2"))
+        );
+        assert_eq!(
+            by.get("Sales").map(|(a, b)| (a.as_str(), b.as_str())),
+            Some(("1", "2"))
+        );
 
         let sum = session
-            .execute_sql(
-                "SELECT SUM(salary) FILTER (WHERE department = 'Eng') FROM emp",
-            )
+            .execute_sql("SELECT SUM(salary) FILTER (WHERE department = 'Eng') FROM emp")
             .unwrap();
         assert_eq!(sum.rows[0].get("sum(salary) filter"), Some("200"));
 
@@ -10629,9 +11185,7 @@ ORDER BY a.attnum;"#;
     fn session_count_distinct_e2e() {
         let (mut session, root) = temp_session("count-distinct");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)")
             .unwrap();
         for (id, dept, name) in [
             (1, "Eng", "Ada"),
@@ -10647,16 +11201,16 @@ ORDER BY a.attnum;"#;
         }
 
         let global = session
-            .execute_sql("SELECT COUNT(DISTINCT department), COUNT(DISTINCT name), COUNT(*) FROM emp")
+            .execute_sql(
+                "SELECT COUNT(DISTINCT department), COUNT(DISTINCT name), COUNT(*) FROM emp",
+            )
             .unwrap();
         assert_eq!(global.rows[0].get("count(distinct department)"), Some("2"));
         assert_eq!(global.rows[0].get("count(distinct name)"), Some("3"));
         assert_eq!(global.rows[0].get("count(*)"), Some("4"));
 
         let grouped = session
-            .execute_sql(
-                "SELECT department, COUNT(DISTINCT name) FROM emp GROUP BY department",
-            )
+            .execute_sql("SELECT department, COUNT(DISTINCT name) FROM emp GROUP BY department")
             .unwrap();
         let mut by = std::collections::BTreeMap::new();
         for r in &grouped.rows {
@@ -10669,9 +11223,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(by.get("Sales").map(String::as_str), Some("1"));
 
         let filtered = session
-            .execute_sql(
-                "SELECT COUNT(DISTINCT name) FILTER (WHERE department = 'Eng') FROM emp",
-            )
+            .execute_sql("SELECT COUNT(DISTINCT name) FILTER (WHERE department = 'Eng') FROM emp")
             .unwrap();
         assert_eq!(
             filtered.rows[0].get("count(distinct name) filter"),
@@ -10685,9 +11237,7 @@ ORDER BY a.attnum;"#;
     fn session_string_agg_order_by_e2e() {
         let (mut session, root) = temp_session("string-agg-order");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, name TEXT)")
             .unwrap();
         for (id, dept, name) in [
             (1, "Eng", "Di"),
@@ -10725,9 +11275,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(desc.rows[0].get("string_agg(name)"), Some("Di|Ada"));
 
         let arr = session
-            .execute_sql(
-                "SELECT array_agg(name ORDER BY id) FROM emp WHERE department = 'Eng'",
-            )
+            .execute_sql("SELECT array_agg(name ORDER BY id) FROM emp WHERE department = 'Eng'")
             .unwrap();
         assert_eq!(arr.rows[0].get("array_agg(name)"), Some("[Di,Ada]"));
 
@@ -10754,13 +11302,32 @@ ORDER BY a.attnum;"#;
                  stddev(x), variance(x) FROM nums",
             )
             .unwrap();
-        let samp = row.rows[0].get("stddev_samp(x)").unwrap().parse::<f64>().unwrap();
-        let pop = row.rows[0].get("stddev_pop(x)").unwrap().parse::<f64>().unwrap();
-        let vs = row.rows[0].get("var_samp(x)").unwrap().parse::<f64>().unwrap();
-        let vp = row.rows[0].get("var_pop(x)").unwrap().parse::<f64>().unwrap();
+        let samp = row.rows[0]
+            .get("stddev_samp(x)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let pop = row.rows[0]
+            .get("stddev_pop(x)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let vs = row.rows[0]
+            .get("var_samp(x)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let vp = row.rows[0]
+            .get("var_pop(x)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
         assert!((vs - 8.0 / 3.0).abs() < 1e-9, "var_samp={vs}");
         assert!((vp - 2.0).abs() < 1e-9, "var_pop={vp}");
-        assert!((samp - (8.0_f64 / 3.0).sqrt()).abs() < 1e-9, "stddev_samp={samp}");
+        assert!(
+            (samp - (8.0_f64 / 3.0).sqrt()).abs() < 1e-9,
+            "stddev_samp={samp}"
+        );
         assert!((pop - 2.0_f64.sqrt()).abs() < 1e-9, "stddev_pop={pop}");
         // Aliases rewrite to *_SAMP names in the result column.
         assert!(row.rows[0].get("stddev_samp(x)").is_some());
@@ -10770,7 +11337,10 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT stddev(x) FROM nums WHERE id = 1")
             .unwrap();
         assert!(
-            single.rows[0].get("stddev_samp(x)").unwrap_or("x").is_empty(),
+            single.rows[0]
+                .get("stddev_samp(x)")
+                .unwrap_or("x")
+                .is_empty(),
             "sample stddev of 1 row is NULL, got {:?}",
             single.rows[0]
         );
@@ -10794,13 +11364,19 @@ ORDER BY a.attnum;"#;
         }
 
         let row = session
-            .execute_sql(
-                "SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM pts",
-            )
+            .execute_sql("SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM pts")
             .unwrap();
         let corr = row.rows[0].get("corr(y)").unwrap().parse::<f64>().unwrap();
-        let cp = row.rows[0].get("covar_pop(y)").unwrap().parse::<f64>().unwrap();
-        let cs = row.rows[0].get("covar_samp(y)").unwrap().parse::<f64>().unwrap();
+        let cp = row.rows[0]
+            .get("covar_pop(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let cs = row.rows[0]
+            .get("covar_samp(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
         assert!((corr - 1.0).abs() < 1e-9, "corr={corr}");
         // mean_x=2, mean_y=4; C = sum (x-2)(y-4) = (-1)(-2)+(0)(0)+(1)(2)=4
         // covar_pop=4/3, covar_samp=4/2=2
@@ -10851,13 +11427,33 @@ ORDER BY a.attnum;"#;
         assert!((intercept - 1.0).abs() < 1e-9, "intercept={intercept}");
         assert!((r2 - 1.0).abs() < 1e-9, "r2={r2}");
         assert_eq!(row.rows[0].get("regr_count(y)"), Some("3"));
-        let avgx = row.rows[0].get("regr_avgx(y)").unwrap().parse::<f64>().unwrap();
-        let avgy = row.rows[0].get("regr_avgy(y)").unwrap().parse::<f64>().unwrap();
+        let avgx = row.rows[0]
+            .get("regr_avgx(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let avgy = row.rows[0]
+            .get("regr_avgy(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
         assert!((avgx - 2.0).abs() < 1e-9, "avgx={avgx}");
         assert!((avgy - 5.0).abs() < 1e-9, "avgy={avgy}");
-        let sxx = row.rows[0].get("regr_sxx(y)").unwrap().parse::<f64>().unwrap();
-        let syy = row.rows[0].get("regr_syy(y)").unwrap().parse::<f64>().unwrap();
-        let sxy = row.rows[0].get("regr_sxy(y)").unwrap().parse::<f64>().unwrap();
+        let sxx = row.rows[0]
+            .get("regr_sxx(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let syy = row.rows[0]
+            .get("regr_syy(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let sxy = row.rows[0]
+            .get("regr_sxy(y)")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
         assert!((sxx - 2.0).abs() < 1e-9, "sxx={sxx}");
         assert!((syy - 8.0).abs() < 1e-9, "syy={syy}");
         assert!((sxy - 4.0).abs() < 1e-9, "sxy={sxy}");
@@ -10869,9 +11465,7 @@ ORDER BY a.attnum;"#;
     fn session_mode_e2e() {
         let (mut session, root) = temp_session("mode-agg");
         session
-            .execute_sql(
-                "CREATE TABLE votes (id BIGINT PRIMARY KEY, grp TEXT, color TEXT)",
-            )
+            .execute_sql("CREATE TABLE votes (id BIGINT PRIMARY KEY, grp TEXT, color TEXT)")
             .unwrap();
         for (id, grp, color) in [
             (1, "A", "red"),
@@ -10920,9 +11514,7 @@ ORDER BY a.attnum;"#;
     fn session_row_number_e2e() {
         let (mut session, root) = temp_session("row-number");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, salary BIGINT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, salary BIGINT)")
             .unwrap();
         for (id, name, sal) in [(1, "Ada", 200), (2, "Di", 100), (3, "Bob", 300)] {
             session
@@ -10933,9 +11525,7 @@ ORDER BY a.attnum;"#;
         }
 
         let rows = session
-            .execute_sql(
-                "SELECT name, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM emp",
-            )
+            .execute_sql("SELECT name, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM emp")
             .unwrap();
         assert_eq!(rows.rows.len(), 3);
         assert_eq!(rows.rows[0].get("name"), Some("Bob"));
@@ -10958,9 +11548,7 @@ ORDER BY a.attnum;"#;
     fn session_rank_dense_rank_e2e() {
         let (mut session, root) = temp_session("rank-dense");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, salary BIGINT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, salary BIGINT)")
             .unwrap();
         // salaries: 100,100,200 → RANK 1,1,3 and DENSE_RANK 1,1,2
         for (id, name, sal) in [(1, "Ada", 100), (2, "Di", 100), (3, "Bob", 200)] {
@@ -10988,9 +11576,18 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by_name.get("Ada").map(|(r, d)| (r.as_str(), d.as_str())), Some(("1", "1")));
-        assert_eq!(by_name.get("Di").map(|(r, d)| (r.as_str(), d.as_str())), Some(("1", "1")));
-        assert_eq!(by_name.get("Bob").map(|(r, d)| (r.as_str(), d.as_str())), Some(("3", "2")));
+        assert_eq!(
+            by_name.get("Ada").map(|(r, d)| (r.as_str(), d.as_str())),
+            Some(("1", "1"))
+        );
+        assert_eq!(
+            by_name.get("Di").map(|(r, d)| (r.as_str(), d.as_str())),
+            Some(("1", "1"))
+        );
+        assert_eq!(
+            by_name.get("Bob").map(|(r, d)| (r.as_str(), d.as_str())),
+            Some(("3", "2"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11033,10 +11630,22 @@ ORDER BY a.attnum;"#;
                 r.get("rn").unwrap_or("").to_string(),
             );
         }
-        assert_eq!(by.get(&("Eng".into(), "Ada".into())).map(String::as_str), Some("1"));
-        assert_eq!(by.get(&("Eng".into(), "Di".into())).map(String::as_str), Some("2"));
-        assert_eq!(by.get(&("Sales".into(), "Zoe".into())).map(String::as_str), Some("1"));
-        assert_eq!(by.get(&("Sales".into(), "Bob".into())).map(String::as_str), Some("2"));
+        assert_eq!(
+            by.get(&("Eng".into(), "Ada".into())).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            by.get(&("Eng".into(), "Di".into())).map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            by.get(&("Sales".into(), "Zoe".into())).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            by.get(&("Sales".into(), "Bob".into())).map(String::as_str),
+            Some("2")
+        );
 
         let ranked = session
             .execute_sql(
@@ -11095,9 +11704,18 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by.get("Ada").map(|(p, n)| (p.as_str(), n.as_str())), Some(("", "200")));
-        assert_eq!(by.get("Di").map(|(p, n)| (p.as_str(), n.as_str())), Some(("100", "50")));
-        assert_eq!(by.get("Bob").map(|(p, n)| (p.as_str(), n.as_str())), Some(("200", "")));
+        assert_eq!(
+            by.get("Ada").map(|(p, n)| (p.as_str(), n.as_str())),
+            Some(("", "200"))
+        );
+        assert_eq!(
+            by.get("Di").map(|(p, n)| (p.as_str(), n.as_str())),
+            Some(("100", "50"))
+        );
+        assert_eq!(
+            by.get("Bob").map(|(p, n)| (p.as_str(), n.as_str())),
+            Some(("200", ""))
+        );
 
         let with_default = session
             .execute_sql(
@@ -11266,12 +11884,7 @@ ORDER BY a.attnum;"#;
         session
             .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, salary BIGINT)")
             .unwrap();
-        for (id, name, sal) in [
-            (1, "A", 100),
-            (2, "B", 200),
-            (3, "C", 200),
-            (4, "D", 300),
-        ] {
+        for (id, name, sal) in [(1, "A", 100), (2, "B", 200), (3, "C", 200), (4, "D", 300)] {
             session
                 .execute_sql(&format!(
                     "INSERT INTO emp (id, name, salary) VALUES ({id}, '{name}', {sal})"
@@ -11530,9 +12143,18 @@ ORDER BY a.attnum;"#;
                 ),
             );
         }
-        assert_eq!(by.get("Ada").map(|(n, t)| (n.as_str(), t.as_str())), Some(("2", "300")));
-        assert_eq!(by.get("Di").map(|(n, t)| (n.as_str(), t.as_str())), Some(("2", "300")));
-        assert_eq!(by.get("Bob").map(|(n, t)| (n.as_str(), t.as_str())), Some(("1", "50")));
+        assert_eq!(
+            by.get("Ada").map(|(n, t)| (n.as_str(), t.as_str())),
+            Some(("2", "300"))
+        );
+        assert_eq!(
+            by.get("Di").map(|(n, t)| (n.as_str(), t.as_str())),
+            Some(("2", "300"))
+        );
+        assert_eq!(
+            by.get("Bob").map(|(n, t)| (n.as_str(), t.as_str())),
+            Some(("1", "50"))
+        );
 
         // Running SUM with ROWS frame
         let run = session
@@ -11622,15 +12244,9 @@ ORDER BY a.attnum;"#;
     fn session_bare_having_e2e() {
         let (mut session, root) = temp_session("bare-having");
         session
-            .execute_sql(
-                "CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, salary BIGINT)",
-            )
+            .execute_sql("CREATE TABLE emp (id BIGINT PRIMARY KEY, department TEXT, salary BIGINT)")
             .unwrap();
-        for (id, dept, sal) in [
-            (1, "Eng", 100),
-            (2, "Eng", 200),
-            (3, "Sales", 50),
-        ] {
+        for (id, dept, sal) in [(1, "Eng", 100), (2, "Eng", 200), (3, "Sales", 50)] {
             session
                 .execute_sql(&format!(
                     "INSERT INTO emp (id, department, salary) VALUES ({id}, '{dept}', {sal})"
@@ -11748,7 +12364,10 @@ ORDER BY a.attnum;"#;
             .execute_sql("SELECT row_to_json(ROW(id, name)) FROM emp")
             .unwrap();
         let c = ctor.rows[0].fields.values().next().unwrap();
-        assert!(c.contains("\"id\":1") && c.contains("\"name\":\"Ada\""), "ctor={c}");
+        assert!(
+            c.contains("\"id\":1") && c.contains("\"name\":\"Ada\""),
+            "ctor={c}"
+        );
         assert!(!c.contains("dept"), "ROW() must not include dept: {c}");
 
         let _ = fs::remove_dir_all(root);
@@ -11865,9 +12484,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("CREATE TABLE docs (id BIGINT PRIMARY KEY, tags TEXT)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO docs (id, tags) VALUES (1, '[10,20]'), (2, '[30]')",
-            )
+            .execute_sql("INSERT INTO docs (id, tags) VALUES (1, '[10,20]'), (2, '[30]')")
             .unwrap();
         let corr = session
             .execute_sql(
@@ -11895,9 +12512,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("CREATE TABLE objs (id BIGINT PRIMARY KEY, j TEXT)")
             .unwrap();
         session
-            .execute_sql(
-                r#"INSERT INTO objs (id, j) VALUES (1, '{"a":1,"b":2}'), (2, '{"z":9}')"#,
-            )
+            .execute_sql(r#"INSERT INTO objs (id, j) VALUES (1, '{"a":1,"b":2}'), (2, '{"z":9}')"#)
             .unwrap();
 
         let each = session
@@ -11949,9 +12564,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("CREATE TABLE arrs (id BIGINT PRIMARY KEY, tags TEXT)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO arrs (id, tags) VALUES (1, '[10,20]'), (2, '[30]')",
-            )
+            .execute_sql("INSERT INTO arrs (id, tags) VALUES (1, '[10,20]'), (2, '[30]')")
             .unwrap();
         let corr = session
             .execute_sql(
@@ -11978,9 +12591,7 @@ ORDER BY a.attnum;"#;
             .execute_sql("CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO docs (id, body) VALUES (1, 'a-b-c'), (2, 'x|y')",
-            )
+            .execute_sql("INSERT INTO docs (id, body) VALUES (1, 'a-b-c'), (2, 'x|y')")
             .unwrap();
 
         let split = session
@@ -12091,9 +12702,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(keys, vec!["a".to_string(), "z".to_string()]);
 
         let aliased = session
-            .execute_sql(
-                r#"SELECT k FROM json_object_keys('{"x":true}'::json) AS t(k)"#,
-            )
+            .execute_sql(r#"SELECT k FROM json_object_keys('{"x":true}'::json) AS t(k)"#)
             .unwrap();
         assert_eq!(aliased.rows.len(), 1);
         assert_eq!(aliased.rows[0].get("k"), Some("x"));
@@ -12173,9 +12782,7 @@ ORDER BY a.attnum;"#;
         assert_eq!(rows.rows[1].get("part"), Some("world"));
 
         let aliased = session
-            .execute_sql(
-                r#"SELECT x FROM regexp_split_to_table('aXbXc', 'x', 'i') AS t(x)"#,
-            )
+            .execute_sql(r#"SELECT x FROM regexp_split_to_table('aXbXc', 'x', 'i') AS t(x)"#)
             .unwrap();
         assert_eq!(aliased.rows.len(), 3);
         assert_eq!(aliased.rows[0].get("x"), Some("a"));
@@ -12579,14 +13186,10 @@ ORDER BY a.attnum;"#;
     fn session_ssi_write_skew_aborts_second_committer() {
         let (mut session, root) = temp_session("ssi-skew");
         session
-            .execute_sql(
-                "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INT NOT NULL)",
-            )
+            .execute_sql("CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INT NOT NULL)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO accounts (id, balance) VALUES ('A', '100'), ('B', '100')",
-            )
+            .execute_sql("INSERT INTO accounts (id, balance) VALUES ('A', '100'), ('B', '100')")
             .unwrap();
         session
             .execute_sql("SET transaction_isolation TO 'serializable'")
@@ -12647,14 +13250,10 @@ ORDER BY a.attnum;"#;
         // not the SSI doom path (RR must not register SSI).
         let (mut session, root) = temp_session("rr-skew");
         session
-            .execute_sql(
-                "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INT NOT NULL)",
-            )
+            .execute_sql("CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INT NOT NULL)")
             .unwrap();
         session
-            .execute_sql(
-                "INSERT INTO accounts (id, balance) VALUES ('A', '100'), ('B', '100')",
-            )
+            .execute_sql("INSERT INTO accounts (id, balance) VALUES ('A', '100'), ('B', '100')")
             .unwrap();
         assert_eq!(session.transaction_isolation(), "repeatable read");
 
@@ -12806,8 +13405,14 @@ ORDER BY a.attnum;"#;
 
         let mut session = SessionState::new(Arc::clone(&e1));
         session.attach_dist_shards([
-            (1, EngineShard::new(Arc::clone(&e1), 1) as Arc<dyn ShardParticipant>),
-            (2, EngineShard::new(Arc::clone(&e2), 2) as Arc<dyn ShardParticipant>),
+            (
+                1,
+                EngineShard::new(Arc::clone(&e1), 1) as Arc<dyn ShardParticipant>,
+            ),
+            (
+                2,
+                EngineShard::new(Arc::clone(&e2), 2) as Arc<dyn ShardParticipant>,
+            ),
         ]);
 
         session.execute_sql("BEGIN").unwrap();

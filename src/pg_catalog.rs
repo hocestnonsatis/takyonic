@@ -10,11 +10,7 @@ use crate::schema::{Record, TableSchema};
 /// Try to answer a catalog / information_schema introspection query.
 ///
 /// Returns [`None`] when `sql` is ordinary user SQL (caller should plan normally).
-pub fn try_handle(
-    sql: &str,
-    tables: &[TableSchema],
-    owner: &str,
-) -> Option<SessionResult> {
+pub fn try_handle(sql: &str, tables: &[TableSchema], owner: &str) -> Option<SessionResult> {
     let n = normalize(sql);
     if looks_like_psql_list_tables(&n) {
         return Some(list_relations_dt(tables, owner));
@@ -180,14 +176,8 @@ fn info_schema_columns(tables: &[TableSchema], normalized: &str) -> SessionResul
                     .set("table_name", table.name.as_str())
                     .set("column_name", col.name.as_str())
                     .set("ordinal_position", (i + 1).to_string())
-                    .set(
-                        "column_default",
-                        col.default_sql.as_deref().unwrap_or(""),
-                    )
-                    .set(
-                        "is_nullable",
-                        if col.nullable { "YES" } else { "NO" },
-                    )
+                    .set("column_default", col.default_sql.as_deref().unwrap_or(""))
+                    .set("is_nullable", if col.nullable { "YES" } else { "NO" })
                     .set("data_type", data_type.as_str())
                     .set("udt_name", udt.as_str()),
             );
@@ -224,10 +214,7 @@ fn info_schema_type_names(catalog_ty: &str) -> (String, String) {
         "JSONB" => "jsonb",
         "INTERVAL" => "interval",
         other => {
-            return (
-                other.to_ascii_lowercase(),
-                other.to_ascii_lowercase(),
-            );
+            return (other.to_ascii_lowercase(), other.to_ascii_lowercase());
         }
     };
     let data_type = match udt {
@@ -254,11 +241,7 @@ fn info_schema_type_names(catalog_ty: &str) -> (String, String) {
 }
 
 fn pg_tables(tables: &[TableSchema], owner: &str) -> SessionResult {
-    let columns = vec![
-        "schemaname".into(),
-        "tablename".into(),
-        "tableowner".into(),
-    ];
+    let columns = vec!["schemaname".into(), "tablename".into(), "tableowner".into()];
     let mut rows: Vec<Record> = tables
         .iter()
         .map(|t| {
@@ -342,9 +325,8 @@ mod tests {
                 ColumnSpec::new("id", "BIGINT"),
                 ColumnSpec::new("name", "TEXT"),
             ]),
-            TableSchema::new("orders", "id", vec![]).with_columns(vec![
-                ColumnSpec::new("id", "BIGINT"),
-            ]),
+            TableSchema::new("orders", "id", vec![])
+                .with_columns(vec![ColumnSpec::new("id", "BIGINT")]),
         ]
     }
 

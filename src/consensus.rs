@@ -737,7 +737,9 @@ impl RaftConsensus {
             return;
         }
         if let Some(started) = st.election_started_at.take() {
-            self.engine.metrics().record_raft_election(started.elapsed());
+            self.engine
+                .metrics()
+                .record_raft_election(started.elapsed());
         } else {
             self.engine
                 .metrics()
@@ -1199,8 +1201,7 @@ mod tests {
     fn mock_election_follower_candidate_leader() {
         let (engine, root) = temp_engine("elect");
         let log = RaftLog::open(root.join("raft")).unwrap();
-        let membership =
-            ClusterMembership::from_endpoints([(1, "127.0.0.1:1".into())]);
+        let membership = ClusterMembership::from_endpoints([(1, "127.0.0.1:1".into())]);
         let raft: Arc<RaftNode> = RaftConsensus::new(1, membership, log, engine);
         assert_eq!(raft.role(), Role::Follower);
         assert_eq!(raft.term(), 0);

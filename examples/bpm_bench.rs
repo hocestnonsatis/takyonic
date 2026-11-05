@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use takyonic::{BufferPoolManager, DEFAULT_LRU_K, DiskManager, DEFAULT_PAGE_SIZE};
+use takyonic::{BufferPoolManager, DEFAULT_LRU_K, DEFAULT_PAGE_SIZE, DiskManager};
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)

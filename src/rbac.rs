@@ -188,9 +188,7 @@ pub fn schema_exists(schema: &str, search_path: &str) -> bool {
     matches!(
         leaf.as_str(),
         "public" | "pg_catalog" | "information_schema"
-    ) || search_path
-        .split(',')
-        .any(|p| schema_name_leaf(p) == leaf)
+    ) || search_path.split(',').any(|p| schema_name_leaf(p) == leaf)
 }
 
 /// Default schema ACL (plus optional `GRANT ON SCHEMA` rows in AUTH):
@@ -375,7 +373,10 @@ pub fn tablespace_name_leaf(name: &str) -> String {
 
 /// Built-in tablespaces: `pg_default` (and alias `pg_global` as catalog name only).
 pub fn tablespace_exists(name: &str) -> bool {
-    matches!(tablespace_name_leaf(name).as_str(), "pg_default" | "pg_global")
+    matches!(
+        tablespace_name_leaf(name).as_str(),
+        "pg_default" | "pg_global"
+    )
 }
 
 /// PostgreSQL built-in tablespace OIDs (`pg_default`=1663, `pg_global`=1664).
@@ -426,9 +427,9 @@ pub fn has_tablespace_privilege(
             "tablespace \"{leaf}\" does not exist"
         )));
     }
-    Ok(privs.iter().any(|p| {
-        matches!(p, TablespacePrivilege::Create) && is_superuser
-    }))
+    Ok(privs
+        .iter()
+        .any(|p| matches!(p, TablespacePrivilege::Create) && is_superuser))
 }
 
 /// Function-level privilege for `has_function_privilege` (`EXECUTE`).
@@ -907,11 +908,8 @@ impl AuthCatalog {
     /// Catalog with the bootstrap `postgres` superuser.
     pub fn with_bootstrap() -> Self {
         let mut cat = Self::new();
-        let scram = ScramCredential::from_password(
-            BOOTSTRAP_PASSWORD,
-            BOOTSTRAP_SALT,
-            SCRAM_ITERATIONS,
-        );
+        let scram =
+            ScramCredential::from_password(BOOTSTRAP_PASSWORD, BOOTSTRAP_SALT, SCRAM_ITERATIONS);
         let argon2_hash = hash_password(BOOTSTRAP_PASSWORD).expect("argon2 bootstrap");
         cat.roles.insert(
             BOOTSTRAP_USER.to_string(),
@@ -989,10 +987,7 @@ impl AuthCatalog {
                 "MEMBER" => {
                     let member = parts.next().unwrap_or("").to_string();
                     let role = parts.next().unwrap_or("").to_string();
-                    cat.memberships
-                        .entry(member)
-                        .or_default()
-                        .insert(role);
+                    cat.memberships.entry(member).or_default().insert(role);
                 }
                 "GRANT" => {
                     let grantee = parts.next().unwrap_or("").to_string();
@@ -1130,9 +1125,7 @@ impl AuthCatalog {
             (None, None)
         };
         if can_login && password.is_none() {
-            return Err(TakyonicError::Sql(
-                "login role requires PASSWORD".into(),
-            ));
+            return Err(TakyonicError::Sql("login role requires PASSWORD".into()));
         }
         self.roles.insert(
             name.to_string(),
@@ -1187,12 +1180,7 @@ impl AuthCatalog {
     }
 
     /// Grant table privileges.
-    pub fn grant(
-        &mut self,
-        grantee: &str,
-        table: &str,
-        privileges: &[Privilege],
-    ) -> Result<()> {
+    pub fn grant(&mut self, grantee: &str, table: &str, privileges: &[Privilege]) -> Result<()> {
         if !self.roles.contains_key(grantee) {
             return Err(TakyonicError::Sql(format!(
                 "role `{grantee}` does not exist"
@@ -1209,12 +1197,7 @@ impl AuthCatalog {
     }
 
     /// Revoke table privileges.
-    pub fn revoke(
-        &mut self,
-        grantee: &str,
-        table: &str,
-        privileges: &[Privilege],
-    ) -> Result<()> {
+    pub fn revoke(&mut self, grantee: &str, table: &str, privileges: &[Privilege]) -> Result<()> {
         let key = (grantee.to_string(), table.to_string());
         if let Some(entry) = self.grants.get_mut(&key) {
             for p in privileges {
@@ -1337,9 +1320,9 @@ impl AuthCatalog {
         let table = table_name_leaf(table);
         let column = column.trim().to_ascii_lowercase();
         for role in &ctx.roles {
-            if let Some(set) = self
-                .column_grants
-                .get(&(role.clone(), table.to_string(), column.clone()))
+            if let Some(set) =
+                self.column_grants
+                    .get(&(role.clone(), table.to_string(), column.clone()))
             {
                 if set.contains(&priv_) {
                     return true;
@@ -1409,9 +1392,10 @@ impl AuthCatalog {
 
     /// Build an [`AuthContext`] for `user` (expanding memberships).
     pub fn auth_context(&self, user: &str) -> Result<AuthContext> {
-        let role = self.roles.get(user).ok_or_else(|| {
-            TakyonicError::PermissionDenied(format!("unknown user `{user}`"))
-        })?;
+        let role = self
+            .roles
+            .get(user)
+            .ok_or_else(|| TakyonicError::PermissionDenied(format!("unknown user `{user}`")))?;
         let mut roles = BTreeSet::new();
         roles.insert(user.to_string());
         if let Some(m) = self.memberships.get(user) {
@@ -1419,12 +1403,7 @@ impl AuthCatalog {
         }
         let mut is_superuser = role.is_superuser;
         for r in &roles {
-            if self
-                .roles
-                .get(r)
-                .map(|d| d.is_superuser)
-                .unwrap_or(false)
-            {
+            if self.roles.get(r).map(|d| d.is_superuser).unwrap_or(false) {
                 is_superuser = true;
             }
         }
@@ -1449,9 +1428,9 @@ impl AuthCatalog {
                 "role \"{role}\" does not exist"
             )));
         }
-        let ctx = self.auth_context(&user).map_err(|_| {
-            TakyonicError::Sql(format!("role \"{user}\" does not exist"))
-        })?;
+        let ctx = self
+            .auth_context(&user)
+            .map_err(|_| TakyonicError::Sql(format!("role \"{user}\" does not exist")))?;
         if ctx.is_superuser {
             return Ok(true);
         }
@@ -1483,9 +1462,7 @@ impl AuthCatalog {
         privs: &[Privilege],
     ) -> bool {
         let table = table_name_leaf(table);
-        privs
-            .iter()
-            .any(|p| self.has_privilege(ctx, table, *p))
+        privs.iter().any(|p| self.has_privilege(ctx, table, *p))
     }
 
     /// `has_column_privilege` — table grants apply to all columns; plus `CGRANT` rows.
@@ -1655,13 +1632,17 @@ fn walk_privs(plan: &LogicalPlan, out: &mut Vec<(String, Privilege)>) {
         LogicalPlan::Insert { table, .. } => {
             out.push((table.clone(), Privilege::Insert));
         }
-        LogicalPlan::Update { table, selection, .. } => {
+        LogicalPlan::Update {
+            table, selection, ..
+        } => {
             out.push((table.clone(), Privilege::Update));
             if selection.is_some() {
                 out.push((table.clone(), Privilege::Select));
             }
         }
-        LogicalPlan::Delete { table, selection, .. } => {
+        LogicalPlan::Delete {
+            table, selection, ..
+        } => {
             out.push((table.clone(), Privilege::Delete));
             if selection.is_some() {
                 out.push((table.clone(), Privilege::Select));
@@ -1839,37 +1820,27 @@ mod tests {
 
     #[test]
     fn schema_privilege_defaults() {
-        assert!(has_schema_privilege(
-            false,
-            "public",
-            "public",
-            &[SchemaPrivilege::Usage]
-        )
-        .unwrap());
-        assert!(!has_schema_privilege(
-            false,
-            "public",
-            "public",
-            &[SchemaPrivilege::Create]
-        )
-        .unwrap());
-        assert!(has_schema_privilege(
-            true,
-            "public",
-            "public",
-            &[SchemaPrivilege::Create]
-        )
-        .unwrap());
+        assert!(
+            has_schema_privilege(false, "public", "public", &[SchemaPrivilege::Usage]).unwrap()
+        );
+        assert!(
+            !has_schema_privilege(false, "public", "public", &[SchemaPrivilege::Create]).unwrap()
+        );
+        assert!(
+            has_schema_privilege(true, "public", "public", &[SchemaPrivilege::Create]).unwrap()
+        );
         let err =
             has_schema_privilege(false, "nope", "public", &[SchemaPrivilege::Usage]).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
-        assert!(!has_schema_privilege(
-            false,
-            "myschema",
-            "myschema, public",
-            &[SchemaPrivilege::Usage]
-        )
-        .unwrap());
+        assert!(
+            !has_schema_privilege(
+                false,
+                "myschema",
+                "myschema, public",
+                &[SchemaPrivilege::Usage]
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1880,57 +1851,47 @@ mod tests {
         cat.grant_schema("analyst", "public", &[SchemaPrivilege::Create])
             .unwrap();
         let ctx = cat.auth_context("analyst").unwrap();
-        assert!(cat
-            .has_any_schema_privilege(&ctx, "public", "public", &[SchemaPrivilege::Create])
-            .unwrap());
+        assert!(
+            cat.has_any_schema_privilege(&ctx, "public", "public", &[SchemaPrivilege::Create])
+                .unwrap()
+        );
         let text = cat.encode();
         assert!(text.contains("SGRANT\tanalyst\tpublic\tCREATE"));
         let mut parsed = AuthCatalog::parse(&text).unwrap();
         let ctx2 = parsed.auth_context("analyst").unwrap();
-        assert!(parsed
-            .has_any_schema_privilege(&ctx2, "public", "public", &[SchemaPrivilege::Create])
-            .unwrap());
+        assert!(
+            parsed
+                .has_any_schema_privilege(&ctx2, "public", "public", &[SchemaPrivilege::Create])
+                .unwrap()
+        );
         parsed
             .revoke_schema("analyst", "public", &[SchemaPrivilege::Create])
             .unwrap();
         let ctx3 = parsed.auth_context("analyst").unwrap();
-        assert!(!parsed
-            .has_any_schema_privilege(&ctx3, "public", "public", &[SchemaPrivilege::Create])
-            .unwrap());
+        assert!(
+            !parsed
+                .has_any_schema_privilege(&ctx3, "public", "public", &[SchemaPrivilege::Create])
+                .unwrap()
+        );
     }
 
     #[test]
     fn database_privilege_defaults() {
-        assert!(has_database_privilege(
-            false,
-            "postgres",
-            &[DatabasePrivilege::Connect]
-        )
-        .unwrap());
-        assert!(!has_database_privilege(
-            false,
-            "postgres",
-            &[DatabasePrivilege::Create]
-        )
-        .unwrap());
-        assert!(!has_database_privilege(
-            false,
-            "postgres",
-            &[DatabasePrivilege::Temporary]
-        )
-        .unwrap());
-        assert!(has_database_privilege(
-            true,
-            "postgres",
-            &[DatabasePrivilege::Create, DatabasePrivilege::Temporary]
-        )
-        .unwrap());
-        let err = has_database_privilege(
-            false,
-            "otherdb",
-            &[DatabasePrivilege::Connect],
-        )
-        .unwrap_err();
+        assert!(has_database_privilege(false, "postgres", &[DatabasePrivilege::Connect]).unwrap());
+        assert!(!has_database_privilege(false, "postgres", &[DatabasePrivilege::Create]).unwrap());
+        assert!(
+            !has_database_privilege(false, "postgres", &[DatabasePrivilege::Temporary]).unwrap()
+        );
+        assert!(
+            has_database_privilege(
+                true,
+                "postgres",
+                &[DatabasePrivilege::Create, DatabasePrivilege::Temporary]
+            )
+            .unwrap()
+        );
+        let err =
+            has_database_privilege(false, "otherdb", &[DatabasePrivilege::Connect]).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
         assert_eq!(
             DatabasePrivilege::parse_list("CONNECT, TEMP").unwrap(),
@@ -1972,22 +1933,27 @@ mod tests {
             .unwrap();
         cat.create_role("analyst", true, false, Some("pw"), false)
             .unwrap();
-        assert!(!cat
-            .has_role_privilege("analyst", "analysts", &[RolePrivilege::Member])
-            .unwrap());
+        assert!(
+            !cat.has_role_privilege("analyst", "analysts", &[RolePrivilege::Member])
+                .unwrap()
+        );
         cat.grant_membership("analysts", "analyst").unwrap();
-        assert!(cat
-            .has_role_privilege("analyst", "analysts", &[RolePrivilege::Member])
-            .unwrap());
-        assert!(cat
-            .has_role_privilege("analyst", "analysts", &[RolePrivilege::Usage])
-            .unwrap());
-        assert!(cat
-            .has_role_privilege("analyst", "analyst", &[RolePrivilege::Set])
-            .unwrap());
-        assert!(cat
-            .has_role_privilege("postgres", "analysts", &[RolePrivilege::Member])
-            .unwrap());
+        assert!(
+            cat.has_role_privilege("analyst", "analysts", &[RolePrivilege::Member])
+                .unwrap()
+        );
+        assert!(
+            cat.has_role_privilege("analyst", "analysts", &[RolePrivilege::Usage])
+                .unwrap()
+        );
+        assert!(
+            cat.has_role_privilege("analyst", "analyst", &[RolePrivilege::Set])
+                .unwrap()
+        );
+        assert!(
+            cat.has_role_privilege("postgres", "analysts", &[RolePrivilege::Member])
+                .unwrap()
+        );
         let err = cat
             .has_role_privilege("analyst", "nope", &[RolePrivilege::Member])
             .unwrap_err();
@@ -2004,8 +1970,8 @@ mod tests {
         let exists = |n: &str| crate::oid::type_oid_from_name(n).is_some();
         assert!(has_type_privilege(false, "integer", &[TypePrivilege::Usage], exists).unwrap());
         assert!(has_type_privilege(true, "integer", &[TypePrivilege::Usage], exists).unwrap());
-        let err = has_type_privilege(false, "nope_type", &[TypePrivilege::Usage], exists)
-            .unwrap_err();
+        let err =
+            has_type_privilege(false, "nope_type", &[TypePrivilege::Usage], exists).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 
@@ -2065,18 +2031,8 @@ mod tests {
             "name",
             &[ColumnPrivilege::Update]
         ));
-        assert!(!cat.has_any_column_privilege(
-            &ctx,
-            "employees",
-            "id",
-            &[ColumnPrivilege::Update]
-        ));
-        assert!(cat.has_any_column_privilege(
-            &ctx,
-            "employees",
-            "",
-            &[ColumnPrivilege::Update]
-        ));
+        assert!(!cat.has_any_column_privilege(&ctx, "employees", "id", &[ColumnPrivilege::Update]));
+        assert!(cat.has_any_column_privilege(&ctx, "employees", "", &[ColumnPrivilege::Update]));
         let text = cat.encode();
         assert!(text.contains("CGRANT\tanalyst\temployees\tname\tUPDATE"));
         let mut parsed = AuthCatalog::parse(&text).unwrap();

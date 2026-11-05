@@ -49,9 +49,7 @@ use tracing::{info, warn};
 
 use pgwire::tokio::process_socket;
 use takyonic::pg::TakyonicPgFactory;
-use takyonic::{
-    Config, TakyonicClient, TakyonicNode, demo_users_schema, should_seed_demo_users,
-};
+use takyonic::{Config, TakyonicClient, TakyonicNode, demo_users_schema, should_seed_demo_users};
 
 /// Resolved runtime configuration for one server process.
 struct ServerArgs {
@@ -196,10 +194,9 @@ TAKYONIC_DEMO_BOOTSTRAP=0 takyonic-server"
         .unwrap_or_else(|| "0.0.0.0".to_string());
     let data_dir = data_dir
         .or_else(|| env("TAKYONIC_DATA").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/data"));
-    let object_store_root = object_store_root.or_else(|| {
-        env("TAKYONIC_OBJECT_STORE").map(PathBuf::from)
-    });
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    let object_store_root =
+        object_store_root.or_else(|| env("TAKYONIC_OBJECT_STORE").map(PathBuf::from));
     let s3_endpoint = s3_endpoint.or_else(|| env("TAKYONIC_S3_ENDPOINT"));
     let s3_bucket = s3_bucket.or_else(|| env("TAKYONIC_S3_BUCKET"));
     let s3_region = s3_region
@@ -324,14 +321,8 @@ async fn main() -> Result<()> {
             use takyonic::object_store::S3Backend;
             let endpoint = cfg.s3_endpoint.as_deref().unwrap();
             let bucket = cfg.s3_bucket.as_deref().unwrap();
-            let access = cfg
-                .s3_access_key
-                .as_deref()
-                .unwrap_or("minioadmin");
-            let secret = cfg
-                .s3_secret_key
-                .as_deref()
-                .unwrap_or("minioadmin");
+            let access = cfg.s3_access_key.as_deref().unwrap_or("minioadmin");
+            let secret = cfg.s3_secret_key.as_deref().unwrap_or("minioadmin");
             info!(%endpoint, %bucket, "connecting S3 / MinIO object store");
             let store = S3Backend::connect_minio(bucket, endpoint, access, secret)
                 .await
@@ -356,8 +347,7 @@ Rebuild: cargo build --release --bin takyonic-server --features s3"
         }
     } else {
         Arc::new(
-            TakyonicNode::open(args.node_id, &root, endpoints.clone(), cfg)
-                .context("open node")?,
+            TakyonicNode::open(args.node_id, &root, endpoints.clone(), cfg).context("open node")?,
         )
     };
     let (_server, _ticker) = node.start_background();
@@ -438,6 +428,7 @@ Rebuild: cargo build --release --bin takyonic-server --features s3"
         "  connect   : PGPASSWORD=password psql -h 127.0.0.1 -p {} -U postgres -d postgres",
         args.pg_port
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let mut shutdown = shutdown_signal();
     loop {

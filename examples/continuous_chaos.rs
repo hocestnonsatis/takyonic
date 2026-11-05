@@ -20,8 +20,7 @@ fn main() {
         cfg.seed,
         cfg.duration.as_secs()
     );
-    let report =
-        takyonic::reliability::continuous::run_continuous_chaos(cfg, hb.as_deref());
+    let report = takyonic::reliability::continuous::run_continuous_chaos(cfg, hb.as_deref());
     println!("{}", report.summary());
     if !report.ok() {
         std::process::exit(1);

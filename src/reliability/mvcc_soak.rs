@@ -59,9 +59,7 @@ fn account_record(id: usize, balance: i64) -> Record {
 }
 
 fn parse_balance(rec: &Record) -> i64 {
-    rec.get("balance")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    rec.get("balance").and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -97,10 +95,7 @@ fn transfer_once(
         txn.abort();
         return Ok(());
     }
-    txn.put_record(
-        "accounts",
-        account_record(from, from_bal - amount),
-    )?;
+    txn.put_record("accounts", account_record(from, from_bal - amount))?;
     txn.put_record("accounts", account_record(to, to_bal + amount))?;
     txn.commit()?;
     Ok(())
@@ -220,9 +215,7 @@ pub fn run_mvcc_soak(cfg: MvccSoakConfig) -> ReliabilityReport {
                     Ok(sum) if sum == expected_sum => {}
                     Ok(sum) => {
                         if let Ok(mut v) = violations.lock() {
-                            v.push(format!(
-                                "reader {r}: sum {sum} != expected {expected_sum}"
-                            ));
+                            v.push(format!("reader {r}: sum {sum} != expected {expected_sum}"));
                         }
                         stop.store(true, Ordering::Relaxed);
                         return;
@@ -290,10 +283,7 @@ mod tests {
             seed: 7,
             writers: 4,
             readers: 2,
-            duration: Duration::from_secs(crate::reliability::env_u64(
-                "TAKYONIC_SOAK_SECS",
-                5,
-            )),
+            duration: Duration::from_secs(crate::reliability::env_u64("TAKYONIC_SOAK_SECS", 5)),
             accounts: 32,
         };
         let report = run_mvcc_soak(cfg);

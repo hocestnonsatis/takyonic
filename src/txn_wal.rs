@@ -20,8 +20,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::error::{Result, TakyonicError};
 use crate::memtable::Memtable;
 use crate::schema::{DATA_PREFIX, IDX_PREFIX};
-use crate::types::{Entry, Key, Value};
 use crate::txn::WriteOp;
+use crate::types::{Entry, Key, Value};
 
 /// On-disk file name under `data_dir`.
 pub const TXN_WAL_FILE: &str = "TXN_WAL";
@@ -190,9 +190,7 @@ fn take_bytes(body: &[u8]) -> Result<(&[u8], &[u8])> {
     let len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
     let rest = &body[4..];
     if rest.len() < len {
-        return Err(TakyonicError::Integrity(
-            "txn WAL truncated payload".into(),
-        ));
+        return Err(TakyonicError::Integrity("txn WAL truncated payload".into()));
     }
     Ok((&rest[..len], &rest[len..]))
 }
@@ -360,7 +358,9 @@ impl WalManager {
             return Ok(Vec::new());
         }
         if &magic != MAGIC {
-            return Err(TakyonicError::Integrity("txn WAL bad magic on recover".into()));
+            return Err(TakyonicError::Integrity(
+                "txn WAL bad magic on recover".into(),
+            ));
         }
         let mut ver = [0u8; 1];
         reader.read_exact(&mut ver)?;
@@ -444,10 +444,7 @@ impl WalManager {
             );
         }
 
-        info!(
-            commits = committed.len(),
-            "txn WAL redo scan complete"
-        );
+        info!(commits = committed.len(), "txn WAL redo scan complete");
         Ok(committed)
     }
 
@@ -568,10 +565,7 @@ mod tests {
 
     #[test]
     fn table_from_data_and_idx_keys() {
-        assert_eq!(
-            table_from_storage_key(b"Data_employees_1"),
-            "employees"
-        );
+        assert_eq!(table_from_storage_key(b"Data_employees_1"), "employees");
         assert_eq!(
             table_from_storage_key(b"Idx_employees_dept_Sales_1"),
             "employees"
