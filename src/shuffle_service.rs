@@ -76,10 +76,7 @@ impl ShuffleService for ShuffleGrpcService {
             .try_fetch(key, req.partition)
             .map_err(Self::map_err)?;
         Ok(Response::new(FetchShuffleResponse {
-            rows: encode_rows(&rows)
-                .into_iter()
-                .map(|b| b.to_vec())
-                .collect(),
+            rows: encode_rows(&rows).into_iter().map(|b| b.to_vec()).collect(),
             eos,
         }))
     }
@@ -92,10 +89,7 @@ impl ShuffleService for ShuffleGrpcService {
         let spec = FragmentSpec::decode(Bytes::from(req.fragment)).map_err(Self::map_err)?;
         let rows = self.worker.execute_fragment(&spec).map_err(Self::map_err)?;
         Ok(Response::new(ExecuteFragmentResponse {
-            rows: encode_rows(&rows)
-                .into_iter()
-                .map(|b| b.to_vec())
-                .collect(),
+            rows: encode_rows(&rows).into_iter().map(|b| b.to_vec()).collect(),
         }))
     }
 
@@ -222,9 +216,7 @@ impl FragmentDispatcher for GrpcFragmentDispatcher {
         self.block_on(async {
             let mut client = self.client(node_id).await?;
             let resp = client
-                .execute_fragment(Request::new(ExecuteFragmentRequest {
-                    fragment: encoded,
-                }))
+                .execute_fragment(Request::new(ExecuteFragmentRequest { fragment: encoded }))
                 .await
                 .map_err(|e| TakyonicError::Network(e.to_string()))?
                 .into_inner();
@@ -320,11 +312,7 @@ impl RemoteShuffleClient {
     }
 
     /// Fetch available rows from a remote partition.
-    pub fn try_fetch(
-        &self,
-        key: ShuffleKey,
-        partition: u32,
-    ) -> Result<(Vec<Record>, bool)> {
+    pub fn try_fetch(&self, key: ShuffleKey, partition: u32) -> Result<(Vec<Record>, bool)> {
         self.block_on(async {
             let mut client = self.connect().await?;
             let resp = client
@@ -450,4 +438,3 @@ mod tests {
         assert!(mgr.try_push(key, 0, &row, true).unwrap());
     }
 }
-

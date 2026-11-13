@@ -500,11 +500,13 @@ mod tests {
     ) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let ok = nodes.iter().all(|n| match (n.get(key).ok().flatten(), expect) {
-                (Some(v), Some(e)) => v.as_bytes() == e,
-                (None, None) => true,
-                _ => false,
-            });
+            let ok = nodes
+                .iter()
+                .all(|n| match (n.get(key).ok().flatten(), expect) {
+                    (Some(v), Some(e)) => v.as_bytes() == e,
+                    (None, None) => true,
+                    _ => false,
+                });
             if ok {
                 return;
             }
@@ -619,9 +621,7 @@ mod tests {
             .await
             .expect("insert user");
         client
-            .execute_session_sql(
-                "INSERT INTO orders (id, user_id, item) VALUES (10, 1, 'book')",
-            )
+            .execute_session_sql("INSERT INTO orders (id, user_id, item) VALUES (10, 1, 'book')")
             .await
             .expect("insert order");
         wait_replicas_caught_up(&nodes, Duration::from_secs(30)).await;
@@ -639,9 +639,7 @@ mod tests {
         assert_eq!(joined.rows[0].get("item"), Some("book"));
 
         let err = client
-            .execute_sql(
-                "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id",
-            )
+            .execute_sql("SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id")
             .await
             .expect_err("narrow path must stay pgwire-only");
         assert!(
@@ -683,10 +681,11 @@ mod tests {
                 }
             };
             let leader = nodes.iter().find(|n| n.id() == leader_id).unwrap();
-            let target = leader.raft().commit_index().max(leader.engine().last_applied());
-            let all_ok = nodes
-                .iter()
-                .all(|n| n.engine().last_applied() >= target);
+            let target = leader
+                .raft()
+                .commit_index()
+                .max(leader.engine().last_applied());
+            let all_ok = nodes.iter().all(|n| n.engine().last_applied() >= target);
             if all_ok {
                 return;
             }
@@ -730,8 +729,12 @@ mod tests {
     }
 
     /// Poll until `pred` is true on every node, or panic with per-node status.
-    async fn wait_all_nodes<F>(nodes: &[Arc<TakyonicNode>], label: &str, timeout: Duration, mut pred: F)
-    where
+    async fn wait_all_nodes<F>(
+        nodes: &[Arc<TakyonicNode>],
+        label: &str,
+        timeout: Duration,
+        mut pred: F,
+    ) where
         F: FnMut(&TakyonicNode) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -864,9 +867,7 @@ mod tests {
         session
             .execute_sql("GRANT SELECT ON sales TO analyst")
             .expect("grant");
-        session
-            .execute_sql("ANALYZE sales")
-            .expect("analyze");
+        session.execute_sql("ANALYZE sales").expect("analyze");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         loop {
@@ -987,10 +988,7 @@ mod tests {
         .expect("join")
         .expect("execute");
         assert!(
-            matches!(
-                outcome,
-                crate::dtxn::DistTxnOutcome::Committed { .. }
-            ),
+            matches!(outcome, crate::dtxn::DistTxnOutcome::Committed { .. }),
             "expected Committed, got {outcome:?}"
         );
 
@@ -1156,15 +1154,17 @@ mod tests {
             .unwrap();
         }
 
-        remotes[2]
-            .inject_crash_after_prepare(true)
-            .expect("inject");
+        remotes[2].inject_crash_after_prepare(true).expect("inject");
         let tc2 = Arc::clone(&tc);
         let outcome = tokio::task::spawn_blocking(move || {
             tc2.execute(DistTxnRequest {
                 read_ts: 0,
                 branches: vec![
-                    put_branch(1, Key::new(b"acct".as_slice()), Value::new(b"90".as_slice())),
+                    put_branch(
+                        1,
+                        Key::new(b"acct".as_slice()),
+                        Value::new(b"90".as_slice()),
+                    ),
                     put_branch(2, Key::new(b"y".as_slice()), Value::new(b"9".as_slice())),
                     put_branch(3, Key::new(b"z".as_slice()), Value::new(b"9".as_slice())),
                 ],
@@ -1204,9 +1204,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(n >= 1);
-        assert!(remotes[2]
-            .get(&Key::new(b"z".as_slice()))
-            .is_none());
+        assert!(remotes[2].get(&Key::new(b"z".as_slice())).is_none());
         // Bank invariant: aborted transfer must not debit seed account.
         assert_eq!(
             nodes[0]
@@ -1314,9 +1312,8 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let all_nodes = || -> Vec<Arc<TakyonicNode>> {
-            live.values().map(|(n, _)| Arc::clone(n)).collect()
-        };
+        let all_nodes =
+            || -> Vec<Arc<TakyonicNode>> { live.values().map(|(n, _)| Arc::clone(n)).collect() };
 
         let leader_id = wait_for_leader(&all_nodes(), Duration::from_secs(10))
             .await
@@ -1341,8 +1338,7 @@ mod tests {
         }
         drop(_killed);
 
-        let survivors: Vec<Arc<TakyonicNode>> =
-            live.values().map(|(n, _)| Arc::clone(n)).collect();
+        let survivors: Vec<Arc<TakyonicNode>> = live.values().map(|(n, _)| Arc::clone(n)).collect();
         let new_leader = wait_for_leader(&survivors, Duration::from_secs(15))
             .await
             .expect("reelect after crash");

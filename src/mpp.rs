@@ -17,13 +17,9 @@ use tracing::debug;
 
 use crate::engine::TakyonicEngine;
 use crate::error::{Result, TakyonicError};
-use crate::partition::{
-    PartitionPruningRule, PartitionRouter, Rebalancer,
-};
+use crate::partition::{PartitionPruningRule, PartitionRouter, Rebalancer};
 use crate::schema::Record;
-use crate::shuffle::{
-    Distribution, ShuffleKey, ShuffleManager, hash_partition,
-};
+use crate::shuffle::{Distribution, ShuffleKey, ShuffleManager, hash_partition};
 use crate::sql::{Expression, JoinType, LogicalPlan};
 use crate::telemetry::EngineMetrics;
 
@@ -326,7 +322,9 @@ fn get_str(data: &mut Bytes) -> Result<String> {
     }
     let n = data.get_u32_le() as usize;
     if data.remaining() < n {
-        return Err(TakyonicError::Engine("fragment string body truncated".into()));
+        return Err(TakyonicError::Engine(
+            "fragment string body truncated".into(),
+        ));
     }
     let bytes = data.copy_to_bytes(n);
     String::from_utf8(bytes.to_vec())
@@ -393,13 +391,9 @@ impl Fragmenter {
         }
         if let Some(schema) = schema {
             let router = PartitionRouter::new(self.workers.clone());
-            worker_frags = PartitionPruningRule::prune_fragments(
-                schema,
-                predicate,
-                worker_frags,
-                &router,
-            )
-            .unwrap_or_default();
+            worker_frags =
+                PartitionPruningRule::prune_fragments(schema, predicate, worker_frags, &router)
+                    .unwrap_or_default();
         }
         let final_frag = FragmentSpec::FinalAggregate {
             shuffle,
@@ -423,10 +417,7 @@ impl Fragmenter {
         let targets = if let Some(schema) = schema {
             PartitionPruningRule::prune_workers(schema, predicate, &router)?
         } else {
-            self.workers
-                .iter()
-                .map(|w| (w.node_id, w.slot))
-                .collect()
+            self.workers.iter().map(|w| (w.node_id, w.slot)).collect()
         };
         let part_count = schema
             .map(|s| s.partitioning.partition_count().max(n))
@@ -659,8 +650,7 @@ impl Worker {
                     };
                     let mut batches: HashMap<u32, Vec<Record>> = HashMap::new();
                     for row in &rows {
-                        let p =
-                            dist.partition_of(row, *partition_count, self.shuffle.rr_counter());
+                        let p = dist.partition_of(row, *partition_count, self.shuffle.rr_counter());
                         batches.entry(p).or_default().push(row.clone());
                     }
                     for p in 0..*partition_count {
@@ -695,11 +685,7 @@ impl Worker {
                     };
                     let mut batches: HashMap<u32, Vec<Record>> = HashMap::new();
                     for row in &partial {
-                        let p = dist.partition_of(
-                            row,
-                            *partition_count,
-                            self.shuffle.rr_counter(),
-                        );
+                        let p = dist.partition_of(row, *partition_count, self.shuffle.rr_counter());
                         batches.entry(p).or_default().push(row.clone());
                     }
                     for p in 0..*partition_count {
@@ -1012,8 +998,7 @@ impl Coordinator {
     ) -> Result<Vec<Record>> {
         let schema = self.local.engine().table_schema(table)?;
         let frag = Fragmenter::new(self.workers.clone());
-        let worker_frags =
-            frag.fragment_partitioned_scan(table, Some(&schema), predicate)?;
+        let worker_frags = frag.fragment_partitioned_scan(table, Some(&schema), predicate)?;
         if worker_frags.is_empty() {
             return Ok(Vec::new());
         }
@@ -1063,8 +1048,7 @@ impl Coordinator {
             );
             return crate::executor::collect_rows(&mut hj);
         }
-        let mut join =
-            crate::executor::NestedLoopJoin::from_rows(left, right, on.clone());
+        let mut join = crate::executor::NestedLoopJoin::from_rows(left, right, on.clone());
         crate::executor::collect_rows(&mut join)
     }
 
@@ -1120,11 +1104,7 @@ impl Coordinator {
     /// single-process mode the row is written via the local worker after the
     /// router decides the target; with a remote dispatcher only that node is
     /// contacted.
-    pub fn execute_insert(
-        &self,
-        table: &str,
-        record: Record,
-    ) -> Result<(u64, u32)> {
+    pub fn execute_insert(&self, table: &str, record: Record) -> Result<(u64, u32)> {
         let schema = self.local.engine().table_schema(table)?;
         let col = schema
             .partitioning
@@ -1133,9 +1113,7 @@ impl Coordinator {
         let key = record
             .get(col)
             .ok_or_else(|| {
-                TakyonicError::Engine(format!(
-                    "INSERT missing partition key `{col}` on `{table}`"
-                ))
+                TakyonicError::Engine(format!("INSERT missing partition key `{col}` on `{table}`"))
             })?
             .to_string();
         let router = PartitionRouter::new(self.workers.clone());
@@ -1145,7 +1123,10 @@ impl Coordinator {
         let frag = FragmentSpec::PartitionedScan {
             table: table.to_string(),
             partition_id,
-            partition_count: schema.partitioning.partition_count().max(self.partition_count()),
+            partition_count: schema
+                .partitioning
+                .partition_count()
+                .max(self.partition_count()),
             shuffle: None,
         };
         // Touch the owning worker (metrics / remote path) then write locally
@@ -1172,11 +1153,7 @@ impl Coordinator {
     /// Route each row of a multi-row INSERT to its owning partition (no broadcast).
     ///
     /// Returns the number of rows written.
-    pub fn execute_insert_rows(
-        &self,
-        table: &str,
-        records: Vec<Record>,
-    ) -> Result<u64> {
+    pub fn execute_insert_rows(&self, table: &str, records: Vec<Record>) -> Result<u64> {
         let n = records.len() as u64;
         for record in records {
             let _ = self.execute_insert(table, record)?;
@@ -1278,10 +1255,7 @@ mod tests {
     fn distributed_aggregate_three_virtual_workers() {
         let (engine, root) = temp_engine("agg");
         seed_employees(&engine);
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let workers: Vec<_> = (0..3u32)
             .map(|slot| WorkerEndpoint {
                 node_id: u64::from(slot) + 1,
@@ -1294,7 +1268,11 @@ mod tests {
         let coord = Coordinator::local(Arc::clone(&engine), Arc::clone(&shuffle), workers);
         struct LocalDispatch(Worker);
         impl FragmentDispatcher for LocalDispatch {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 self.0.execute_fragment(fragment)
             }
         }
@@ -1333,10 +1311,7 @@ mod tests {
     fn distributed_min_max_avg_three_virtual_workers() {
         let (engine, root) = temp_engine("agg-mma");
         seed_employees(&engine);
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let workers: Vec<_> = (0..3u32)
             .map(|slot| WorkerEndpoint {
                 node_id: u64::from(slot) + 1,
@@ -1347,7 +1322,11 @@ mod tests {
         let coord = Coordinator::local(Arc::clone(&engine), Arc::clone(&shuffle), workers);
         struct LocalDispatch(Worker);
         impl FragmentDispatcher for LocalDispatch {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 self.0.execute_fragment(fragment)
             }
         }
@@ -1422,10 +1401,7 @@ mod tests {
         engine
             .register_table(TableSchema::new("employees_copy", "id", vec![]))
             .unwrap();
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let workers: Vec<_> = (0..3u32)
             .map(|slot| WorkerEndpoint {
                 node_id: u64::from(slot) + 1,
@@ -1436,7 +1412,11 @@ mod tests {
         let coord = Coordinator::local(Arc::clone(&engine), Arc::clone(&shuffle), workers);
         struct LocalDispatch(Worker);
         impl FragmentDispatcher for LocalDispatch {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 self.0.execute_fragment(fragment)
             }
         }
@@ -1590,11 +1570,7 @@ mod tests {
             32,
             Some(Arc::clone(leader_engine.metrics())),
         ));
-        let coord = Coordinator::local(
-            Arc::clone(&leader_engine),
-            leader_shuffle,
-            endpoints_list,
-        );
+        let coord = Coordinator::local(Arc::clone(&leader_engine), leader_shuffle, endpoints_list);
 
         struct MultiDispatch {
             workers: StdHashMap<u64, Worker>,
@@ -1630,7 +1606,10 @@ mod tests {
         assert_eq!(map.get("HR"), Some(&80));
 
         // Shuffle-phase load: every node should have executed a fragment.
-        let frag_total: u64 = nodes.iter().map(|n| n.engine().metrics().mpp_fragments()).sum();
+        let frag_total: u64 = nodes
+            .iter()
+            .map(|n| n.engine().metrics().mpp_fragments())
+            .sum();
         assert!(
             frag_total >= 3,
             "expected fragments on all workers, got {frag_total}"
@@ -1641,10 +1620,7 @@ mod tests {
             .collect();
         // At least two nodes should have sent shuffle traffic (partitioned load).
         let active = sent.iter().filter(|&&s| s > 0).count();
-        assert!(
-            active >= 2,
-            "shuffle load not distributed: sent={sent:?}"
-        );
+        assert!(active >= 2, "shuffle load not distributed: sent={sent:?}");
         assert!(
             sent.iter().copied().sum::<u64>() > 0,
             "3-node agg must increase shuffle sent metrics, sent={sent:?}"
@@ -1680,11 +1656,7 @@ mod tests {
             32,
             Some(Arc::clone(leader_engine.metrics())),
         ));
-        let coord = Coordinator::local(
-            Arc::clone(&leader_engine),
-            leader_shuffle,
-            endpoints_list,
-        );
+        let coord = Coordinator::local(Arc::clone(&leader_engine), leader_shuffle, endpoints_list);
         coord.set_dispatcher(Arc::new(MultiDispatch {
             workers: worker_map,
         }));
@@ -1764,7 +1736,11 @@ mod tests {
         );
         let seen = contacted.lock().unwrap().clone();
         let unique: std::collections::HashSet<_> = seen.iter().copied().collect();
-        assert_eq!(unique.len(), 3, "dispatcher must not broadcast, got {seen:?}");
+        assert_eq!(
+            unique.len(),
+            3,
+            "dispatcher must not broadcast, got {seen:?}"
+        );
         // Each insert contacts exactly one node.
         assert_eq!(seen.len(), 60);
 
@@ -1876,8 +1852,8 @@ mod tests {
     fn partition_pruning_explain_single_remote_worker() {
         use crate::executor::{explain_physical, optimize_with_catalog};
         use crate::partition::{PartitionMap, PartitioningStrategy};
-        use crate::sql::{Expression, LogicalPlan};
         use crate::query::FilterOp;
+        use crate::sql::{Expression, LogicalPlan};
 
         let schema = TableSchema::new("users", "user_id", vec![])
             .with_partitioning(PartitioningStrategy::Hash {

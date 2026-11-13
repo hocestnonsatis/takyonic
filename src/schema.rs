@@ -156,10 +156,7 @@ impl TableSchema {
     }
 
     /// Builder: attach a hashing / range partitioning strategy.
-    pub fn with_partitioning(
-        mut self,
-        strategy: crate::partition::PartitioningStrategy,
-    ) -> Self {
+    pub fn with_partitioning(mut self, strategy: crate::partition::PartitioningStrategy) -> Self {
         let n = strategy.partition_count();
         self.partitioning = strategy;
         if self.partition_map.assignments.is_empty() {

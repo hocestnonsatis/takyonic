@@ -36,9 +36,7 @@ use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 use crate::client_service::status_to_error;
-use crate::dtxn::{
-    DistTxnOutcome, DistTxnRequest, ShardParticipant, TransactionCoordinator,
-};
+use crate::dtxn::{DistTxnOutcome, DistTxnRequest, ShardParticipant, TransactionCoordinator};
 use crate::error::{Result, TakyonicError};
 use crate::executor::{self, ExecutionContext, value_to_field};
 use crate::network::proto::client_service_client::ClientServiceClient;
@@ -322,7 +320,9 @@ impl TakyonicClient {
                 .await?;
                 Ok(Vec::new())
             }
-            LogicalPlan::Delete { table, selection, .. } => {
+            LogicalPlan::Delete {
+                table, selection, ..
+            } => {
                 let pk = extract_pk_equality(&table, selection.as_ref(), &self.inner.schemas)?;
                 self.execute_txn(|txn| {
                     let table = table.clone();
@@ -661,11 +661,7 @@ impl TakyonicClient {
             let pk = pk.clone();
             async move {
                 client
-                    .txn_delete_record(Request::new(TxnDeleteRecordRequest {
-                        txn_id,
-                        table,
-                        pk,
-                    }))
+                    .txn_delete_record(Request::new(TxnDeleteRecordRequest { txn_id, table, pk }))
                     .await
                     .map_err(status_to_error)?;
                 Ok(())
@@ -965,9 +961,7 @@ mod tests {
     async fn execute_sql_join_is_pgwire_only() {
         let client = TakyonicClient::new(vec!["127.0.0.1:9"]);
         let err = client
-            .execute_sql(
-                "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id",
-            )
+            .execute_sql("SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id")
             .await
             .unwrap_err();
         assert_pgwire_only(err);

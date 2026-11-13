@@ -72,8 +72,9 @@ impl Distribution {
                 }
                 n - 1
             }
-            Distribution::RoundRobin => (rr_counter.fetch_add(1, Ordering::Relaxed) % u64::from(n))
-                as u32,
+            Distribution::RoundRobin => {
+                (rr_counter.fetch_add(1, Ordering::Relaxed) % u64::from(n)) as u32
+            }
         }
     }
 }
@@ -137,11 +138,7 @@ impl ShuffleManager {
         let mut map = self.partitions.lock();
         map.entry((key, partition)).or_insert_with(|| {
             let (tx, rx) = bounded(self.capacity);
-            Arc::new(Mutex::new(PartitionBuffer {
-                tx,
-                rx,
-                eos: false,
-            }))
+            Arc::new(Mutex::new(PartitionBuffer { tx, rx, eos: false }))
         });
     }
 
@@ -452,10 +449,7 @@ mod tests {
         let rr = AtomicU64::new(0);
         let r1 = Record::new().set("dept", "Eng").set("sal", "10");
         let r2 = Record::new().set("dept", "Eng").set("sal", "20");
-        assert_eq!(
-            d.partition_of(&r1, 4, &rr),
-            d.partition_of(&r2, 4, &rr)
-        );
+        assert_eq!(d.partition_of(&r1, 4, &rr), d.partition_of(&r2, 4, &rr));
     }
 
     #[test]

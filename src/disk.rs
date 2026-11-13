@@ -234,9 +234,7 @@ impl DiskManager {
     /// Register a read-only file (e.g. SST) for page-aligned cached reads.
     pub fn register_file(&self, path: impl AsRef<Path>) -> u32 {
         let id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
-        self.files
-            .lock()
-            .insert(id, path.as_ref().to_path_buf());
+        self.files.lock().insert(id, path.as_ref().to_path_buf());
         id
     }
 
@@ -369,7 +367,9 @@ impl DiskManager {
             extend_file(&mut file, need, self.page_size)?;
         }
         file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)?;
+        // O_DIRECT rejects writes whose user buffer is not page-aligned.
+        // Checkpoint snapshots are plain `Vec<u8>` copies, so stage them.
+        write_all_aligned(&mut file, data, self.page_size, self.direct_io)?;
         file.sync_data()?;
         Ok(())
     }
@@ -453,12 +453,7 @@ impl DiskManager {
         Ok(())
     }
 
-    fn read_registered_page(
-        &self,
-        file_id: u32,
-        page_index: u32,
-        page: &mut Page,
-    ) -> Result<()> {
+    fn read_registered_page(&self, file_id: u32, page_index: u32, page: &mut Page) -> Result<()> {
         let path = self
             .files
             .lock()
@@ -582,6 +577,25 @@ fn open_page_file(path: &Path, create: bool) -> Result<(File, bool)> {
     Ok((opts.open(path)?, false))
 }
 
+/// `O_DIRECT` requires the user-space pointer to be aligned to the logical
+/// block size. Page frames already are; copied snapshots are not.
+fn write_all_aligned(file: &mut File, data: &[u8], page_size: usize, direct: bool) -> Result<()> {
+    let aligned = page_size > 0 && (data.as_ptr() as usize) % page_size == 0;
+    if !direct || (aligned && data.len() % page_size == 0) {
+        file.write_all(data)?;
+        return Ok(());
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        let n = (data.len() - offset).min(page_size);
+        let mut frame = crate::page::Page::new_aligned(page_size);
+        frame.data_mut()[..n].copy_from_slice(&data[offset..offset + n]);
+        file.write_all(frame.data())?;
+        offset += page_size;
+    }
+    Ok(())
+}
+
 fn extend_file(file: &mut File, need: u64, page_size: usize) -> Result<()> {
     let len = file.metadata()?.len();
     if len >= need {
@@ -634,13 +648,19 @@ mod tests {
     #[test]
     fn s3_mock_shared_between_nodes() {
         let store = InMemoryObjectStore::new();
-        let s3: Arc<dyn ObjectStorage> =
-            Arc::new(S3Backend::mock("bucket", Arc::clone(&store) as Arc<dyn ObjectStorage>));
+        let s3: Arc<dyn ObjectStorage> = Arc::new(S3Backend::mock(
+            "bucket",
+            Arc::clone(&store) as Arc<dyn ObjectStorage>,
+        ));
 
         let root_a = temp_dir("node-a");
-        let dm_a =
-            DiskManager::open_with_remote(&root_a, DEFAULT_PAGE_SIZE, Some(Arc::clone(&s3)), REMOTE_PAGES_KEY)
-                .unwrap();
+        let dm_a = DiskManager::open_with_remote(
+            &root_a,
+            DEFAULT_PAGE_SIZE,
+            Some(Arc::clone(&s3)),
+            REMOTE_PAGES_KEY,
+        )
+        .unwrap();
         let id = dm_a.allocate_page();
         let mut page = Page::new_aligned(DEFAULT_PAGE_SIZE);
         page.page_id = id;
@@ -667,8 +687,10 @@ mod tests {
     #[test]
     fn cold_start_hydrates_from_object_storage() {
         let store = InMemoryObjectStore::new();
-        let s3: Arc<dyn ObjectStorage> =
-            Arc::new(S3Backend::mock("takyonic", Arc::clone(&store) as Arc<dyn ObjectStorage>));
+        let s3: Arc<dyn ObjectStorage> = Arc::new(S3Backend::mock(
+            "takyonic",
+            Arc::clone(&store) as Arc<dyn ObjectStorage>,
+        ));
         let root1 = temp_dir("warm");
         let dm = DiskManager::open_with_remote(
             &root1,
@@ -704,12 +726,14 @@ mod tests {
     #[test]
     fn three_node_shared_object_store_restart_integrity() {
         use crate::bpm::BufferPoolManager;
-        use crate::manifest::{ManifestManager, ManifestSst, StorageManifest};
         use crate::bpm::DEFAULT_LRU_K;
+        use crate::manifest::{ManifestManager, ManifestSst, StorageManifest};
 
         let store = InMemoryObjectStore::new();
-        let remote: Arc<dyn ObjectStorage> =
-            Arc::new(S3Backend::mock("cluster", Arc::clone(&store) as Arc<dyn ObjectStorage>));
+        let remote: Arc<dyn ObjectStorage> = Arc::new(S3Backend::mock(
+            "cluster",
+            Arc::clone(&store) as Arc<dyn ObjectStorage>,
+        ));
 
         // Node 1 writes pages + publishes manifest.
         let root1 = temp_dir("n1");
@@ -737,8 +761,7 @@ mod tests {
         bpm1.flush_all().unwrap();
         dm1.sync_pages_to_remote().unwrap();
 
-        let manifest_mgr =
-            ManifestManager::open(Arc::clone(&remote)).unwrap();
+        let manifest_mgr = ManifestManager::open(Arc::clone(&remote)).unwrap();
         let mut m = StorageManifest::new();
         m.pages_key = REMOTE_PAGES_KEY.into();
         m.sstables.push(ManifestSst {
@@ -771,10 +794,7 @@ mod tests {
             let loaded = mgr.current();
             assert!(loaded.version >= 1);
             assert_eq!(loaded.sstables[0].path, "sst/L0/1.sst");
-            assert_eq!(
-                remote.read_all("sst/L0/1.sst").unwrap(),
-                b"SST-PAYLOAD"
-            );
+            assert_eq!(remote.read_all("sst/L0/1.sst").unwrap(), b"SST-PAYLOAD");
 
             for (id, byte) in &expected {
                 let g = bpm.fetch_page(*id).unwrap();
@@ -820,11 +840,8 @@ mod tests {
         let mut p2 = Page::new_aligned(DEFAULT_PAGE_SIZE);
         p2.page_id = 2;
         p2.data_mut()[0] = 0x33;
-        dm.write_page_snapshots_coalesced(&[
-            (p1.page_id, p1.data()),
-            (p2.page_id, p2.data()),
-        ])
-        .unwrap();
+        dm.write_page_snapshots_coalesced(&[(p1.page_id, p1.data()), (p2.page_id, p2.data())])
+            .unwrap();
 
         assert_eq!(
             store.write_ops(),

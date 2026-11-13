@@ -22,8 +22,8 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -37,26 +37,26 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::consensus::{RaftConsensus, Role};
 use crate::disk::{DiskManager, PAGES_V2_PREFIX, REMOTE_PAGES_KEY};
+use crate::dtxn::TransactionCoordinator;
 use crate::error::{Result, TakyonicError};
+use crate::hnsw::HnswIndex;
 use crate::manifest::{ManifestManager, ManifestSst, StorageManifest};
 use crate::memtable::Memtable;
 use crate::object_store::{LocalFileBackend, ObjectStorage};
 use crate::query::Query;
 use crate::raft::{BatchApplyResult, CommittedEntry, LocalRaftNode, RaftCommand};
-use crate::hnsw::HnswIndex;
 use crate::rbac::{AuthCatalog, SharedAuthCatalog};
 use crate::schema::{
     ColumnSpec, IndexDef, Record, TableSchema, data_table_prefix, index_table_prefix,
 };
-use crate::vacuum::VacuumStats;
 use crate::snapshot::{SnapshotPayload, snapshot_sst_path};
 use crate::sst::{SstRegistry, SstWriter};
 use crate::stats::{self, StatsCatalog, TableStats};
 use crate::telemetry::{EngineMetrics, MetricsManager};
 use crate::txn::{IsolationLevel, SsiRegistry, StatsEdit, Transaction, TxnTracker, WriteOp};
 use crate::txn_wal::{WalManager, WalRecord, records_from_writes};
-use crate::dtxn::TransactionCoordinator;
 use crate::types::{CommitTs, Entry, Key, Value};
+use crate::vacuum::VacuumStats;
 use crate::vector::{VectorIndexSpec, VectorValue};
 use crate::wal::{WalReader, WalWriter, segment_path};
 
@@ -158,10 +158,7 @@ impl TakyonicEngine {
     ///
     /// On open the engine fetches `manifest/CURRENT.json` as the source of truth
     /// for SST / B-Tree / pages object keys.
-    pub fn open_with_object_storage(
-        config: Config,
-        store: Arc<dyn ObjectStorage>,
-    ) -> Result<Self> {
+    pub fn open_with_object_storage(config: Config, store: Arc<dyn ObjectStorage>) -> Result<Self> {
         Self::open_inner(config, Some(store))
     }
 
@@ -317,10 +314,8 @@ impl TakyonicEngine {
             None
         };
 
-        let txn_coordinator = TransactionCoordinator::open(
-            &config.data_dir,
-            Some(Arc::clone(&metrics)),
-        )?;
+        let txn_coordinator =
+            TransactionCoordinator::open(&config.data_dir, Some(Arc::clone(&metrics)))?;
 
         let engine = Self {
             config,
@@ -497,10 +492,7 @@ impl TakyonicEngine {
     ///
     /// When set, this overrides the auto-wired gRPC dispatcher (tests / custom
     /// cluster wiring). Pass `None` to clear.
-    pub fn set_mpp_dispatcher(
-        &self,
-        dispatcher: Option<Arc<dyn crate::mpp::FragmentDispatcher>>,
-    ) {
+    pub fn set_mpp_dispatcher(&self, dispatcher: Option<Arc<dyn crate::mpp::FragmentDispatcher>>) {
         *self.mpp_dispatcher.lock() = dispatcher;
     }
 
@@ -529,11 +521,7 @@ impl TakyonicEngine {
             crate::shuffle::DEFAULT_SHUFFLE_BUFFER,
             Some(Arc::clone(&self.metrics)),
         ));
-        let coord = crate::mpp::Coordinator::local(
-            Arc::clone(self),
-            shuffle,
-            workers,
-        );
+        let coord = crate::mpp::Coordinator::local(Arc::clone(self), shuffle, workers);
         if let Some(d) = self.mpp_dispatcher.lock().clone() {
             coord.set_dispatcher(d);
         } else {
@@ -809,11 +797,7 @@ impl TakyonicEngine {
     /// Append OCC write-set + `Commit` to the ARIES txn WAL and `sync_data`.
     ///
     /// Must run **before** the write-set is applied to the memtable / LSM.
-    pub(crate) fn log_txn_wal(
-        &self,
-        txn_id: u64,
-        writes: &BTreeMap<Key, WriteOp>,
-    ) -> Result<()> {
+    pub(crate) fn log_txn_wal(&self, txn_id: u64, writes: &BTreeMap<Key, WriteOp>) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -911,16 +895,16 @@ impl TakyonicEngine {
         query: &VectorValue,
         k: usize,
     ) -> Result<Vec<(f32, String)>> {
-        let graph = self.hnsw_index(index).ok_or_else(|| {
-            TakyonicError::Sql(format!("unknown vector index `{index}`"))
-        })?;
+        let graph = self
+            .hnsw_index(index)
+            .ok_or_else(|| TakyonicError::Sql(format!("unknown vector index `{index}`")))?;
         graph.search_knn(query, k)
     }
 
     fn hnsw_upsert(&self, index: &str, pk: &str, vector_text: &str) -> Result<()> {
-        let graph = self.hnsw_index(index).ok_or_else(|| {
-            TakyonicError::Sql(format!("unknown vector index `{index}`"))
-        })?;
+        let graph = self
+            .hnsw_index(index)
+            .ok_or_else(|| TakyonicError::Sql(format!("unknown vector index `{index}`")))?;
         let vec = VectorValue::from_text(vector_text)?;
         graph.insert(pk, vec)?;
         Ok(())
@@ -1343,9 +1327,10 @@ impl TakyonicEngine {
                     self.rename_table(&current, new_name)?;
                     current = new_name.clone();
                 }
-                crate::sql::AlterTableOp::SetDataType { name: col, data_type } => {
-                    self.set_column_type(&current, col, data_type)?
-                }
+                crate::sql::AlterTableOp::SetDataType {
+                    name: col,
+                    data_type,
+                } => self.set_column_type(&current, col, data_type)?,
             }
         }
         Ok(())
@@ -1364,21 +1349,15 @@ impl TakyonicEngine {
         }
         // Legacy tables with empty columns: seed PK so catalog stays coherent.
         if schema.columns.is_empty() {
-            schema.columns.push(ColumnSpec::new(
-                schema.primary_key.clone(),
-                "TEXT",
-            ));
+            schema
+                .columns
+                .push(ColumnSpec::new(schema.primary_key.clone(), "TEXT"));
         }
         schema.columns.push(column.clone());
         self.replicate_or_install_schema(schema)
     }
 
-    fn drop_column(
-        self: &Arc<Self>,
-        table: &str,
-        column: &str,
-        if_exists: bool,
-    ) -> Result<()> {
+    fn drop_column(self: &Arc<Self>, table: &str, column: &str, if_exists: bool) -> Result<()> {
         let schema = self.table_schema(table)?;
         if column == schema.primary_key {
             return Err(TakyonicError::Sql(format!(
@@ -1418,8 +1397,8 @@ impl TakyonicEngine {
             return Ok(());
         }
         let schema = self.table_schema(table)?;
-        let has_old = schema.columns.iter().any(|c| c.name == old_name)
-            || schema.primary_key == old_name;
+        let has_old =
+            schema.columns.iter().any(|c| c.name == old_name) || schema.primary_key == old_name;
         if !has_old {
             return Err(TakyonicError::Sql(format!(
                 "column `{old_name}` does not exist on table `{table}`"
@@ -1518,10 +1497,9 @@ impl TakyonicEngine {
         let Some(col) = schema.columns.iter_mut().find(|c| c.name == column) else {
             // Legacy empty column list: seed PK then fail if not that column.
             if schema.columns.is_empty() && schema.primary_key == column {
-                schema.columns.push(ColumnSpec::new(
-                    schema.primary_key.clone(),
-                    data_type,
-                ));
+                schema
+                    .columns
+                    .push(ColumnSpec::new(schema.primary_key.clone(), data_type));
                 return self.replicate_or_install_schema(schema);
             }
             return Err(TakyonicError::Sql(format!(
@@ -1620,7 +1598,12 @@ impl TakyonicEngine {
     }
 
     /// `COMMENT ON COLUMN table.col` / clear (`None`); persisted under `data_dir/COMMENTS`.
-    pub fn set_column_comment(&self, table: &str, column: &str, comment: Option<&str>) -> Result<()> {
+    pub fn set_column_comment(
+        &self,
+        table: &str,
+        column: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
         self.ensure_open()?;
         let key = format!(
             "c:{}.{}",
@@ -1640,12 +1623,7 @@ impl TakyonicEngine {
     }
 
     /// `COMMENT ON ROLE` / `COMMENT ON DATABASE` (shared objects); keys `r:` / `d:`.
-    pub fn set_shared_comment(
-        &self,
-        kind: &str,
-        name: &str,
-        comment: Option<&str>,
-    ) -> Result<()> {
+    pub fn set_shared_comment(&self, kind: &str, name: &str, comment: Option<&str>) -> Result<()> {
         self.ensure_open()?;
         let prefix = match kind {
             "role" | "r" => "r",
@@ -1778,17 +1756,18 @@ impl TakyonicEngine {
         self.ensure_open()?;
         {
             let schemas = self.schemas.read();
-            if schemas.values().any(|s| s.indexes.iter().any(|i| i.name == name)) {
+            if schemas
+                .values()
+                .any(|s| s.indexes.iter().any(|i| i.name == name))
+            {
                 if if_not_exists {
                     return Ok(());
                 }
-                return Err(TakyonicError::Sql(format!(
-                    "index `{name}` already exists"
-                )));
+                return Err(TakyonicError::Sql(format!("index `{name}` already exists")));
             }
-            let schema = schemas.get(table).ok_or_else(|| {
-                TakyonicError::Sql(format!("unknown table `{table}`"))
-            })?;
+            let schema = schemas
+                .get(table)
+                .ok_or_else(|| TakyonicError::Sql(format!("unknown table `{table}`")))?;
             if schema.primary_key == column {
                 return Err(TakyonicError::Sql(
                     "cannot create secondary index on the primary key column".into(),
@@ -2209,7 +2188,10 @@ impl TakyonicEngine {
     pub fn table_version_count(&self, table: &str) -> Result<u64> {
         let data = data_table_prefix(table);
         let idx = index_table_prefix(table);
-        Ok(self.count_versions_prefix(data.as_ref())? + self.count_versions_prefix(idx.as_ref())?)
+        Ok(
+            self.count_versions_prefix(data.as_ref())?
+                + self.count_versions_prefix(idx.as_ref())?,
+        )
     }
 
     /// Run `VACUUM` on `table`: GC dead heap + index versions below the watermark,
@@ -2549,8 +2531,7 @@ impl TakyonicEngine {
 
     /// Render Prometheus exposition text (same body as `GET /metrics`).
     pub fn render_metrics(&self) -> String {
-        self.metrics
-            .render_prometheus(self.buffer_pool.as_deref())
+        self.metrics.render_prometheus(self.buffer_pool.as_deref())
     }
 
     /// Average group-commit batch size observed so far.
@@ -2583,9 +2564,8 @@ impl TakyonicEngine {
         for committed in entries {
             match &committed.command {
                 RaftCommand::CatalogUpsert { table, schema } => {
-                    let text = std::str::from_utf8(schema.as_ref()).map_err(|e| {
-                        TakyonicError::Raft(format!("CatalogUpsert utf8: {e}"))
-                    })?;
+                    let text = std::str::from_utf8(schema.as_ref())
+                        .map_err(|e| TakyonicError::Raft(format!("CatalogUpsert utf8: {e}")))?;
                     let parsed = crate::catalog::parse_table_block(text)?;
                     if parsed.name != *table {
                         return Err(TakyonicError::Raft(format!(
@@ -2599,23 +2579,20 @@ impl TakyonicEngine {
                     self.remove_catalog_schema(table)?;
                 }
                 RaftCommand::AuthReplace { blob } => {
-                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
-                        TakyonicError::Raft(format!("AuthReplace utf8: {e}"))
-                    })?;
+                    let text = std::str::from_utf8(blob.as_ref())
+                        .map_err(|e| TakyonicError::Raft(format!("AuthReplace utf8: {e}")))?;
                     let catalog = crate::rbac::AuthCatalog::parse(text)?;
                     self.install_auth_catalog(catalog)?;
                 }
                 RaftCommand::StatsReplace { blob } => {
-                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
-                        TakyonicError::Raft(format!("StatsReplace utf8: {e}"))
-                    })?;
+                    let text = std::str::from_utf8(blob.as_ref())
+                        .map_err(|e| TakyonicError::Raft(format!("StatsReplace utf8: {e}")))?;
                     let snapshot = stats::parse_stats(text)?;
                     self.install_stats_catalog(snapshot)?;
                 }
                 RaftCommand::CommentsReplace { blob } => {
-                    let text = std::str::from_utf8(blob.as_ref()).map_err(|e| {
-                        TakyonicError::Raft(format!("CommentsReplace utf8: {e}"))
-                    })?;
+                    let text = std::str::from_utf8(blob.as_ref())
+                        .map_err(|e| TakyonicError::Raft(format!("CommentsReplace utf8: {e}")))?;
                     let map = parse_comments(text)?;
                     self.install_comments_catalog(map)?;
                 }
@@ -2995,7 +2972,11 @@ impl TakyonicEngine {
 
     /// Tombstone secondary-index keys that still point at values no longer present
     /// on the live (watermark-visible) heap row.
-    fn purge_dangling_index_entries(self: &Arc<Self>, table: &str, watermark: CommitTs) -> Result<u64> {
+    fn purge_dangling_index_entries(
+        self: &Arc<Self>,
+        table: &str,
+        watermark: CommitTs,
+    ) -> Result<u64> {
         use crate::schema::index_key;
         use crate::txn::index_store_value;
 
@@ -3109,8 +3090,7 @@ impl Drop for TakyonicEngine {
         if let Err(error) = self.close() {
             // Tests often `remove_dir_all` before the engine Arc drops; treat
             // missing paths as a benign teardown race.
-            if !matches!(&error, TakyonicError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
-            {
+            if !matches!(&error, TakyonicError::Io(e) if e.kind() == std::io::ErrorKind::NotFound) {
                 warn!(%error, "error while closing TakyonicEngine on drop");
             }
         }
@@ -3186,10 +3166,7 @@ fn recover_existing_ssts(manager: &SstManager) -> Result<()> {
 
 /// Pull SSTs listed in the shared manifest from object storage into the local
 /// data dir when this node has an empty / partial Tier-1 cache.
-fn hydrate_ssts_from_manifest(
-    manager: &SstManager,
-    manifest: &StorageManifest,
-) -> Result<()> {
+fn hydrate_ssts_from_manifest(manager: &SstManager, manifest: &StorageManifest) -> Result<()> {
     if !manager.has_remote() || manifest.sstables.is_empty() {
         return Ok(());
     }
@@ -3489,7 +3466,10 @@ mod tests {
             reopened.table_comment("users").as_deref(),
             Some("people\twith\nescapes")
         );
-        assert_eq!(reopened.column_comment("users", "id").as_deref(), Some("pk"));
+        assert_eq!(
+            reopened.column_comment("users", "id").as_deref(),
+            Some("pk")
+        );
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -3850,8 +3830,7 @@ mod tests {
         .unwrap();
         txn.commit().unwrap();
 
-        let idx_key =
-            crate::schema::index_key("employees", "idx_dept", "Engineering", "1");
+        let idx_key = crate::schema::index_key("employees", "idx_dept", "Engineering", "1");
         assert!(
             engine.get(&idx_key).unwrap().is_some(),
             "insert must write secondary index key"
@@ -4060,7 +4039,11 @@ mod tests {
             // Read path must use the B-Tree mirror (not only LSM).
             let mut txn = engine.begin().unwrap();
             assert_eq!(
-                txn.get_record("hot", "3").unwrap().unwrap().get("v").unwrap(),
+                txn.get_record("hot", "3")
+                    .unwrap()
+                    .unwrap()
+                    .get("v")
+                    .unwrap(),
                 "v3"
             );
             txn.abort();
@@ -4100,9 +4083,8 @@ mod tests {
         let config = temp_config("btree-vac", 64 * 1024 * 1024);
         let root = config.data_dir.parent().unwrap().to_path_buf();
         let engine = Arc::new(TakyonicEngine::open(config).unwrap());
-        let schema = TableSchema::new("hot", "id", vec![]).with_engine(
-            crate::storage::StorageEngineKind::BTree,
-        );
+        let schema = TableSchema::new("hot", "id", vec![])
+            .with_engine(crate::storage::StorageEngineKind::BTree);
         engine.register_table(schema).unwrap();
 
         for i in 0..30 {
@@ -4157,8 +4139,10 @@ mod tests {
         use crate::page::DEFAULT_PAGE_SIZE;
 
         let store = InMemoryObjectStore::new();
-        let remote: Arc<dyn ObjectStorage> =
-            Arc::new(S3Backend::mock("eng", Arc::clone(&store) as Arc<dyn ObjectStorage>));
+        let remote: Arc<dyn ObjectStorage> = Arc::new(S3Backend::mock(
+            "eng",
+            Arc::clone(&store) as Arc<dyn ObjectStorage>,
+        ));
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4253,7 +4237,9 @@ mod tests {
 
         let engine = TakyonicEngine::open(cfg).unwrap();
         assert!(engine.manifest().is_some());
-        engine.put(&b"d2-key"[..], &b"from-object-store"[..]).unwrap();
+        engine
+            .put(&b"d2-key"[..], &b"from-object-store"[..])
+            .unwrap();
         engine.force_flush().unwrap();
         let published = engine.publish_storage_manifest().unwrap().unwrap();
         assert!(
@@ -4331,8 +4317,10 @@ mod tests {
         use std::thread;
 
         let store = InMemoryObjectStore::new();
-        let remote: Arc<dyn ObjectStorage> =
-            Arc::new(S3Backend::mock("cluster", Arc::clone(&store) as Arc<dyn ObjectStorage>));
+        let remote: Arc<dyn ObjectStorage> = Arc::new(S3Backend::mock(
+            "cluster",
+            Arc::clone(&store) as Arc<dyn ObjectStorage>,
+        ));
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4375,8 +4363,7 @@ mod tests {
             let ids = ids.clone();
             let expected_ver = expected_ver;
             handles.push(thread::spawn(move || {
-                let root = std::env::temp_dir()
-                    .join(format!("takyonic-eng-reader-{nanos}-{n}"));
+                let root = std::env::temp_dir().join(format!("takyonic-eng-reader-{nanos}-{n}"));
                 let eng = Arc::new(
                     TakyonicEngine::open_with_object_storage(
                         Config::default()

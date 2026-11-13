@@ -14,9 +14,7 @@ use tokio::runtime::Handle;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
-use crate::dtxn::{
-    DistTxnId, EngineShard, LocalShard, ShardId, ShardParticipant, WriteOp,
-};
+use crate::dtxn::{DistTxnId, EngineShard, LocalShard, ShardId, ShardParticipant, WriteOp};
 use crate::engine::TakyonicEngine;
 use crate::error::{Result, TakyonicError};
 use crate::network::proto::twopc_service_client::TwopcServiceClient;
@@ -86,12 +84,7 @@ impl TwopcGrpcService {
     fn decode_reads(reads: &[crate::network::proto::TwopcReadCheck]) -> Vec<(Key, CommitTs)> {
         reads
             .iter()
-            .map(|r| {
-                (
-                    Key::new(Bytes::copy_from_slice(&r.key)),
-                    r.observed_ts,
-                )
-            })
+            .map(|r| (Key::new(Bytes::copy_from_slice(&r.key)), r.observed_ts))
             .collect()
     }
 }
@@ -523,18 +516,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(outcome, DistTxnOutcome::Committed { .. }));
-        assert_eq!(
-            cluster.remotes[0].get(&key("a")).unwrap().as_bytes(),
-            b"1"
-        );
-        assert_eq!(
-            cluster.remotes[1].get(&key("b")).unwrap().as_bytes(),
-            b"2"
-        );
-        assert_eq!(
-            cluster.remotes[2].get(&key("c")).unwrap().as_bytes(),
-            b"3"
-        );
+        assert_eq!(cluster.remotes[0].get(&key("a")).unwrap().as_bytes(), b"1");
+        assert_eq!(cluster.remotes[1].get(&key("b")).unwrap().as_bytes(), b"2");
+        assert_eq!(cluster.remotes[2].get(&key("c")).unwrap().as_bytes(), b"3");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -582,9 +566,18 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(outcome, DistTxnOutcome::Aborted { .. }));
-        assert_eq!(cluster.remotes[0].get(&key("a")).unwrap().as_bytes(), b"100");
-        assert_eq!(cluster.remotes[1].get(&key("b")).unwrap().as_bytes(), b"100");
-        assert_eq!(cluster.remotes[2].get(&key("c")).unwrap().as_bytes(), b"100");
+        assert_eq!(
+            cluster.remotes[0].get(&key("a")).unwrap().as_bytes(),
+            b"100"
+        );
+        assert_eq!(
+            cluster.remotes[1].get(&key("b")).unwrap().as_bytes(),
+            b"100"
+        );
+        assert_eq!(
+            cluster.remotes[2].get(&key("c")).unwrap().as_bytes(),
+            b"100"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

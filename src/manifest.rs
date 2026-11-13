@@ -153,12 +153,19 @@ impl ManifestManager {
     }
 
     /// Open with a custom current-pointer key.
-    pub fn open_with_key(store: Arc<dyn ObjectStorage>, current_key: impl Into<String>) -> Result<Self> {
+    pub fn open_with_key(
+        store: Arc<dyn ObjectStorage>,
+        current_key: impl Into<String>,
+    ) -> Result<Self> {
         let current_key = current_key.into();
         let cached = match store.read_all(&current_key) {
             Ok(bytes) => {
                 let m = StorageManifest::from_json(&bytes)?;
-                info!(version = m.version, sst = m.sstables.len(), "loaded storage manifest");
+                info!(
+                    version = m.version,
+                    sst = m.sstables.len(),
+                    "loaded storage manifest"
+                );
                 m
             }
             Err(_) => StorageManifest::new(),
@@ -248,7 +255,8 @@ mod tests {
             path: "sst/L0/7.sst".into(),
             level: 0,
         });
-        m.btree_roots.insert("users".into(), "btree/users.root".into());
+        m.btree_roots
+            .insert("users".into(), "btree/users.root".into());
         mgr.publish(m).unwrap();
 
         // Separate node: empty local state, hydrate from shared store.
@@ -257,10 +265,7 @@ mod tests {
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.sstables.len(), 1);
         assert_eq!(loaded.btree_roots.get("users").unwrap(), "btree/users.root");
-        assert!(matches!(
-            loaded.pages_layout,
-            PagesLayout::ChunkV2 { .. }
-        ));
+        assert!(matches!(loaded.pages_layout, PagesLayout::ChunkV2 { .. }));
         loaded.verify().unwrap();
     }
 

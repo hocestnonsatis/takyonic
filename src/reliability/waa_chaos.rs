@@ -76,10 +76,7 @@ mod tests {
                     ],
                 })
                 .expect_err("injected crash");
-            assert!(
-                err.to_string().contains("crash after durable"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("crash after durable"), "{err}");
         }
         let tc2 = TransactionCoordinator::open(&root, None).unwrap();
         tc2.register_shard(a.clone());
@@ -103,12 +100,10 @@ mod tests {
         {
             let engine = open_engine(&root);
             engine
-                .register_table(
-                    TableSchema::new(table, "id", vec![]).with_columns(vec![
-                        ColumnSpec::new("id", "BIGINT"),
-                        ColumnSpec::new("name", "TEXT"),
-                    ]),
-                )
+                .register_table(TableSchema::new(table, "id", vec![]).with_columns(vec![
+                    ColumnSpec::new("id", "BIGINT"),
+                    ColumnSpec::new("name", "TEXT"),
+                ]))
                 .unwrap();
             let mut session = SessionState::new(Arc::clone(&engine));
 
@@ -198,10 +193,7 @@ mod tests {
             )
             .unwrap();
 
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let worker = Worker::new(
             Arc::clone(&engine),
             Arc::clone(&shuffle),
@@ -219,7 +211,11 @@ mod tests {
             attempts: AtomicU64,
         }
         impl FragmentDispatcher for FlakyOnce {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(TakyonicError::Engine(
                         "connection unavailable (injected)".into(),
@@ -283,10 +279,7 @@ mod tests {
                     ],
                 })
                 .expect_err("injected crash");
-            assert!(
-                err.to_string().contains("crash after durable"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("crash after durable"), "{err}");
         }
         let tc2 = TransactionCoordinator::open(&root, None).unwrap();
         tc2.register_shard(a.clone());
@@ -312,8 +305,11 @@ mod tests {
             .unwrap();
         {
             let mut session = SessionState::new(Arc::clone(&engine));
-            for (id, dept, sal) in [("1", "Eng", "100"), ("2", "Eng", "200"), ("3", "Sales", "50")]
-            {
+            for (id, dept, sal) in [
+                ("1", "Eng", "100"),
+                ("2", "Eng", "200"),
+                ("3", "Sales", "50"),
+            ] {
                 session
                     .execute_sql(&format!(
                         "INSERT INTO employees (id, department, salary) VALUES ('{id}', '{dept}', '{sal}')"
@@ -321,10 +317,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let workers: Vec<_> = (0..3u32)
             .map(|slot| WorkerEndpoint {
                 node_id: u64::from(slot) + 1,
@@ -335,7 +328,11 @@ mod tests {
         let coord = Coordinator::local(Arc::clone(&engine), Arc::clone(&shuffle), workers);
         struct LocalDispatch(Worker);
         impl FragmentDispatcher for LocalDispatch {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 self.0.execute_fragment(fragment)
             }
         }
@@ -442,10 +439,7 @@ mod tests {
         let eng_r = Arc::clone(&engine);
         let tx_r = done_tx;
         thread::spawn(move || {
-            let shuffle = Arc::new(ShuffleManager::new(
-                32,
-                Some(Arc::clone(eng_r.metrics())),
-            ));
+            let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(eng_r.metrics()))));
             let workers: Vec<_> = (0..3u32)
                 .map(|slot| WorkerEndpoint {
                     node_id: u64::from(slot) + 1,
@@ -499,10 +493,7 @@ mod tests {
         }
 
         // Final MPP agg must still succeed after pressure.
-        let shuffle = Arc::new(ShuffleManager::new(
-            32,
-            Some(Arc::clone(engine.metrics())),
-        ));
+        let shuffle = Arc::new(ShuffleManager::new(32, Some(Arc::clone(engine.metrics()))));
         let workers: Vec<_> = (0..3u32)
             .map(|slot| WorkerEndpoint {
                 node_id: u64::from(slot) + 1,
@@ -513,7 +504,11 @@ mod tests {
         let coord = Coordinator::local(Arc::clone(&engine), Arc::clone(&shuffle), workers);
         struct LocalDispatch2(Worker);
         impl FragmentDispatcher for LocalDispatch2 {
-            fn execute_remote(&self, _node_id: u64, fragment: &FragmentSpec) -> Result<Vec<Record>> {
+            fn execute_remote(
+                &self,
+                _node_id: u64,
+                fragment: &FragmentSpec,
+            ) -> Result<Vec<Record>> {
                 self.0.execute_fragment(fragment)
             }
         }

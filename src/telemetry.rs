@@ -306,11 +306,7 @@ impl EngineMetrics {
         let h = self.bpm_hits.load(Ordering::Relaxed) as f64;
         let m = self.bpm_misses.load(Ordering::Relaxed) as f64;
         let t = h + m;
-        if t == 0.0 {
-            0.0
-        } else {
-            h / t
-        }
+        if t == 0.0 { 0.0 } else { h / t }
     }
 
     /// Buffer pool cache hits.
@@ -341,7 +337,8 @@ impl EngineMetrics {
 
     /// Expression fell back to the interpreter.
     pub fn record_jit_interpreter_fallback(&self) {
-        self.jit_interpreter_fallbacks.fetch_add(1, Ordering::Relaxed);
+        self.jit_interpreter_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Total successful JIT compilations.
@@ -435,7 +432,8 @@ impl EngineMetrics {
 
     /// One rejected / full shuffle push (producer must retry — backpressure).
     pub fn record_mpp_shuffle_backpressure(&self) {
-        self.mpp_shuffle_backpressure.fetch_add(1, Ordering::Relaxed);
+        self.mpp_shuffle_backpressure
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// One MPP fragment executed on this node.
@@ -509,11 +507,7 @@ impl EngineMetrics {
         };
         let ratio = {
             let t = hits + misses;
-            if t == 0 {
-                0.0
-            } else {
-                hits as f64 / t as f64
-            }
+            if t == 0 { 0.0 } else { hits as f64 / t as f64 }
         };
 
         counter(
@@ -546,11 +540,8 @@ impl EngineMetrics {
             "Buffer pool dirty page flushes",
             flushes,
         );
-        self.bpm_flush.prometheus_pair(
-            "takyonic_bpm_flush",
-            "Dirty page flush latency",
-            &mut out,
-        );
+        self.bpm_flush
+            .prometheus_pair("takyonic_bpm_flush", "Dirty page flush latency", &mut out);
 
         counter(
             &mut out,
@@ -605,11 +596,8 @@ impl EngineMetrics {
             "Successful OCC commits",
             self.txn_commits(),
         );
-        self.txn_commit.prometheus_pair(
-            "takyonic_txn_commit",
-            "OCC commit latency",
-            &mut out,
-        );
+        self.txn_commit
+            .prometheus_pair("takyonic_txn_commit", "OCC commit latency", &mut out);
         gauge(
             &mut out,
             "takyonic_txn_active",
@@ -749,12 +737,12 @@ impl MetricsManager {
         let metrics = Arc::clone(&self.metrics);
         let bpm = self.bpm.clone();
         let shutdown = Arc::clone(&self.shutdown);
-        self.join = Some(thread::Builder::new()
-            .name("takyonic-metrics".into())
-            .spawn(move || metrics_http_loop(listener, metrics, bpm, shutdown))
-            .map_err(|e| {
-                crate::error::TakyonicError::Engine(format!("metrics thread: {e}"))
-            })?);
+        self.join = Some(
+            thread::Builder::new()
+                .name("takyonic-metrics".into())
+                .spawn(move || metrics_http_loop(listener, metrics, bpm, shutdown))
+                .map_err(|e| crate::error::TakyonicError::Engine(format!("metrics thread: {e}")))?,
+        );
         self.bind_addr = Some(bound);
         debug!(%bound, "Prometheus /metrics server started");
         Ok(self)
@@ -762,8 +750,7 @@ impl MetricsManager {
 
     /// Render current metrics (same body as `/metrics`).
     pub fn render(&self) -> String {
-        self.metrics
-            .render_prometheus(self.bpm.as_deref())
+        self.metrics.render_prometheus(self.bpm.as_deref())
     }
 
     /// Stop the HTTP thread (best-effort).

@@ -112,9 +112,7 @@ impl PartitionMap {
             };
         }
         Self {
-            assignments: (0..n)
-                .map(|i| node_ids[i % node_ids.len()])
-                .collect(),
+            assignments: (0..n).map(|i| node_ids[i % node_ids.len()]).collect(),
         }
     }
 
@@ -182,14 +180,11 @@ impl PartitionRouter {
         predicate: Option<&Expression>,
     ) -> Result<Vec<(u32, u64)>> {
         if matches!(schema.partitioning, PartitioningStrategy::None) {
-            return Ok(self
-                .workers
-                .iter()
-                .map(|w| (w.slot, w.node_id))
-                .collect());
+            return Ok(self.workers.iter().map(|w| (w.slot, w.node_id)).collect());
         }
         if let Some(pred) = predicate {
-            if let Some(val) = extract_partition_eq(pred, schema.partitioning.column().unwrap_or(""))
+            if let Some(val) =
+                extract_partition_eq(pred, schema.partitioning.column().unwrap_or(""))
             {
                 let (pid, node) = self.route_key(schema, &val)?;
                 return Ok(vec![(pid, node)]);
@@ -264,10 +259,7 @@ impl PartitionPruningRule {
         router: &PartitionRouter,
     ) -> Result<Vec<(u64, u32)>> {
         let targets = router.route_predicate(schema, predicate)?;
-        Ok(targets
-            .into_iter()
-            .map(|(pid, node)| (node, pid))
-            .collect())
+        Ok(targets.into_iter().map(|(pid, node)| (node, pid)).collect())
     }
 }
 
@@ -374,6 +366,8 @@ impl Rebalancer {
                 c.fetch_add(delta as u64, Ordering::Relaxed);
             } else {
                 let sub = (-delta) as u64;
+                // `try_update` is the 1.88+ name; keep `fetch_update` for MSRV 1.85.
+                #[allow(deprecated)]
                 let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(sub))
                 });
@@ -563,7 +557,11 @@ mod tests {
             right: Box::new(Expression::Literal("42".into())),
         };
         let workers = PartitionPruningRule::prune_workers(&schema, Some(&pred), &router).unwrap();
-        assert_eq!(workers.len(), 1, "expected single RemoteWorker, got {workers:?}");
+        assert_eq!(
+            workers.len(),
+            1,
+            "expected single RemoteWorker, got {workers:?}"
+        );
         let (pid, _) = router.route_key(&schema, "42").unwrap();
         assert_eq!(workers[0].1, pid);
     }
